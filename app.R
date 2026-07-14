@@ -685,16 +685,7 @@ ui <- page_fillable(
                     tags$li(tags$strong("Images CSV"), " — detection records such as timestamps, species, and ", tags$strong("Cluster ID"), " values. In this workflow, ", tags$strong("Cluster ID"), " means the unique identifier for an independent encounter event.")
                   ),
                   tags$p(
-                    "The current upload pipeline expects the ", tags$strong("exact column names"), " described in the Add your data tab. Default camera spacing and camera counts are based on the ",
-                    tags$a(
-                      href = "https://irma.nps.gov/DataStore/Reference/Profile/2307775",
-                      target = "_blank",
-                      style = "color: var(--rw1); text-decoration: underline;",
-                      "northeastern National Park Service deer monitoring program"
-                    ),
-                    ", but the app analyzes the data you provide rather than requiring one exact array design or minimum camera count to function."
-                  ),
-                  tags$p(
+                    "The current upload pipeline expects the ", tags$strong("exact column names"), " described in the Add your data tab.",
                     "Click the ", tags$strong("'Add your data'"), " tab for column requirements and examples. The app will automatically:"
                   ),
                   tags$ul(
@@ -709,15 +700,12 @@ ui <- page_fillable(
                 ),
                 tags$ul(
                   tags$li("Modify priors for movement speed, viewshed or detection parameters, and camera heterogeneity."),
-                  tags$li("Change the fallback camera detection angle, or provide camera-specific `Camera Detection Angle` values in the deployment file.")
+                  tags$li("Change the defaulst camera detection angle, or provide camera-specific `Camera Detection Angle` values in the deployment file.")
                 ),
                 tags$h2(style = "font-size: 1.5rem; font-weight: 600; margin-top: 1rem;", "Step 3: Run the models"),
                 tags$p(
-                  tags$strong("Uploaded field data:"), " use the ", tags$strong("USCR"), ", ", tags$strong("REM"), ", and ", tags$strong("TTE"),
+                  "Fit models from the ", tags$strong("USCR"), ", ", tags$strong("REM"), ", and ", tags$strong("TTE"),
                   " tabs. Each tab has its own run button and troubleshooting panel."
-                ),
-                tags$p(
-                  tags$strong("Simulated data:"), " run ", tags$strong("USCR"), ", ", tags$strong("REM"), ", and ", tags$strong("TTE"), " from their own tabs after generating the shared simulated dataset."
                 ),
                 tags$ul(
                   tags$li("Click the ", tags$strong("'Run'"), " button for your data type."),
@@ -732,7 +720,7 @@ ui <- page_fillable(
                 tags$p(
                   "For longer runs, users may prefer to download the app and run it locally. Download and setup instructions are available in the ",
                   tags$a(
-                    href = "https://github.com/kcring/DEER_app",
+                    href = "https://github.com/nationalparkservice/DEER_app",
                     target = "_blank",
                     style = "color: var(--rw1); text-decoration: underline;",
                     "GitHub repository"
@@ -742,17 +730,23 @@ ui <- page_fillable(
                 tags$h2(style = "font-size: 1.5rem; font-weight: 600; margin-top: 0.5rem;", "Step 4: Compare results"),
                 tags$p("Use the ", tags$strong("'Compare & combine'"), " tab to:"),
                 tags$ul(
-                  tags$li("For ", tags$strong("uploaded field data"), ": compare whichever model fits have finished so far, and compute WAIC-weighted summaries when WAIC is available for all completed fits."),
-                  tags$li("For ", tags$strong("simulated data"), ": compare whichever shared-simulation model fits have finished so far, as in the uploaded-data workflow."),
                   tags$li("Compare model performance using WAIC values for uploaded field data."),
                   tags$li("Download posterior summaries with parameter names, means, and 95% credible intervals.")
                 ),
                 tags$h2(style = "font-size: 1.5rem; font-weight: 600; margin-top: 1rem;", "Step 5: Optional design tools"),
                 tags$p(
-                  "The ", tags$strong("'Simulate data'"), " and ", tags$strong("'Camera array design'"), " tabs can be used as design tools."
-                ),
+                  "The ", tags$strong("'Simulate data'"), " and ", tags$strong("'Camera array design'"), " tabs can be used as design tools.",
+                  "Default camera spacing and camera counts used in simulations are based on the ",
+                  tags$a(
+                    href = "https://irma.nps.gov/DataStore/Reference/Profile/2307775",
+                    target = "_blank",
+                    style = "color: var(--rw1); text-decoration: underline;",
+                    "northeastern National Park Service deer monitoring program."
+                    )
+                  ),
                 tags$ul(
-                  tags$li("The shared simulator can generate practice datasets for USCR, REM, and TTE."),
+                  tags$li("The shared simulator can generate datasets for USCR, REM, and TTE."),
+                  tags$li("Simulated data can be analyzed from the ", tags$strong("USCR"), ", ", tags$strong("REM"), ", and ", tags$strong("TTE"), " tabs."),
                   tags$li("The camera-array tool can help lay out cameras for a new site from uploaded spatial layers.")
                 )
               )
