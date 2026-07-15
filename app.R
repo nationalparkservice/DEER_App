@@ -1176,8 +1176,12 @@ ui <- page_fillable(
             "1. Check required columns and data types;",
             "2. Flag image timestamps that fall outside the deployment window;",
             "3. Optionally trim each camera deployment length to meet study design criteria.",
+            "4. Generate downloadable CSVs of data with any corrections.",
             "",
-            "Download processed CSVs if needed, then configure MCMC and priors in the **Model settings** tab and run models in the USCR/REM/TTE tabs.",
+            "Once data are uploaded and checked, click on the",
+            "**Model settings** tab to select the species for analysis and",
+            "configure MCMC and priors. Once you are satisfied with model",
+            "settings, you run models in the **USCR**/**REM**/**TTE** tabs.",
             "",
             "---",
             "",
@@ -1196,7 +1200,7 @@ ui <- page_fillable(
             "- **`Latitude`** — Camera latitude (decimal degrees)",
             "- **`Longitude`** — Camera longitude (decimal degrees)",
             "- `Camera Model` — Optional camera make/model field for recordkeeping (for example `Browning Strike Force Pro`)",
-            "- `Camera Detection Angle` — Optional full detection angle in degrees for that camera. If left blank, the app uses the fallback angle from Model settings.",
+            "- `Camera Detection Angle` — Optional full detection angle in degrees for that camera. If left blank, the app uses the default angle from Model settings.",
             "- `Camera Height` — Optional camera height (meters)",
             "- `Camera Orientation` — Optional cardinal direction (for example `N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, `NW`) or 0-359 degrees",
             "- **`Camera Functioning`** — Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted",
@@ -1251,18 +1255,23 @@ ui <- page_fillable(
           DTOutput("images_preview"),
           downloadButton("download_images_checked", "Download processed images CSV"),
           
-          hr(),
-          
-          h3("Model settings"),
-          p(
-            "Configure priors and fallback detection-angle settings (",
-            tags$strong("θ"), ") in the ",
-            tags$strong("Model settings"), " tab."
-          )
+          hr()
         ),
         
+    # ---------------------- MODEL SETTINGS -------------------------
         nav_panel(
           "Model settings",
+          
+          h4("Species to analyze"),
+          "First, you must select the species to analyze.",
+          selectInput(
+            inputId = "species_to_analyze",
+            label = "Select species to analyze",
+            choices = character(0)
+          ),
+          tableOutput("species_count_summary"),
+          hr(),
+          
           markdown(paste(
             "### Run defaults",
             "",
@@ -1283,17 +1292,17 @@ ui <- page_fillable(
             "These defaults may not be well calibrated for other species or field conditions.",
             "Model output can be sensitive to prior choice, so users working on other species should adjust the priors to better match their system.",
             "",
-            "### Fallback camera geometry",
+            "### Default camera geometry",
             "",
-            "Fallback detection angle is 55° (based on Browning-style camera specifications). This value is used for simulated runs and for uploaded cameras that do not include a `Camera Detection Angle` value.",
+            "Default detection angle is 55° (based on Browning-style camera specifications). This value is used for simulated runs and for uploaded cameras that do not include a `Camera Detection Angle` value.",
             "",
             sep = "\n"
           )),
           
-          h4("Fallback camera geometry"),
+          h4("Default camera geometry"),
           fluidRow(
             column(12,
-              sliderInput("theta", "Fallback detection angle θ (degrees)",
+              sliderInput("theta", "Default detection angle θ (degrees)",
                           min = 20, max = 80, value = 55, step = 1)
             )
           ),
@@ -1320,7 +1329,7 @@ ui <- page_fillable(
                 tags$li("REM and TTE start from 6000 iterations, 1000 burn-in, and thin = 5."),
                 tags$li("USCR starts from 6000 iterations, 1000 burn-in, thin = 5, and M = 300."),
                 tags$li("The app checks convergence internally and can rerun models when needed."),
-                tags$li("Most users only need to change the fallback camera angle above or switch to Advanced for species- or site-specific priors.")
+                tags$li("Most users only need to change the default camera angle above or switch to Advanced for species- or site-specific priors.")
               )
             )
           ),
@@ -1570,9 +1579,9 @@ ui <- page_fillable(
           )
         ),
         
-        # ---------------------- REM MODEL TAB -------------------------
+        # ---------------------- REM TAB -------------------------
         nav_panel(
-          "REM model",
+          "REM",
           tags$div(
             id = "rem-content",
             HTML('
@@ -1593,7 +1602,7 @@ ui <- page_fillable(
                   <li>\\(D\\) — animal density in animals/km².</li>
                   <li>\\(v\\) — animal movement speed (km/day).</li>
                   <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
-                  <li>\\(\\theta_{\\mathrm{rad},j}\\) — full detection angle used for camera \\(j\\) in the REM formula (radians).</li>
+                  <li>\\(\\theta_{\\mathrm{rad},j}\\) — full detection angle used for camera \\(j\\) (radians).</li>
                   <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts.</li>
                 </ul>
                 <h3>Default priors/inputs used in the app</h3>
@@ -1601,7 +1610,7 @@ ui <- page_fillable(
                   <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
                   <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day.</li>
                   <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
-                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the fallback angle from Model settings.</li>
+                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
                 </ul>
               </div>
             </details>
@@ -1692,7 +1701,7 @@ ui <- page_fillable(
                 <ul>
                   <li>\\(y_j\\) — number of animal detection events for camera \\(j\\).</li>
                   <li>\\(\\mathrm{days}_j\\) — total deployed days for camera \\(j\\).</li>
-                  <li>\\(U_j\\) — movement-based encounter-rate multiplier for camera \\(j\\).</li>
+                  <li>\\(U_j\\) — the time needed to move across the average camera viewshed width \\(j\\).</li>
                   <li>\\(v\\) — movement speed (km/day); prior on \\(\\log v\\) as below.</li>
                   <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
                   <li>\\(\\theta_{\\mathrm{deg},j}\\) — full detection angle used for camera \\(j\\) (degrees).</li>
@@ -1704,7 +1713,7 @@ ui <- page_fillable(
                   <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
                   <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day.</li>
                   <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
-                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the fallback angle from Model settings.</li>
+                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
                 </ul>
               </div>
             </details>
@@ -2676,21 +2685,18 @@ server <- function(input, output, session) {
   observe({
     species <- available_species()
     current <- isolate(input$summary_species)
-    selected <- if (!is.null(current) && current %in% species) {
-      current
-    } else if ("Deer" %in% species) {
-      "Deer"
-    } else if (length(species) > 0) {
-      species[[1]]
-    } else {
-      character(0)
-    }
+    current_analysis <- isolate(input$species_to_analyze)
     
     updateSelectInput(
       session,
       "summary_species",
       choices = species,
-      selected = selected
+      selected = species[1]
+    )
+    updateSelectInput(
+      session,
+      "species_to_analyze",
+      choices = species
     )
   })
   
@@ -2802,13 +2808,6 @@ server <- function(input, output, session) {
     validate(
       need(nrow(dc) > 0, paste0("No '", species_name, "' images found in dataset."))
     )
-
-    dc <- dc |>
-      dplyr::mutate(
-        Longitude = suppressWarnings(as.numeric(Longitude)),
-        Latitude = suppressWarnings(as.numeric(Latitude))
-      ) |>
-      dplyr::filter(is.finite(Longitude), is.finite(Latitude))
 
     validate(
       need(
@@ -3395,7 +3394,11 @@ server <- function(input, output, session) {
   uscr_nps_resume_settings <- reactiveVal(NULL)
   
   nps_model_inputs <- reactive({
-    req(deployment_checked(), images_checked())
+    req(
+      deployment_checked(),
+        images_checked(),
+      !is.null(input$species_to_analyze)
+      )
     trim_days <- NULL
     if (isTRUE(input$apply_56day_trim)) {
       trim_days <- input$trim_days
@@ -3405,6 +3408,7 @@ server <- function(input, output, session) {
     build_nps_model_inputs(
       deployment_checked(),
       images_checked(),
+      input$species_to_analyze,
       max_days = trim_days
     )
   })
@@ -4202,8 +4206,7 @@ server <- function(input, output, session) {
     requested_chains <- app_n_chains()
     rem_context <- c(
       summarize_rem_context(d),
-      paste("Chains requested in UI:", requested_chains),
-      "Background worker run: yes; the app enforces a minimum of 2 chains."
+      paste("Chains requested in UI:", requested_chains)
     )
     rem_args <- list(
       y            = d$camera_counts,
@@ -4273,23 +4276,6 @@ server <- function(input, output, session) {
       )
     )
     
-    showNotification(
-      paste(
-        "REM background run started.",
-        paste0(
-          "Requested settings: iter=", input$iter_rem_tte,
-          ", burn-in=", input$burnin_rem_tte,
-          ", thin=", input$thin_rem_tte,
-          ", chains=", requested_chains,
-          "."
-        ),
-        "This session should stay responsive, but live tuning updates are not available for this path."
-      ),
-      type = "message",
-      duration = NULL,
-      id = "rem_nps_progress"
-    )
-    
     rem_future <- future::future({
       do.call(run_REM, rem_args)
     })
@@ -4306,7 +4292,7 @@ server <- function(input, output, session) {
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "REM completed successfully in a background worker. Review the summary above and the tuning history below.",
+        guidance = "REM completed successfully. Review the summary above and the tuning history below.",
         log_entry = "Uploaded-data REM background run completed."
       )
       showNotification("REM (uploaded data) complete!", type = "message", duration = 5)
@@ -4935,6 +4921,17 @@ server <- function(input, output, session) {
       ggplot2::ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
     }
   )
+  
+  output$species_count_summary <- renderTable({
+    tibble(
+      category = c("Total detections", "Camera trap days"),
+      result = c(
+        sum(nps_model_inputs()$camera_counts),
+        sum(nps_model_inputs()$camera_days)
+        )
+    )
+  },
+  colnames = F)
 }
 
 # -------------------------------------------------------------------

@@ -306,7 +306,12 @@ build_sim_data_for_nimble <- function(ch, detection_radius_m) {
 # -------------------------------------------------------------------
 # 2. NPS inputs: format deployments + images as in the Rmd
 # -------------------------------------------------------------------
-build_nps_model_inputs <- function(deployments, images, max_days = NULL) {
+build_nps_model_inputs <- function(
+    deployments,
+    images,
+    species_to_analyze,
+    max_days = NULL
+    ) {
   quiet_require("dplyr")
   quiet_require("tidyr")
   quiet_require("sf")
@@ -356,9 +361,8 @@ build_nps_model_inputs <- function(deployments, images, max_days = NULL) {
                  mean(range(utm_coords[, "Y"]))) / 1000
     )
   
-  # Deer-only sequences
   seqs <- images |>
-    dplyr::filter(grepl("deer", Species, ignore.case = TRUE)) |>
+    dplyr::filter(Species == species_to_analyze) |>
     dplyr::group_by(`Cluster ID`) |>
     dplyr::summarise(
       Site           = dplyr::first(`Site Name`),
@@ -698,6 +702,7 @@ run_encounter_rate_model <- function(method,
   )
 
   current_iter <- iter
+  current_burnin <- burnin
   current_thin <- thin
   round_i <- 0L
   current_rhat <- Inf
@@ -722,8 +727,9 @@ run_encounter_rate_model <- function(method,
     }
 
     detail <- paste0(
-      method, " tuning round ", round_i,
+      method, " MCMC round ", round_i,
       ": iter=", current_iter,
+      ": burnin=", current_burnin,
       ", thin=", current_thin,
       ", chains=", n_chains
     )
@@ -732,7 +738,7 @@ run_encounter_rate_model <- function(method,
       message(detail)
     }
     report_status(
-      "tuning",
+      "MCMC running",
       detail,
       value = min(0.15 + 0.2 * round_i, 0.9)
     )
@@ -744,7 +750,7 @@ run_encounter_rate_model <- function(method,
       data = data,
       monitors = monitors,
       niter = current_iter,
-      nburnin = burnin,
+      nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
       parallel_chains = parallel_chains,
@@ -759,7 +765,7 @@ run_encounter_rate_model <- function(method,
     adapt_log[[round_i]] <- data.frame(
       round = round_i,
       niter = current_iter,
-      nburnin = burnin,
+      nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
       rhat_max = current_rhat,
@@ -770,9 +776,9 @@ run_encounter_rate_model <- function(method,
 
     elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
     report_status(
-      "tuning",
+      "MCMC running",
       paste0(
-        method, " tuning round ", round_i,
+        method, " MCMC round ", round_i,
         " complete: max Rhat=",
         if (is.finite(current_rhat)) format(round(current_rhat, 3), nsmall = 3) else "NA",
         "; processing time=",
@@ -788,6 +794,7 @@ run_encounter_rate_model <- function(method,
     }
 
     current_iter <- current_iter * 2L
+    current_burnin <- current_burnin * 2L
     current_thin <- max(1L, floor((current_iter - burnin) / 1000))
   }
 
@@ -804,7 +811,7 @@ run_encounter_rate_model <- function(method,
     final_rhat_max = current_rhat,
     settings = list(
       iter = current_iter,
-      burnin = burnin,
+      burnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
       adaptive = adaptive,

@@ -672,38 +672,19 @@ first_finite_or_na <- function(x) {
   if (length(vals)) vals[1] else NA_real_
 }
 
-species_counts_per_camera <- function(images, species_name, deployments = NULL) {
-  counts <- filter_species_rows(images, species_name) %>%
-    dplyr::group_by(`Site Name`) %>%
-    dplyr::summarise(
-      total_detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  if (!is.null(deployments) &&
-      all(c("Site Name", "Latitude", "Longitude") %in% names(deployments))) {
-    coords <- deployments %>%
-      dplyr::group_by(`Site Name`) %>%
-      dplyr::summarise(
-        Latitude = first_finite_or_na(Latitude),
-        Longitude = first_finite_or_na(Longitude),
-        .groups = "drop"
-      )
-    counts <- counts %>%
-      dplyr::left_join(coords, by = "Site Name")
-  } else if (all(c("Latitude", "Longitude") %in% names(images))) {
-    coords <- images %>%
-      dplyr::group_by(`Site Name`) %>%
-      dplyr::summarise(
-        Latitude = first_finite_or_na(Latitude),
-        Longitude = first_finite_or_na(Longitude),
-        .groups = "drop"
-      )
-    counts <- counts %>%
-      dplyr::left_join(coords, by = "Site Name")
-  }
-
-  counts
+species_counts_per_camera <- function(images, species_name, deployments) {
+  counts <- deployments %>%
+    left_join(
+      filter_species_rows(images, species_name) %>%
+        dplyr::group_by(`Site Name`) %>%
+        dplyr::summarise(
+          total_detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
+          .groups = "drop"
+        ),
+      by = "Site Name"
+    ) %>%
+    replace_na(list(total_detections = 0))
+  return(counts)
 }
 
 deer_daily_detections <- function(images) {
