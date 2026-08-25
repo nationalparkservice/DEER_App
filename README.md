@@ -114,8 +114,8 @@ Rscript -e "shiny::runApp('/path/to/DEER_app')"
 Navigate to the model tabs (USCR, REM, TTE):
 - **Simulated data:** run **USCR**, **REM**, and **TTE** from their tabs after generating the shared simulated dataset
 - **Uploaded field data:** run each model from its tab with the uploaded-data buttons
-- Run-status panels show setup, adaptive tuning, convergence checks, and final-run messages where available
-- **Stop** buttons allow you to terminate long-running models
+- Run-status panels show each round's settings, convergence checks, and a run history once the model has retried at least once
+- A popup message reports each model's iteration and burn-in settings while it runs (plus the current M and state-space buffer for USCR), and an approximate remaining run time once the model has retried at least once
 - Results appear below the buttons when complete
 
 **Model settings:**
@@ -162,7 +162,7 @@ deer_app_v2/
 ### Deployment File Required Columns:
 - **Site Name**: Camera location identifier
 - **Start Date / End Date**: Deployment dates in `MM/DD/YYYY`
-- **Latitude / Longitude**: Decimal degrees
+- **Latitude / Longitude**: Decimal degrees, WGS84 (standard GPS coordinates)
 - **Camera Functioning**: `Yes` or `No` (common variants like `TRUE`/`FALSE`/`1`/`0` are normalized on import)
 - **Camera Malfunction Date**: Keep the column in the file; fill it when `Camera Functioning = No` for a site with images
 - **Detection Distance**: Detection radius in meters
@@ -174,7 +174,7 @@ Commonly used but not always required for model fitting:
 - **Start Time / End Time**: Deployment times in 24-hour format
 - **Camera Height**: Numeric camera height
 - **Camera Orientation**: Cardinal direction or 0-359 degrees
-- **Camera Detection Angle**: Optional full detection angle in degrees; if omitted, the app uses the fallback angle from Model settings
+- **Camera Detection Angle**: Optional full detection angle in degrees; if omitted, the app uses the default angle from Model settings
 - **Camera Model**: Optional descriptive metadata
 - **Notes**: Keep the column even if some rows are blank
 
@@ -182,7 +182,7 @@ Commonly used but not always required for model fitting:
 - **Site Name**: Must match deployment file
 - **Timestamp**: Detection date-time (the app expects this column name; see **Add your data** for format details)
 - **Species**: Species name
-- **Cluster ID**: Unique identifier for independent detection events
+- **Cluster ID**: Identifier for an independent detection event; any format is accepted, and multiple rows can share the same value (e.g. burst photos)
 - **Sighting Count**: Number of animals in the image; pipe-delimited values are allowed for multi-species rows
 
 Optional image columns:
@@ -207,7 +207,7 @@ Cross-year winter surveys (for example December to January) are supported; the a
 
 - **USCR** is the most computationally intensive model. For faster demos, use smaller datasets or smaller simulated examples for quick checks.
 
-- **USCR** now uses adaptive tuning and may rerun the final fit if convergence checks are still poor, so it can take longer than earlier app versions
+- **USCR** doubles iterations/burn-in when Rhat is too high, doubles M when the augmentation bound is too small, and grows the state-space buffer when the posterior sigma is larger than the buffer safely covers, so it can rerun (and take longer) if any check fails
 
 - **REM** and **TTE** are generally faster but still benefit from reduced iterations for quick tests
 
@@ -216,7 +216,7 @@ Cross-year winter surveys (for example December to January) are supported; the a
 ## Deployment and concurrent users
 
 - **Single session:** `shiny::runApp()` is still the main local workflow.
-- **Concurrent users:** support is still being improved. The uploaded-data REM path has an experimental background-worker workflow, but full multi-user server behavior still needs deployment-side testing.
+- **Concurrent users:** support is still being improved. Each model run occupies its session while fitting; full multi-user server behavior still needs deployment-side testing.
 
 
 

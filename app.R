@@ -9,8 +9,7 @@ needs <- c(
   "shiny", "bslib", "DT", "ggplot2", "dplyr", "tidyr",
   "readr", "purrr", "stringr", "secr", "data.table",
   "leaflet", "ggrepel", "shinyjs",
-  "nimble", "parallel", "MCMCvis", "lubridate", "sf", "tibble",
-  "future", "promises"
+  "nimble", "parallel", "MCMCvis", "lubridate", "sf", "tibble"
 )
 
 # Redwood-inspired palette (hex only — no extra color package)
@@ -54,19 +53,7 @@ suppressPackageStartupMessages({
   library(sf)
   library(nimble)
   library(shinyjs)
-  library(future)
-  library(promises)
 })
-
-# Conservative async worker pool for server-side background REM jobs.
-# Keep this small because the model code can also use parallel chains internally.
-available_cores <- suppressWarnings(parallel::detectCores(logical = TRUE))
-if (is.na(available_cores) || available_cores < 2) {
-  async_workers <- 1L
-} else {
-  async_workers <- min(2L, available_cores - 1L)
-}
-future::plan(future::multisession, workers = async_workers)
 
 # -------------------------------------------------------------------
 # Helper files
@@ -158,13 +145,33 @@ prepare_combo_density_data <- function(fits) {
   }
 
   density_draws <- lapply(fits, function(fit) sort(extract_density_draws_km2(fit)))
-  n_draws <- min(lengths(density_draws))
-  if (!is.finite(n_draws) || n_draws < 1L) return(NULL)
+  draw_lengths <- lengths(density_draws)
+  if (any(!is.finite(draw_lengths)) || any(draw_lengths < 1L)) return(NULL)
 
-  mat <- do.call(
-    cbind,
-    lapply(density_draws, function(x) x[seq_len(n_draws)])
-  )
+  # Quantile-based averaging (below) assumes every model contributes the same
+  # number of posterior draws, so that sorted position s means the same thing
+  # (the same quantile) in each model. In practice this always holds because
+  # D_mi2 is a deterministic, bounded quantity for all three models (REM/TTE:
+  # a scaled dunif(0, D_max) draw; USCR: N / area_mi2, with N in [0, M] and
+  # area_mi2 a fixed constant), so it can't produce non-finite draws that get
+  # filtered out unevenly across models. If that assumption is ever violated,
+  # fail loudly rather than silently truncating every model down to the
+  # shortest one, which would quietly drop the upper tail of the longer
+  # model(s) instead of matching quantiles.
+  if (length(unique(draw_lengths)) > 1L) {
+    stop(
+      "prepare_combo_density_data: models have unequal numbers of finite ",
+      "posterior draws (",
+      paste0(model_names, " = ", draw_lengths, collapse = ", "),
+      "). Quantile-based model averaging assumes an equal number of draws ",
+      "per model; this most likely means D_mi2 contained non-finite values ",
+      "in one model's samples that were filtered out. Investigate the ",
+      "affected fit(s) instead of truncating to the shortest model.",
+      call. = FALSE
+    )
+  }
+
+  mat <- do.call(cbind, density_draws)
   colnames(mat) <- model_names
 
   density_est <- mat
@@ -274,7 +281,7 @@ build_combo_interval_plot <- function(fits, title_text) {
   interval_colors <- interval_colors[!is.na(interval_colors)]
 
   ggplot(interval_df, aes(x = mean, y = Method, color = Method)) +
-    geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.18, linewidth = 1, alpha = 0.95) +
+    geom_errorbar(aes(xmin = lower, xmax = upper), orientation = "y", width = 0.18, linewidth = 1, alpha = 0.95) +
     geom_point(aes(shape = point_shape), size = 3.2, show.legend = FALSE) +
     scale_color_manual(
       values = interval_colors,
@@ -375,16 +382,51 @@ build_sim_combo_table_uscr_only <- function(uscr_fit, density_threshold = 20) {
 posterior_summary_df <- function(fit) {
   if (is.null(fit) || is.null(fit$samples_all)) return(NULL)
   m <- as.data.frame(fit$samples_all)
-  if ("D_mi2" %in% names(m)) {
+
+  # Density: REM/TTE monitor "D" directly in animals/km²; USCR only
+  # monitors "D_mi2" (from N / area_mi2). Normalize both to a single
+  # "D_km2" column instead of keeping "D" alongside a re-derived "D_km2"
+  # that would just be the same value computed two different ways.
+  if ("D" %in% names(m)) {
+    m$D_km2 <- m$D
+    m$D     <- NULL
+    m$D_mi2 <- NULL
+  } else if ("D_mi2" %in% names(m)) {
     m$D_km2 <- m$D_mi2 / 2.59
     m$D_mi2 <- NULL
   }
+
+  # log_sigma/log_lam_0 (USCR) duplicate sigma/lam_0 on the log scale, and
+  # sum_obs/sum_sim are just the intermediate discrepancy sums used to
+  # compute bp (the Bayesian p-value) — drop all four rather than exporting
+  # redundant or purely intermediate columns.
+  drop_cols <- intersect(c("log_sigma", "log_lam_0", "sum_obs", "sum_sim"), names(m))
+  if (length(drop_cols) > 0) m[drop_cols] <- NULL
+
   tibble::tibble(
     parameter = names(m),
-    mean      = sapply(m, mean),
-    q025      = sapply(m, function(x) stats::quantile(x, 0.025)),
-    q975      = sapply(m, function(x) stats::quantile(x, 0.975))
+    mean      = round(sapply(m, mean), 2),
+    q025      = round(sapply(m, function(x) stats::quantile(x, 0.025)), 2),
+    q975      = round(sapply(m, function(x) stats::quantile(x, 0.975)), 2)
   )
+}
+
+#' Shared legend describing posterior summary CSV columns, shown below the
+#' download buttons on the Compare & combine tab.
+posterior_param_legend <- function() {
+  markdown(paste(
+    "**Posterior summary column reference:**",
+    "",
+    "- `bp` — Bayesian p-value (posterior predictive check).",
+    "- `sd_eps` — standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model.",
+    "- `v` — animal movement speed (km/day).",
+    "- `D_km2` — density, in animals per km².",
+    "- `N` — USCR only: abundance, the total number of animals estimated within the state space.",
+    "- `lam_0` (λ₀) — USCR only: expected detections per deployed day if an animal's activity center were at the camera.",
+    "- `psi` (ψ) — USCR only: the probability that a data-augmented individual is a real member of the population.",
+    "- `sigma` (σ) — USCR only: spatial scale parameter (km), related to home-range size and how quickly detection falls with distance from an animal's activity center.",
+    sep = "\n"
+  ))
 }
 
 # -------------------------------------------------------------------
@@ -682,7 +724,7 @@ ui <- page_fillable(
                   tags$p("You will need two data files:"),
                   tags$ul(
                     tags$li(tags$strong("Deployment CSV"), " — camera deployment information such as locations, dates, and detection distances."),
-                    tags$li(tags$strong("Images CSV"), " — detection records such as timestamps, species, and ", tags$strong("Cluster ID"), " values. In this workflow, ", tags$strong("Cluster ID"), " means the unique identifier for an independent encounter event.")
+                    tags$li(tags$strong("Images CSV"), " — detection records such as timestamps, species, and ", tags$strong("Cluster ID"), " values. In this workflow, ", tags$strong("Cluster ID"), " identifies which images belong to the same independent encounter event; multiple images (or species) from the same event share the same Cluster ID.")
                   ),
                   tags$p(
                     "The current upload pipeline expects the ", tags$strong("exact column names"), " described in the Add your data tab.",
@@ -700,7 +742,7 @@ ui <- page_fillable(
                 ),
                 tags$ul(
                   tags$li("Modify priors for movement speed, viewshed or detection parameters, and camera heterogeneity."),
-                  tags$li("Change the defaulst camera detection angle, or provide camera-specific `Camera Detection Angle` values in the deployment file.")
+                  tags$li("Change the default camera detection angle, or provide camera-specific `Camera Detection Angle` values in the deployment file.")
                 ),
                 tags$h2(style = "font-size: 1.5rem; font-weight: 600; margin-top: 1rem;", "Step 3: Run the models"),
                 tags$p(
@@ -710,7 +752,6 @@ ui <- page_fillable(
                 tags$ul(
                   tags$li("Click the ", tags$strong("'Run'"), " button for your data type."),
                   tags$li("Watch stage labels, run-status notes, and troubleshooting text where available."),
-                  tags$li("Use the red ", tags$strong("'Stop'"), " button if necessary and when a model supports stopping."),
                   tags$li("Results appear below the buttons once each model completes.")
                 ),
                 tags$p(
@@ -904,6 +945,685 @@ ui <- page_fillable(
           )
         ),
         
+        # ---------------------- ADD YOUR DATA -------------------------
+        nav_panel(
+          "Add your data",
+          markdown(paste(
+            "Upload a **deployment CSV** (where and when cameras were set and recording) and an **images CSV** (timestamps, species, counts, and Cluster IDs).",
+            "The current upload checker expects the exact column names listed below.",
+            "",
+            sep = "\n"
+          )),
+          h3("The app will:"),
+          markdown(paste(
+            "1. Check required columns and data types;",
+            "2. Flag image timestamps that fall outside the deployment window;",
+            "3. Optionally trim each camera deployment length to meet study design criteria.",
+            "4. Generate downloadable CSVs of data with any corrections.",
+            "",
+            "Once data are uploaded and checked, click on the",
+            "**Model settings** tab to select the species for analysis and",
+            "configure MCMC and priors. Once you are satisfied with model",
+            "settings, you run models in the **USCR**/**REM**/**TTE** tabs.",
+            "",
+            "---",
+            "",
+            "## Required data columns",
+            "",
+            "### Deployment file columns (**bold = required**, others optional for quality control):",
+            "",
+            "- **`Site Name`** — Camera site identifier. Must be unique across all rows in the deployment file.",
+            "- `Site` — Optional broader site identifier",
+            "- `Camera ID` — Optional camera identifier",
+            "- `SD Card ID` — Optional SD card identifier",
+            "- **`Start Date`** — Deployment start date (`MM/DD/YYYY`)",
+            "- **`Start Time`** — Deployment start time (`HH:MM` or `HH:MM:SS`, 24h)",
+            "- **`End Date`** — Deployment end date (`MM/DD/YYYY`)",
+            "- **`End Time`** — Deployment end time (`HH:MM` or `HH:MM:SS`, 24h)",
+            "- **`Latitude`** — Camera latitude (decimal degrees, WGS84 / GPS coordinates — the standard datum used by GPS devices and phones worldwide). The app auto-corrects the sign to match the hemisphere selected in Model settings (under Default camera geometry).",
+            "- **`Longitude`** — Camera longitude (decimal degrees, WGS84). The app auto-corrects the sign to match the hemisphere selected in Model settings (under Default camera geometry).",
+            "- `Camera Model` — Optional camera make/model field for recordkeeping (for example `Browning Strike Force Pro`)",
+            "- `Camera Detection Angle` — Optional full detection angle in degrees for that camera. If left blank, the app uses the default angle from Model settings.",
+            "- `Camera Height` — Optional camera height (meters)",
+            "- `Camera Orientation` — Optional cardinal direction (for example `N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, `NW`) or 0-359 degrees",
+            "- **`Camera Functioning`** — Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted",
+            "- **`Camera Malfunction Date`** — Keep this value blank for cameras that did not malfunction. Enter the failure date (`MM/DD/YYYY`) if the camera failed.",
+            "- **`Detection Distance`** — Effective detection radius in meters",
+            "",
+            "### **Images file** required columns:",
+            "",
+            "- **`Site Name`** — Camera site identifier. These identifiers must match identifiers in the deployment file.",
+            "- **`Timestamp`** — Image timestamp. Preferred format: `MM/DD/YYYY HH:MM:SS`.",
+            "- **`Species`** — Species identifier. Pipe-delimited values such as `deer|squirrel` are allowed for multi-species rows, and the order must match `Sighting Count`.",
+            "- **`Cluster ID`** — Identifier for an independent detection event (a \"cluster\"). Any format is accepted (text or numeric). Multiple rows can share the same Cluster ID when they belong to the same event — for example burst photos, or a multi-species image split into one row per species.",
+            "- **`Sighting Count`** — Number of individuals in the image; pipe-delimited values such as `1|3` are allowed for multi-species rows and should follow the same order as `Species`.",
+            "- `Image URL` — Optional image reference/link column. If included, store it as plain text in a single column, one value per row.",
+            "",
+            "**Notes:**",
+            "",
+            "- Deployment QC expects date-only fields in `MM/DD/YYYY`.",
+            "- Image timestamps are parsed more flexibly if needed, including 2-digit years (for example `2/3/25`).",
+            "- **Upload is blocked** if any deployment row is missing Site Name, Start Date, End Date, Latitude, or Longitude; if Start Date or End Date isn't in `MM/DD/YYYY` format, or End Date is before Start Date; if Latitude or Longitude is zero; or if any Site Name is duplicated across rows. This is because these fields set each camera's deployment window and location, which every model depends on.",
+            "- **Upload of the images file is also blocked** if any image's Site Name doesn't exactly match a Site Name in the deployment file, or if Sighting Count has a non-numeric value; these would otherwise silently drop that camera's deployment metadata, or silently corrupt detection counts, instead of failing clearly.",
+            "- Other required (bold) fields — such as Camera Functioning, Detection Distance, and Camera Malfunction Date — are flagged in the check log as warnings but won't block the upload.",
+            "- The app expects the exact column names listed above. Files from other tagging workflows can usually be renamed to match.",
+            "- Cross-year winter surveys (for example `12/2025` to `01/2026`) are supported; the app uses the actual deployment dates/times and image timestamps, so no separate `Survey Year` field is required.",
+            "- Latitude/Longitude sign auto-correction only fixes the sign to match the selected hemisphere — a value of `0` is still blocked regardless of hemisphere, since it can't be a real coordinate.",
+            "- A duplicate Latitude/Longitude pair shared across different Site Names is flagged as a warning (not blocked) in the deployment check log — worth checking, since two different sites shouldn't normally share the exact same coordinates.",
+            "- A `Cluster ID` that appears at more than one `Site Name` is flagged as a warning (not blocked) in the images check log — worth investigating since it usually means Cluster IDs aren't globally unique in your export.",
+            sep = "\n"
+          )),
+          
+          h3("Step 1: Deployment file"),
+          fileInput("deployment_csv", "Upload deployment CSV", accept = ".csv"),
+          h4("Deployment check log"),
+          verbatimTextOutput("deployment_check_log"),
+          h4("Preview of cleaned deployment data"),
+          DTOutput("deployment_preview"),
+          downloadButton("download_deployment_checked", "Download cleaned deployment CSV"),
+          
+          hr(),
+          
+          h3("Step 2: Images file"),
+          fileInput("images_csv", "Upload images CSV", accept = ".csv"),
+          checkboxInput(
+            "apply_56day_trim",
+            "After validation, trim each camera deployment length to a user-set number of days (counted from each camera's Start Date).",
+            value = TRUE
+          ),
+          conditionalPanel(
+            "input.apply_56day_trim",
+            numericInput(
+              "trim_days",
+              "Deployment length to keep (days)",
+              value = 56,
+              min = 1,
+              step = 1
+            )
+          ),
+          h4("Images check log"),
+          verbatimTextOutput("images_check_log"),
+          h4("Preview of processed images data"),
+          DTOutput("images_preview"),
+          downloadButton("download_images_checked", "Download cleaned images CSV"),
+          
+          hr()
+        ),
+        
+        # ---------------------- DATA SUMMARY --------------------------
+        nav_panel(
+          "Data summary",
+          p(
+            class = "small",
+            style = "color: var(--muted);",
+            "This tab summarizes uploaded deployment and image data. Simulated datasets are summarized in their own model tabs and the Compare & combine tab."
+          ),
+          h4("Site deployment summary"),
+          DTOutput("deploy_summary_table"),
+          leafletOutput("camera_map", height = "300px"),
+          hr(),
+          h4("Uploaded detections by species"),
+          DTOutput("image_summary_table"),
+          plotOutput("species_bar_plot", height = "300px"),
+          hr(),
+          h4("Selected species detections by site"),
+          selectInput(
+            "summary_species",
+            "Species to summarize",
+            choices = character(0)
+          ),
+          DTOutput("deer_summary_table"),
+          plotOutput("deer_bubble_plot", height = "300px"),
+          plotOutput("deer_daily_plot", height = "300px")
+        ),
+        
+    # ---------------------- MODEL SETTINGS -------------------------
+        nav_panel(
+          "Model settings",
+          
+          h4("Species to analyze"),
+          "First, you must select the species to analyze.",
+          selectInput(
+            inputId = "species_to_analyze",
+            label = "Select species to analyze",
+            choices = character(0)
+          ),
+          tableOutput("species_count_summary"),
+          hr(),
+          
+          markdown(paste(
+            "### Run defaults",
+            "",
+            "**Current app defaults**:",
+            "",
+            "- **Number of chains**: 2 by default; the app enforces a minimum of 2 chains for model runs",
+            "- **REM/TTE**: adaptive runs start from 6000 iterations, 1000 burn-in, and thin = 5",
+            "- **USCR**: adaptive runs start from 6000 iterations, 1000 burn-in, thin = 5, and M = 100",
+            "- **Convergence criteria**: R̂ < 1.1 for all monitored parameters",
+            "",
+            "The app handles chain counts and reruns internally, so users do not need to manually edit iterations, thinning, or data-augmentation size in the interface.",
+            "If convergence is still poor after a run, review the run-status panel and consider whether the priors need to better match your site or species.",
+            "",
+            "### Prior distributions",
+            "",
+            "The priors below are grouped by model type.",
+            "The current defaults are calibrated for white-tailed deer using home-range size and daily movement information from the literature.",
+            "These defaults may not be well calibrated for other species or field conditions.",
+            "Model output can be sensitive to prior choice, so users working on other species should adjust the priors to better match their system.",
+            "",
+            "### Default camera geometry",
+            "",
+            "Default detection angle is 55° (based on Browning-style camera specifications). This value is used for simulated runs and for uploaded cameras that do not include a `Camera Detection Angle` value.",
+            "",
+            "Longitude and Latitude sign are auto-corrected to match the selected hemispheres below during upload QC (for example, a positive Longitude gets flipped negative for Western sites, and a positive Latitude gets flipped negative for Southern sites).",
+            "",
+            sep = "\n"
+          )),
+
+          h4("Default camera geometry"),
+          fluidRow(
+            column(12,
+              sliderInput("theta", "Default detection angle θ (degrees)",
+                          min = 20, max = 80, value = 55, step = 1),
+              radioButtons(
+                "hemisphere", "Hemisphere (for Longitude sign auto-correction)",
+                choices  = c("Western" = "Western", "Eastern" = "Eastern"),
+                selected = "Western",
+                inline   = TRUE
+              ),
+              radioButtons(
+                "lat_hemisphere", "Hemisphere (for Latitude sign auto-correction)",
+                choices  = c("Northern" = "Northern", "Southern" = "Southern"),
+                selected = "Northern",
+                inline   = TRUE
+              )
+            )
+          ),
+          
+          hr(),
+          
+          radioButtons(
+            "mode", "Settings mode",
+            choices  = c("Simple (recommended)" = "Default", "Advanced" = "Advanced"),
+            selected = "Default",
+            inline   = TRUE
+          ),
+          
+          conditionalPanel(
+            "input.mode == 'Default'",
+            tags$div(
+              class = "about-card",
+              tags$p(
+                tags$strong("Using the app defaults."),
+                " These settings are meant to be a practical starting point for most users."
+              ),
+              tags$ul(
+                tags$li("2 chains are used for all model runs."),
+                tags$li("REM and TTE start from 6000 iterations, 1000 burn-in, and thin = 5."),
+                tags$li("USCR starts from 6000 iterations, 1000 burn-in, thin = 5, and M = 100."),
+                tags$li("The app checks convergence internally and can rerun models when needed."),
+                tags$li("Most users only need to change the default camera angle above or switch to Advanced for species- or site-specific priors.")
+              )
+            )
+          ),
+          
+          conditionalPanel(
+            "input.mode == 'Advanced'",
+            tagList(
+              tags$p(
+                class = "small",
+                style = "color: var(--muted);",
+                "Most users can leave these advanced controls alone. The app manages chain counts and reruns internally, so the advanced controls focus on priors rather than MCMC tuning."
+              ),
+              tags$details(
+                tags$summary(tags$strong("Priors: REM & TTE")),
+                markdown(paste(
+                  "- **D** ~ Uniform(0, D_max): Uniform prior for density. `D_max` should be well above the maximum value of the posterior draws from `D`.",
+                  "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale). The current default corresponds to an average daily movement rate of `3.09 km/day` with an approximate 95% interval of `1.60` to `6.00 km/day` (Christensen et al. in prep).",
+                  "- **sd_eps** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model. The default `Gamma(1, 1)` prior has mean 1 and variance 1. These shared `sd_eps` controls are used by REM, TTE, and USCR.",
+                  "",
+                  "These defaults are not well calibrated for species other than white-tailed deer (*Odocoileus virginianus*). If you are working with another species, adjust the priors to match that species and study design. Model output is sensitive to choice of prior distribution.",
+                  "",
+                  sep = "\n"
+                )),
+                fluidRow(
+                  column(6,
+                    numericInput("D_max", "Max density prior (D max, animals/km²)",
+                                 value = 200, min = 10, step = 10),
+                    numericInput("log_v_mean", "log(v) mean (km/day)",
+                                 value = 1.130, step = 0.1),
+                    numericInput("log_v_sd", "log(v) SD",
+                                 value = 0.3372, min = 0.01, step = 0.05)
+                  ),
+                  column(6,
+                    numericInput("sd_eps_shape", "sd_eps gamma shape",
+                                 value = 1, min = 0.1, step = 0.1),
+                    numericInput("sd_eps_rate", "sd_eps gamma rate",
+                                 value = 1, min = 0.1, step = 0.1)
+                  )
+                )
+              ),
+              
+              tags$details(
+                tags$summary(tags$strong("Priors: USCR")),
+                markdown(paste(
+                  "- **M = 100**: Starting upper bound on total abundance, not density. Larger values increase run time, and the app checks whether this starting value is large enough during fitting.",
+                  "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale). The current default corresponds to an average 95% circular home-range size of `0.89 km²` with an approximate 95% interval of `0.48` to `1.62 km²` (Christensen et al. in prep).",
+                  "- **log(λ₀)** ~ Normal(mean, SD): Prior on expected detections per day when an animal's activity center is at the camera. The default mean of `0` corresponds to about one expected detection per deployed day at the detector because `exp(0) = 1`.",
+                  "- **State-space buffer**: Distance added around the camera array when defining the USCR state-space. Animals with home range centroids outside the buffer should not be able to be detected within the state space. The default is set from the log(σ) prior so it comfortably covers a 99% home range, and updates automatically if you change that prior; the app also checks it against the posterior sigma after fitting and grows it (and reruns) if needed.",
+                  "- **sd_eps** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect. USCR uses the same shared `sd_eps` gamma controls listed in the REM & TTE section above.",
+                  "",
+                  "These defaults are not well calibrated for species other than white-tailed deer (*Odocoileus virginianus*). If you are working with another species, adjust the priors to better match that species and study design. Model output is sensitive to choice of prior distribution.",
+                  "",
+                  sep = "\n"
+                )),
+                fluidRow(
+                  column(6,
+                    numericInput("log_sigma_mean", "log(σ) mean",
+                                 value = -1.5269, step = 0.1),
+                    numericInput("log_sigma_sd", "log(σ) SD",
+                                 value = 0.1535, min = 0.01, step = 0.05),
+                    numericInput("log_lam0_mean", "log(λ₀) mean",
+                                 value = 0, step = 0.1)
+                  ),
+                  column(6,
+                    numericInput("uscr_buffer_m", "USCR state-space buffer (m)",
+                                 value = 1000, min = 50, step = 50),
+                    numericInput("log_lam0_sd", "log(λ₀) SD",
+                                 value = 1, min = 0.1, step = 0.1)
+                  )
+                )
+              )
+            )
+          ),
+          
+          # Hidden run settings that aren't exposed in either Simple or
+          # Advanced mode (chain count and MCMC iteration/burn-in/thin/M
+          # starting points are managed automatically by the app).
+          tags$div(
+            style = "display:none;",
+            tags$div(
+              numericInput("n_chains", NULL, value = 2),
+              numericInput("iter_rem_tte", NULL, value = 6000),
+              numericInput("burnin_rem_tte", NULL, value = 1000),
+              numericInput("thin_rem_tte", NULL, value = 5),
+              numericInput("iter_uscr", NULL, value = 6000),
+              numericInput("burnin_uscr", NULL, value = 1000),
+              numericInput("thin_uscr", NULL, value = 5),
+              numericInput("M_uscr", NULL, value = 100)
+            )
+          )
+        ),
+        
+        # ---------------------- USCR MODEL TAB ------------------------
+        nav_panel(
+          "USCR model",
+          tags$div(
+            id = "uscr-content",
+            HTML('
+            <h2>Model 1 — USCR (Unmarked Spatial Capture–Recapture)</h2>
+            <p><strong>The gist:</strong> Estimates <strong>animal density in the site/state‑space</strong> by learning from <strong>where and when</strong> animals are detected <strong>across a camera array</strong>.</p>
+            <details>
+              <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
+              <div style="margin: 1rem 0; padding-left: 1rem;">
+                <p>Per-camera observation model:</p>
+                <p>$$y_j \\sim \\mathrm{Poisson}(\\mu_j), \\qquad \\log \\mu_j = \\log(\\mathrm{days}_j) + \\log(\\Lambda_j) + \\epsilon_j$$</p>
+                <p>Expected encounter rate from augmented individuals:</p>
+                <p>$$\\Lambda_j = \\sum_{i=1}^{M} z_i\\,\\lambda_0\\,\\exp\\!\\Big(-\\frac{d_{ij}^2}{2\\sigma^2}\\Big), \\qquad z_i \\sim \\mathrm{Bernoulli}(\\psi)$$</p>
+                <p>Activity centers and camera effects:</p>
+                <p>$$s_i \\sim \\mathrm{Uniform}(S), \\qquad \\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
+                <p>Here \\(S\\) is the buffered state-space. Density is obtained from \\(N = \\sum_i z_i\\) divided by the study-area size. With real coordinates, area comes from the buffered camera state-space; on the toy simulator, area comes from the rectangular simulated state-space. The state-space buffer can be adjusted in Model settings. The app currently reports \\(D_{\\mathrm{km}^2}\\).</p>
+                <h3>Variables</h3>
+                <ul>
+                  <li>\\(y_j\\) — total independent animal detections at camera \\(j\\) across the deployment.</li>
+                  <li>\\(\\mathrm{days}_j\\) — number of deployed days for camera \\(j\\).</li>
+                  <li>\\(\\mu_j\\) — expected number of animal detections at camera \\(j\\) during the deployment.</li>
+                  <li>\\(\\lambda_0\\) — expected detections per deployed day if an animal\'s activity center were at the camera.</li>
+                  <li>\\(\\sigma\\) — spatial scale parameter (km), related to home-range size and how quickly detection falls with distance.</li>
+                  <li>\\(s_i\\) — activity center of augmented individual \\(i\\), located within the buffered state-space \\(S\\).</li>
+                  <li>\\(d_{ij}\\) — projected distance (km) from augmented individual \\(i\\)\'s activity center to camera \\(j\\).</li>
+                  <li>\\(M\\) — upper limit of the prior distribution for total abundance in the augmented population.</li>
+                  <li>\\(z_i\\) — indicator that augmented individual \\(i\\) is part of the real population.</li>
+                </ul>
+                <h3>Default priors used in the app (can be changed in Model settings)</h3>
+                <ul>
+                  <li>\\(M = 100\\), the starting upper bound on total abundance used for data augmentation. If the posterior presses against \\(M\\), the app increases it and reruns the model.</li>
+                  <li>\\(\\log \\sigma \\sim \\mathcal{N}(-1.5269,\\,0.1535)\\), which corresponds to an average 95% circular home-range size of about 0.89 km² (Christensen et al. in prep). The state-space buffer defaults to 1.05&times; the 99% home-range radius implied by this prior, and the app grows it to 1.01&times; the required radius (and reruns) if the posterior sigma would need a bigger buffer.</li>
+                  <li>\\(\\log \\lambda_0 \\sim \\mathcal{N}(0,\\,1)\\), centered near one expected detection per deployed day when the activity center is at the camera.</li>
+                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1,1)\\), giving the camera-level random-effect standard deviation a prior mean of 1 and variance of 1.</li>
+                  <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
+                </ul>
+              </div>
+            </details>
+            '),
+            tags$script(HTML("
+              function processMathJax(element) {
+                if (window.MathJax) {
+                  if (window.MathJax.typesetPromise) {
+                    MathJax.typesetPromise([element]).catch(function(err) {
+                      console.log('MathJax error:', err);
+                    });
+                  } else if (window.MathJax.typeset) {
+                    MathJax.typeset([element]);
+                  }
+                }
+              }
+              setTimeout(function() {
+                var content = document.getElementById('uscr-content');
+                if (content) {
+                  processMathJax(content);
+                  var details = content.querySelector('details');
+                  if (details) {
+                    details.addEventListener('toggle', function(e) {
+                      if (e.target.open) {
+                        setTimeout(function() {
+                          processMathJax(content);
+                        }, 300);
+                      }
+                    });
+                  }
+                }
+              }, 500);
+            "))
+          ),
+          hr(),
+          h4("Uploaded field data"),
+          div(
+            actionButton("run_uscr_nps", "Run USCR on uploaded data", class = "btn-primary"),
+            style = "margin-bottom: 10px;"
+          ),
+          br(),
+          verbatimTextOutput("uscr_nps_text"),
+          h5("Run status & troubleshooting"),
+          verbatimTextOutput("uscr_nps_debug"),
+          
+          hr(),
+          h4("Simulated data"),
+          p(
+            style = "max-width: 52rem;",
+            "USCR runs on the",
+            tags$strong("shared spatial simulator"),
+            " generated in the Simulate data tab, so it can be compared and combined with simulated REM and TTE."
+          ),
+          div(
+            actionButton("run_uscr_sim", "Run USCR on simulated data", class = "btn-primary"),
+            style = "margin-bottom: 10px;"
+          ),
+          br(),
+          verbatimTextOutput("uscr_sim_text"),
+          h5("Run status & troubleshooting"),
+          verbatimTextOutput("uscr_sim_debug"),
+          tags$div(
+            style = "text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0;",
+            tags$h3(style = "margin: 0; color: var(--rw3);", "DEER App"),
+            tags$p(style = "margin: 5px 0 0 0; color: var(--muted);", "Density Estimation from Encounter Rates")
+          )
+        ),
+        
+        # ---------------------- REM TAB -------------------------
+        nav_panel(
+          "REM",
+          tags$div(
+            id = "rem-content",
+            HTML('
+            <h2>Model 2 — REM (Random Encounter Model)</h2>
+            <p><strong>The gist:</strong> Converts <strong>how often animals pass a camera</strong> into density, correcting for <strong>movement speed</strong> and <strong>camera view geometry</strong>.</p>
+            <details>
+              <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
+              <div style="margin: 1rem 0; padding-left: 1rem;">
+                <p>Per-camera Poisson model:</p>
+                <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j)$$</p>
+                <p>$$\\log \\lambda_j = \\log D + \\log(\\mathrm{days}_j) + \\log v + \\log r_j + \\log\\!\\Big(\\frac{2 + \\theta_{\\mathrm{rad},j}}{\\pi}\\Big) + \\epsilon_j$$</p>
+                <p>$$\\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
+                <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
+                <h3>Variables</h3>
+                <ul>
+                  <li>\\(y_j\\) — number of independent animal detection events at camera \\(j\\).</li>
+                  <li>\\(\\mathrm{days}_j\\) — deployed days for camera \\(j\\).</li>
+                  <li>\\(D\\) — animal density in animals/km².</li>
+                  <li>\\(v\\) — animal movement speed (km/day).</li>
+                  <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
+                  <li>\\(\\theta_{\\mathrm{rad},j}\\) — full detection angle used for camera \\(j\\) (radians).</li>
+                  <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts.</li>
+                </ul>
+                <h3>Default priors/inputs used in the app</h3>
+                <ul>
+                  <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density, with \\(D_{\\max} = 200\\) by default. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
+                  <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day (Christensen et al. in prep).</li>
+                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
+                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
+                  <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
+                </ul>
+              </div>
+            </details>
+            '),
+            tags$script(HTML("
+              function processMathJax(element) {
+                if (window.MathJax) {
+                  if (window.MathJax.typesetPromise) {
+                    MathJax.typesetPromise([element]).catch(function(err) {
+                      console.log('MathJax error:', err);
+                    });
+                  } else if (window.MathJax.typeset) {
+                    MathJax.typeset([element]);
+                  }
+                }
+              }
+              setTimeout(function() {
+                var content = document.getElementById('rem-content');
+                if (content) {
+                  processMathJax(content);
+                  var details = content.querySelector('details');
+                  if (details) {
+                    details.addEventListener('toggle', function(e) {
+                      if (e.target.open) {
+                        setTimeout(function() {
+                          processMathJax(content);
+                        }, 300);
+                      }
+                    });
+                  }
+                }
+              }, 500);
+            "))
+          ),
+          hr(),
+          h4("Uploaded field data"),
+          div(
+            actionButton("run_rem_nps", "Run REM on uploaded data", class = "btn-primary"),
+            style = "margin-bottom: 10px;"
+          ),
+          br(),
+          verbatimTextOutput("rem_nps_text"),
+          h5("Run status & troubleshooting"),
+          verbatimTextOutput("rem_nps_debug"),
+          
+          hr(),
+          h4("Simulated data"),
+          p(
+            style = "max-width: 52rem;",
+            "REM runs on the",
+            tags$strong("shared spatial simulator"),
+            " generated in the Simulate data tab, so it can be compared and combined with simulated USCR and TTE."
+          ),
+          div(
+            actionButton("run_rem_sim", "Run REM on simulated data", class = "btn-primary"),
+            style = "margin-bottom: 10px;"
+          ),
+          br(),
+          verbatimTextOutput("rem_sim_text"),
+          h5("Run status & troubleshooting"),
+          verbatimTextOutput("rem_sim_debug"),
+          tags$div(
+            style = "text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0;",
+            tags$h3(style = "margin: 0; color: var(--rw3);", "DEER App"),
+            tags$p(style = "margin: 5px 0 0 0; color: var(--muted);", "Density Estimation from Encounter Rates")
+          )
+        ),
+        
+        # ---------------------- TTE MODEL TAB -------------------------
+        nav_panel(
+          "TTE model",
+          tags$div(
+            id = "tte-content",
+            HTML('
+            <h2>Model 3 — TTE (Time‑to‑Event)</h2>
+            <p><strong>The gist:</strong> Uses <strong>animal detection events per camera</strong>, scaled by <strong>movement-based time units</strong> and the <strong>viewshed area</strong>. Shorter effective time between encounters implies higher density.</p>
+            <details>
+              <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
+              <div style="margin: 1rem 0; padding-left: 1rem;">
+                <p>Per-camera Poisson model:</p>
+                <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j), \\qquad \\log \\lambda_j \\;=\\; \\log D \\;+\\; \\log(\\mathrm{days}_j)\\;+\\;\\log(U_j)\\;+\\;\\log(A_j)\\;+\\;\\epsilon_j$$</p>
+                <p>Movement-based encounter multiplier, viewshed area, and camera effect:</p>
+                <p>$$U_j \\;=\\; \\frac{v}{f(\\theta_j)\\,r_j}, \\qquad A_j \\;=\\; \\pi r_j^2 \\frac{\\theta_{\\mathrm{deg},j}}{360}, \\qquad \\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
+                <p>with \\(f(\\theta_j) = 0.3324 + 0.005580\\,\\theta_j - 1.454\\times10^{-5}\\,\\theta_j^2\\), where \\(\\theta_j\\) is the full camera detection angle in degrees.</p>
+                <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
+                <h3>Variables</h3>
+                <ul>
+                  <li>\\(y_j\\) — number of animal detection events for camera \\(j\\).</li>
+                  <li>\\(\\mathrm{days}_j\\) — total deployed days for camera \\(j\\).</li>
+                  <li>\\(U_j\\) — the time needed to move across the average camera viewshed width \\(j\\).</li>
+                  <li>\\(v\\) — movement speed (km/day); prior on \\(\\log v\\) as below.</li>
+                  <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
+                  <li>\\(\\theta_{\\mathrm{deg},j}\\) — full detection angle used for camera \\(j\\) (degrees).</li>
+                  <li>\\(A_j\\) — viewshed area for camera \\(j\\) (km²).</li>
+                  <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts.</li>
+                </ul>
+                <h3>Default priors/inputs used in the app</h3>
+                <ul>
+                  <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density, with \\(D_{\\max} = 200\\) by default. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
+                  <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day (Christensen et al. in prep).</li>
+                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
+                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
+                  <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
+                </ul>
+              </div>
+            </details>
+            '),
+            tags$script(HTML("
+              function processMathJax(element) {
+                if (window.MathJax) {
+                  if (window.MathJax.typesetPromise) {
+                    MathJax.typesetPromise([element]).catch(function(err) {
+                      console.log('MathJax error:', err);
+                    });
+                  } else if (window.MathJax.typeset) {
+                    MathJax.typeset([element]);
+                  }
+                }
+              }
+              setTimeout(function() {
+                var content = document.getElementById('tte-content');
+                if (content) {
+                  processMathJax(content);
+                  var details = content.querySelector('details');
+                  if (details) {
+                    details.addEventListener('toggle', function(e) {
+                      if (e.target.open) {
+                        setTimeout(function() {
+                          processMathJax(content);
+                        }, 300);
+                      }
+                    });
+                  }
+                }
+              }, 500);
+            "))
+          ),
+          hr(),
+          h4("Uploaded field data"),
+          div(
+            actionButton("run_tte_nps", "Run TTE on uploaded data", class = "btn-primary"),
+            style = "margin-bottom: 10px;"
+          ),
+          br(),
+          verbatimTextOutput("tte_nps_text"),
+          h5("Run status & troubleshooting"),
+          verbatimTextOutput("tte_nps_debug"),
+          
+          hr(),
+          h4("Simulated data"),
+          p(
+            style = "max-width: 52rem;",
+            "TTE runs on the",
+            tags$strong("shared spatial simulator"),
+            " generated in the Simulate data tab, so it can be compared and combined with simulated USCR and REM."
+          ),
+          div(
+            actionButton("run_tte_sim", "Run TTE on simulated data", class = "btn-primary"),
+            style = "margin-bottom: 10px;"
+          ),
+          br(),
+          verbatimTextOutput("tte_sim_text"),
+          h5("Run status & troubleshooting"),
+          verbatimTextOutput("tte_sim_debug"),
+          tags$div(
+            style = "text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0;",
+            tags$h3(style = "margin: 0; color: var(--rw3);", "DEER App"),
+            tags$p(style = "margin: 5px 0 0 0; color: var(--muted);", "Density Estimation from Encounter Rates")
+          )
+        ),
+        
+        # ---------------------- COMPARE & COMBINE --------------------
+        nav_panel(
+          "Compare & combine",
+          markdown(paste(
+            "**Uploaded field data:** the table below updates as REM, TTE, and USCR finish. If only some models have completed, the table will still summarize the completed fits.",
+            "",
+            "1. Compute ΔWAIC and WAIC weights when multiple models are available and WAIC is available for all completed fits;",
+            "2. Combine posterior draws of density (animals/km²) across the completed fits;",
+            "3. Report model-specific densities, and when possible also report unweighted and WAIC-weighted summaries plus the probability that density exceeds the user-set threshold. If WAIC is missing for one or more completed fits, only the unweighted summary is shown.",
+            "",
+            "**Simulated data:** if you run USCR, REM, and TTE from the **shared spatial simulator**, the table below will compare and combine those completed simulated fits too.",
+            "",
+            "Run the models from their tabs first, then check the tables.",
+            sep = "\n"
+          )),
+          numericInput(
+            "combo_density_threshold",
+            "Density threshold for probability summary (animals/km²)",
+            value = 20,
+            min = 0,
+            step = 1
+          ),
+          
+          h4("Uploaded field data – model comparison and combined results (animals/km²)"),
+          DTOutput("nps_combo_table"),
+          h5("Visual summaries"),
+          plotOutput("nps_combo_interval_plot", height = "320px"),
+          div(
+            downloadButton("dl_nps_combo_interval_png", "Download uploaded-data interval plot (PNG)"),
+            style = "margin-bottom: 12px;"
+          ),
+          plotOutput("nps_combo_density_plot", height = "320px"),
+          div(
+            downloadButton("dl_nps_combo_density_png", "Download uploaded-data posterior overlay (PNG)"),
+            style = "margin-bottom: 12px;"
+          ),
+          p("Posterior summaries (all monitored parameters, mean, 95% CI) for each completed model:"),
+          downloadButton("dl_nps_all_csv", "Download available uploaded-data posterior summaries (CSV)"),
+          posterior_param_legend(),
+
+          hr(),
+          h4("Simulated data – shared spatial simulator comparison (animals/km²)"),
+          DTOutput("sim_combo_table"),
+          h5("Visual summaries"),
+          plotOutput("sim_combo_interval_plot", height = "320px"),
+          div(
+            downloadButton("dl_sim_combo_interval_png", "Download simulated interval plot (PNG)"),
+            style = "margin-bottom: 12px;"
+          ),
+          plotOutput("sim_combo_density_plot", height = "320px"),
+          div(
+            downloadButton("dl_sim_combo_density_png", "Download simulated posterior overlay (PNG)"),
+            style = "margin-bottom: 12px;"
+          ),
+          p(class = "small", style = "color: var(--muted);",
+            "Only fits from the current shared spatial simulator are combined here."),
+          downloadButton("dl_sim_uscr_csv", "Download available shared-simulation posterior summaries (CSV)"),
+          posterior_param_legend()
+        ),
+        
         # ---------------------- SIMULATE DATA -------------------------
         nav_panel(
           "Simulate data",
@@ -952,7 +1672,7 @@ ui <- page_fillable(
                   sliderInput("r_m_sim", "Detection radius for REM/TTE model inputs (m)",
                               min = 8, max = 25, value = 12, step = 1),
                   p(class = "small", style = "color: var(--muted); margin-bottom: 0;",
-                    "Detection radius is not used to generate the spatial detections themselves. It is only carried into the shared simulated model-input table used by REM and TTE. The fallback detection angle for simulated REM/TTE runs is set under ",
+                    "Detection radius is not used to generate the spatial detections themselves. It is only carried into the shared simulated model-input table used by REM and TTE. The default detection angle for simulated REM/TTE runs is set under ",
                     tags$strong("Model settings"),
                     ".")
                 )
@@ -1160,685 +1880,6 @@ ui <- page_fillable(
           ),
           h3("Camera coordinates"),
           DTOutput("camera_array_table")
-        ),
-        
-        # ---------------------- ADD YOUR DATA -------------------------
-        nav_panel(
-          "Add your data",
-          markdown(paste(
-            "Upload a **deployment CSV** (where and when cameras were set and recording) and an **images CSV** (timestamps, species, counts, and Cluster IDs).",
-            "The current upload checker expects the exact column names listed below.",
-            "",
-            sep = "\n"
-          )),
-          h3("The app will:"),
-          markdown(paste(
-            "1. Check required columns and data types;",
-            "2. Flag image timestamps that fall outside the deployment window;",
-            "3. Optionally trim each camera deployment length to meet study design criteria.",
-            "4. Generate downloadable CSVs of data with any corrections.",
-            "",
-            "Once data are uploaded and checked, click on the",
-            "**Model settings** tab to select the species for analysis and",
-            "configure MCMC and priors. Once you are satisfied with model",
-            "settings, you run models in the **USCR**/**REM**/**TTE** tabs.",
-            "",
-            "---",
-            "",
-            "## Required data columns",
-            "",
-            "### Deployment file columns (**bold = required**, others optional for quality control):",
-            "",
-            "- **`Site Name`** — Camera site identifier",
-            "- `Site` — Optional broader site identifier",
-            "- `Camera ID` — Optional camera identifier",
-            "- `SD Card ID` — Optional SD card identifier",
-            "- **`Start Date`** — Deployment start date (`MM/DD/YYYY`)",
-            "- **`Start Time`** — Deployment start time (`HH:MM:SS`)",
-            "- **`End Date`** — Deployment end date (`MM/DD/YYYY`)",
-            "- **`End Time`** — Deployment end time (`HH:MM:SS`)",
-            "- **`Latitude`** — Camera latitude (decimal degrees)",
-            "- **`Longitude`** — Camera longitude (decimal degrees)",
-            "- `Camera Model` — Optional camera make/model field for recordkeeping (for example `Browning Strike Force Pro`)",
-            "- `Camera Detection Angle` — Optional full detection angle in degrees for that camera. If left blank, the app uses the default angle from Model settings.",
-            "- `Camera Height` — Optional camera height (meters)",
-            "- `Camera Orientation` — Optional cardinal direction (for example `N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, `NW`) or 0-359 degrees",
-            "- **`Camera Functioning`** — Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted",
-            "- **`Camera Malfunction Date`** — Keep this value blank for cameras that did not malfunction. Enter the failure date (`MM/DD/YYYY`) if the camera failed.",
-            "- **`Detection Distance`** — Effective detection radius in meters",
-            "",
-            "### **Images file** required columns:",
-            "",
-            "- **`Site Name`** — Camera site identifier. These identifiers must match identifiers in the deployment file.",
-            "- **`Timestamp`** — Image timestamp. Preferred format: `MM/DD/YYYY HH:MM:SS`.",
-            "- **`Species`** — Species identifier. Pipe-delimited values such as `deer|squirrel` are allowed for multi-species rows, and the order must match `Sighting Count`.",
-            "- **`Cluster ID`** — Unique identifier for independent detection events",
-            "- **`Sighting Count`** — Number of individuals in the image; pipe-delimited values such as `1|3` are allowed for multi-species rows and should follow the same order as `Species`.",
-            "- `Image URL` — Optional image reference/link column. If included, store it as plain text in a single column, one value per row.",
-            "",
-            "**Notes:** Deployment QC expects date-only fields in `MM/DD/YYYY`. Image timestamps are parsed more flexibly if needed, including 2-digit years (for example `2/3/25`).",
-            "The app expects the exact column names listed above. Files from other tagging workflows can usually be renamed to match.",
-            "Cross-year winter surveys (for example `12/2025` to `01/2026`) are supported; the app uses the actual deployment dates/times and image timestamps, so no separate `Survey Year` field is required.",
-            sep = "\n"
-          )),
-          
-          h3("Step 1: Deployment file"),
-          fileInput("deployment_csv", "Upload deployment CSV", accept = ".csv"),
-          h4("Deployment check log"),
-          verbatimTextOutput("deployment_check_log"),
-          h4("Preview of cleaned deployment data"),
-          DTOutput("deployment_preview"),
-          downloadButton("download_deployment_checked", "Download cleaned deployment CSV"),
-          
-          hr(),
-          
-          h3("Step 2: Images file"),
-          fileInput("images_csv", "Upload images CSV", accept = ".csv"),
-          checkboxInput(
-            "apply_56day_trim",
-            "After validation, trim each camera deployment length to a user-set number of days.",
-            value = TRUE
-          ),
-          conditionalPanel(
-            "input.apply_56day_trim",
-            numericInput(
-              "trim_days",
-              "Deployment length to keep (days)",
-              value = 56,
-              min = 1,
-              step = 1
-            )
-          ),
-          h4("Images check log"),
-          verbatimTextOutput("images_check_log"),
-          h4("Preview of processed images data"),
-          DTOutput("images_preview"),
-          downloadButton("download_images_checked", "Download processed images CSV"),
-          
-          hr()
-        ),
-        
-    # ---------------------- MODEL SETTINGS -------------------------
-        nav_panel(
-          "Model settings",
-          
-          h4("Species to analyze"),
-          "First, you must select the species to analyze.",
-          selectInput(
-            inputId = "species_to_analyze",
-            label = "Select species to analyze",
-            choices = character(0)
-          ),
-          tableOutput("species_count_summary"),
-          hr(),
-          
-          markdown(paste(
-            "### Run defaults",
-            "",
-            "**Current app defaults**:",
-            "",
-            "- **Number of chains**: 2 by default; the app enforces a minimum of 2 chains for model runs",
-            "- **REM/TTE**: adaptive runs start from 6000 iterations, 1000 burn-in, and thin = 5",
-            "- **USCR**: adaptive runs start from 6000 iterations, 1000 burn-in, thin = 5, and M = 300",
-            "- **Convergence criteria**: R̂ < 1.1 for all monitored parameters",
-            "",
-            "The app handles chain counts and reruns internally, so users do not need to manually edit iterations, thinning, or data-augmentation size in the interface.",
-            "If convergence is still poor after a run, review the run-status panel and consider whether the priors need to better match your site or species.",
-            "",
-            "### Prior distributions",
-            "",
-            "The priors below are grouped by model type.",
-            "The current defaults are calibrated for white-tailed deer using home-range size and daily movement information from the literature.",
-            "These defaults may not be well calibrated for other species or field conditions.",
-            "Model output can be sensitive to prior choice, so users working on other species should adjust the priors to better match their system.",
-            "",
-            "### Default camera geometry",
-            "",
-            "Default detection angle is 55° (based on Browning-style camera specifications). This value is used for simulated runs and for uploaded cameras that do not include a `Camera Detection Angle` value.",
-            "",
-            sep = "\n"
-          )),
-          
-          h4("Default camera geometry"),
-          fluidRow(
-            column(12,
-              sliderInput("theta", "Default detection angle θ (degrees)",
-                          min = 20, max = 80, value = 55, step = 1)
-            )
-          ),
-          
-          hr(),
-          
-          radioButtons(
-            "mode", "Settings mode",
-            choices  = c("Simple (recommended)" = "Default", "Advanced" = "Advanced"),
-            selected = "Default",
-            inline   = TRUE
-          ),
-          
-          conditionalPanel(
-            "input.mode == 'Default'",
-            tags$div(
-              class = "about-card",
-              tags$p(
-                tags$strong("Using the app defaults."),
-                " These settings are meant to be a practical starting point for most users."
-              ),
-              tags$ul(
-                tags$li("2 chains are used for all model runs."),
-                tags$li("REM and TTE start from 6000 iterations, 1000 burn-in, and thin = 5."),
-                tags$li("USCR starts from 6000 iterations, 1000 burn-in, thin = 5, and M = 300."),
-                tags$li("The app checks convergence internally and can rerun models when needed."),
-                tags$li("Most users only need to change the default camera angle above or switch to Advanced for species- or site-specific priors.")
-              )
-            )
-          ),
-          
-          conditionalPanel(
-            "input.mode == 'Advanced'",
-            tagList(
-              tags$p(
-                class = "small",
-                style = "color: var(--muted);",
-                "Most users can leave these advanced controls alone. The app manages chain counts and reruns internally, so the advanced controls focus on priors rather than MCMC tuning."
-              ),
-              tags$details(
-                tags$summary(tags$strong("Priors: REM & TTE")),
-                markdown(paste(
-                  "- **D** ~ Uniform(0, D_max): Uniform prior for density. `D_max` should be well above the maximum value of the posterior draws from `D`.",
-                  "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale). The current default corresponds to an average daily movement rate of `3.09 km/day` with an approximate 95% interval of `1.60` to `6.00 km/day`.",
-                  "- **sd_eps** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model. The default `Gamma(1, 1)` prior has mean 1 and variance 1. These shared `sd_eps` controls are used by REM, TTE, and USCR.",
-                  "",
-                  "These defaults are meant for white-tailed deer. If you are working with another species, adjust the priors to match that species and study design.",
-                  "",
-                  sep = "\n"
-                )),
-                fluidRow(
-                  column(6,
-                    numericInput("D_max", "Max density prior (D max, animals/km²)",
-                                 value = 200, min = 10, step = 10),
-                    numericInput("log_v_mean", "log(v) mean (km/day)",
-                                 value = 1.130, step = 0.1),
-                    numericInput("log_v_sd", "log(v) SD",
-                                 value = 0.3372, min = 0.01, step = 0.05)
-                  ),
-                  column(6,
-                    numericInput("sd_eps_shape", "sd_eps gamma shape",
-                                 value = 1, min = 0.1, step = 0.1),
-                    numericInput("sd_eps_rate", "sd_eps gamma rate",
-                                 value = 1, min = 0.1, step = 0.1)
-                  )
-                )
-              ),
-              
-              tags$details(
-                tags$summary(tags$strong("Priors: USCR")),
-                markdown(paste(
-                  "- **M = 300**: Starting upper bound on total abundance, not density. Larger values increase run time, and the app checks whether this starting value is large enough during fitting.",
-                  "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale). The current default corresponds to an average 95% circular home-range size of `0.89 km²` with an approximate 95% interval of `0.48` to `1.62 km²`.",
-                  "- **log(λ₀)** ~ Normal(mean, SD): Prior on expected detections per day when an animal's activity center is at the camera. The default mean of `0` corresponds to about one expected detection per deployed day at the detector because `exp(0) = 1`.",
-                  "- **State-space buffer**: Distance added around the camera array when defining the USCR state-space. Smaller species may need a smaller buffer; larger-ranging species may need a larger one.",
-                  "- **sd_eps** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect. USCR uses the same shared `sd_eps` gamma controls listed in the REM & TTE section above.",
-                  "",
-                  "These defaults are meant for white-tailed deer. If you are working with another species, adjust the priors to better match that species and study design.",
-                  "",
-                  sep = "\n"
-                )),
-                fluidRow(
-                  column(6,
-                    numericInput("log_sigma_mean", "log(σ) mean",
-                                 value = -1.5269, step = 0.1),
-                    numericInput("log_sigma_sd", "log(σ) SD",
-                                 value = 0.1535, min = 0.01, step = 0.05),
-                    numericInput("log_lam0_mean", "log(λ₀) mean",
-                                 value = 0, step = 0.1)
-                  ),
-                  column(6,
-                    numericInput("uscr_buffer_m", "USCR state-space buffer (m)",
-                                 value = 1200, min = 50, step = 50),
-                    numericInput("log_lam0_sd", "log(λ₀) SD",
-                                 value = 1, min = 0.1, step = 0.1)
-                  )
-                )
-              )
-            )
-          ),
-          
-          # Hidden run defaults used in both modes
-          tags$div(
-            style = "display:none;",
-            tags$div(
-              numericInput("n_chains", NULL, value = 2),
-              numericInput("iter_rem_tte", NULL, value = 6000),
-              numericInput("burnin_rem_tte", NULL, value = 1000),
-              numericInput("thin_rem_tte", NULL, value = 5),
-              numericInput("iter_uscr", NULL, value = 6000),
-              numericInput("burnin_uscr", NULL, value = 1000),
-              numericInput("thin_uscr", NULL, value = 5),
-              numericInput("M_uscr", NULL, value = 300),
-              numericInput("D_max", NULL, value = 200),
-              numericInput("log_v_mean", NULL, value = 1.130),
-              numericInput("log_v_sd", NULL, value = 0.3372),
-              numericInput("log_sigma_mean", NULL, value = -1.5269),
-              numericInput("log_sigma_sd", NULL, value = 0.1535),
-              numericInput("uscr_buffer_m", NULL, value = 1200),
-              numericInput("log_lam0_mean", NULL, value = 0),
-              numericInput("log_lam0_sd", NULL, value = 1),
-              numericInput("sd_eps_shape", NULL, value = 1),
-              numericInput("sd_eps_rate", NULL, value = 1)
-            )
-          )
-        ),
-        
-        # ---------------------- DATA SUMMARY --------------------------
-        nav_panel(
-          "Data summary",
-          p(
-            class = "small",
-            style = "color: var(--muted);",
-            "This tab summarizes uploaded deployment and image data. Simulated datasets are summarized in their own model tabs and the Compare & combine tab."
-          ),
-          h4("Site deployment summary"),
-          DTOutput("deploy_summary_table"),
-          leafletOutput("camera_map", height = "300px"),
-          hr(),
-          h4("Uploaded detections by species"),
-          DTOutput("image_summary_table"),
-          plotOutput("species_bar_plot", height = "300px"),
-          hr(),
-          h4("Selected species detections by site"),
-          selectInput(
-            "summary_species",
-            "Species to summarize",
-            choices = character(0)
-          ),
-          DTOutput("deer_summary_table"),
-          plotOutput("deer_bubble_plot", height = "300px"),
-          plotOutput("deer_daily_plot", height = "300px")
-        ),
-        
-        # ---------------------- USCR MODEL TAB ------------------------
-        nav_panel(
-          "USCR model",
-          tags$div(
-            id = "uscr-content",
-            HTML('
-            <h2>Model 1 — USCR (Unmarked Spatial Capture–Recapture)</h2>
-            <p><strong>The gist:</strong> Estimates <strong>animal density in the site/state‑space</strong> by learning from <strong>where and when</strong> animals are detected <strong>across a camera array</strong>.</p>
-            <details>
-              <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
-              <div style="margin: 1rem 0; padding-left: 1rem;">
-                <p>Per-camera observation model:</p>
-                <p>$$y_j \\sim \\mathrm{Poisson}(\\mu_j), \\qquad \\log \\mu_j = \\log(\\mathrm{days}_j) + \\log(\\Lambda_j) + \\epsilon_j$$</p>
-                <p>Expected encounter rate from augmented individuals:</p>
-                <p>$$\\Lambda_j = \\sum_{i=1}^{M} z_i\\,\\lambda_0\\,\\exp\\!\\Big(-\\frac{d_{ij}^2}{2\\sigma^2}\\Big), \\qquad z_i \\sim \\mathrm{Bernoulli}(\\psi)$$</p>
-                <p>Activity centers and camera effects:</p>
-                <p>$$s_i \\sim \\mathrm{Uniform}(S), \\qquad \\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
-                <p>Here \\(S\\) is the buffered state-space. Density is obtained from \\(N = \\sum_i z_i\\) divided by the study-area size. With real coordinates, area comes from the buffered camera state-space; on the toy simulator, area comes from the rectangular simulated state-space. The state-space buffer can be adjusted in Model settings. The app currently reports \\(D_{\\mathrm{km}^2}\\).</p>
-                <h3>Variables</h3>
-                <ul>
-                  <li>\\(y_j\\) — total independent animal detections at camera \\(j\\) across the deployment.</li>
-                  <li>\\(\\mathrm{days}_j\\) — number of deployed days for camera \\(j\\).</li>
-                  <li>\\(\\mu_j\\) — expected number of animal detections at camera \\(j\\) during the deployment.</li>
-                  <li>\\(\\lambda_0\\) — expected detections per deployed day if an animal\'s activity center were at the camera.</li>
-                  <li>\\(\\sigma\\) — spatial scale parameter (km), related to home-range size and how quickly detection falls with distance.</li>
-                  <li>\\(s_i\\) — activity center of augmented individual \\(i\\), located within the buffered state-space \\(S\\).</li>
-                  <li>\\(d_{ij}\\) — projected distance (km) from augmented individual \\(i\\)\'s activity center to camera \\(j\\).</li>
-                  <li>\\(M\\) — upper limit of the prior distribution for total abundance in the augmented population.</li>
-                  <li>\\(z_i\\) — indicator that augmented individual \\(i\\) is part of the real population.</li>
-                </ul>
-                <h3>Default priors used in the app (can be changed in Model settings)</h3>
-                <ul>
-                  <li>\\(M = 300\\), the starting upper bound on total abundance used for data augmentation. If the posterior presses against \\(M\\), the app increases it and reruns the model.</li>
-                  <li>\\(\\log \\sigma \\sim \\mathcal{N}(-1.5269,\\,0.1535)\\), which corresponds to an average 95% circular home-range size of about 0.89 km².</li>
-                  <li>\\(\\log \\lambda_0 \\sim \\mathcal{N}(0,\\,1)\\), centered near one expected detection per deployed day when the activity center is at the camera.</li>
-                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1,1)\\), giving the camera-level random-effect standard deviation a prior mean of 1 and variance of 1.</li>
-                </ul>
-              </div>
-            </details>
-            '),
-            tags$script(HTML("
-              function processMathJax(element) {
-                if (window.MathJax) {
-                  if (window.MathJax.typesetPromise) {
-                    MathJax.typesetPromise([element]).catch(function(err) {
-                      console.log('MathJax error:', err);
-                    });
-                  } else if (window.MathJax.typeset) {
-                    MathJax.typeset([element]);
-                  }
-                }
-              }
-              setTimeout(function() {
-                var content = document.getElementById('uscr-content');
-                if (content) {
-                  processMathJax(content);
-                  var details = content.querySelector('details');
-                  if (details) {
-                    details.addEventListener('toggle', function(e) {
-                      if (e.target.open) {
-                        setTimeout(function() {
-                          processMathJax(content);
-                        }, 300);
-                      }
-                    });
-                  }
-                }
-              }, 500);
-            "))
-          ),
-          hr(),
-          h4("Uploaded field data"),
-          div(
-            actionButton("run_uscr_nps", "Run USCR on uploaded data", class = "btn-primary"),
-            actionButton("pause_resume_uscr_nps", "Pause/Resume", class = "btn-warning", style = "margin-left: 10px;"),
-            actionButton("stop_uscr_nps", "Stop", class = "btn-danger", style = "margin-left: 10px;"),
-            style = "margin-bottom: 10px;"
-          ),
-          checkboxInput(
-            "uscr_fast_mode_nps",
-            "Fast test mode for uploaded USCR",
-            value = FALSE
-          ),
-          p(
-            class = "small",
-            style = "max-width: 52rem; color: var(--muted); margin-top: -0.2rem;",
-            "Fast test mode is for quick checks only. It uses lighter settings and caps adaptive reruns so you can test whether the uploaded-data pipeline works without waiting for a full production run."
-          ),
-          p(
-            class = "small",
-            style = "max-width: 52rem; color: var(--muted); margin-top: -0.2rem;",
-            "Pause waits for the current USCR round to finish, then saves a provisional estimate from the most recent completed round. The same button switches to Resume when a paused USCR fit is available. Provisional paused fits are useful for troubleshooting, but are excluded from Compare & combine by default."
-          ),
-          br(),
-          verbatimTextOutput("uscr_nps_text"),
-          h5("Run status & troubleshooting"),
-          verbatimTextOutput("uscr_nps_debug"),
-          
-          hr(),
-          h4("Simulated data"),
-          p(
-            style = "max-width: 52rem;",
-            "USCR runs on the",
-            tags$strong("shared spatial simulator"),
-            " generated in the Simulate data tab, so it can be compared and combined with simulated REM and TTE."
-          ),
-          div(
-            actionButton("run_uscr_sim", "Run USCR on simulated data", class = "btn-primary"),
-            actionButton("stop_uscr_sim", "Stop", class = "btn-danger", style = "margin-left: 10px;"),
-            style = "margin-bottom: 10px;"
-          ),
-          br(),
-          verbatimTextOutput("uscr_sim_text"),
-          h5("Run status & troubleshooting"),
-          verbatimTextOutput("uscr_sim_debug"),
-          tags$div(
-            style = "text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0;",
-            tags$h3(style = "margin: 0; color: var(--rw3);", "DEER App"),
-            tags$p(style = "margin: 5px 0 0 0; color: var(--muted);", "Density Estimation from Encounter Rates")
-          )
-        ),
-        
-        # ---------------------- REM TAB -------------------------
-        nav_panel(
-          "REM",
-          tags$div(
-            id = "rem-content",
-            HTML('
-            <h2>Model 2 — REM (Random Encounter Model)</h2>
-            <p><strong>The gist:</strong> Converts <strong>how often animals pass a camera</strong> into density, correcting for <strong>movement speed</strong> and <strong>camera view geometry</strong>.</p>
-            <details>
-              <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
-              <div style="margin: 1rem 0; padding-left: 1rem;">
-                <p>Per-camera Poisson model:</p>
-                <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j)$$</p>
-                <p>$$\\log \\lambda_j = \\log D + \\log(\\mathrm{days}_j) + \\log v + \\log r_j + \\log\\!\\Big(\\frac{2 + \\theta_{\\mathrm{rad},j}}{\\pi}\\Big) + \\epsilon_j$$</p>
-                <p>$$\\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
-                <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
-                <h3>Variables</h3>
-                <ul>
-                  <li>\\(y_j\\) — number of independent animal detection events at camera \\(j\\).</li>
-                  <li>\\(\\mathrm{days}_j\\) — deployed days for camera \\(j\\).</li>
-                  <li>\\(D\\) — animal density in animals/km².</li>
-                  <li>\\(v\\) — animal movement speed (km/day).</li>
-                  <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
-                  <li>\\(\\theta_{\\mathrm{rad},j}\\) — full detection angle used for camera \\(j\\) (radians).</li>
-                  <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts.</li>
-                </ul>
-                <h3>Default priors/inputs used in the app</h3>
-                <ul>
-                  <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
-                  <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day.</li>
-                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
-                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
-                </ul>
-              </div>
-            </details>
-            '),
-            tags$script(HTML("
-              function processMathJax(element) {
-                if (window.MathJax) {
-                  if (window.MathJax.typesetPromise) {
-                    MathJax.typesetPromise([element]).catch(function(err) {
-                      console.log('MathJax error:', err);
-                    });
-                  } else if (window.MathJax.typeset) {
-                    MathJax.typeset([element]);
-                  }
-                }
-              }
-              setTimeout(function() {
-                var content = document.getElementById('rem-content');
-                if (content) {
-                  processMathJax(content);
-                  var details = content.querySelector('details');
-                  if (details) {
-                    details.addEventListener('toggle', function(e) {
-                      if (e.target.open) {
-                        setTimeout(function() {
-                          processMathJax(content);
-                        }, 300);
-                      }
-                    });
-                  }
-                }
-              }, 500);
-            "))
-          ),
-          hr(),
-          h4("Uploaded field data"),
-          div(
-            actionButton("run_rem_nps", "Run REM on uploaded data", class = "btn-primary"),
-            actionButton("stop_rem_nps", "Stop", class = "btn-danger", style = "margin-left: 10px;"),
-            style = "margin-bottom: 10px;"
-          ),
-          br(),
-          verbatimTextOutput("rem_nps_text"),
-          h5("Run status & troubleshooting"),
-          verbatimTextOutput("rem_nps_debug"),
-          
-          hr(),
-          h4("Simulated data"),
-          p(
-            style = "max-width: 52rem;",
-            "REM runs on the",
-            tags$strong("shared spatial simulator"),
-            " generated in the Simulate data tab, so it can be compared and combined with simulated USCR and TTE."
-          ),
-          div(
-            actionButton("run_rem_sim", "Run REM on simulated data", class = "btn-primary"),
-            style = "margin-bottom: 10px;"
-          ),
-          br(),
-          verbatimTextOutput("rem_sim_text"),
-          h5("Run status & troubleshooting"),
-          verbatimTextOutput("rem_sim_debug"),
-          tags$div(
-            style = "text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0;",
-            tags$h3(style = "margin: 0; color: var(--rw3);", "DEER App"),
-            tags$p(style = "margin: 5px 0 0 0; color: var(--muted);", "Density Estimation from Encounter Rates")
-          )
-        ),
-        
-        # ---------------------- TTE MODEL TAB -------------------------
-        nav_panel(
-          "TTE model",
-          tags$div(
-            id = "tte-content",
-            HTML('
-            <h2>Model 3 — TTE (Time‑to‑Event)</h2>
-            <p><strong>The gist:</strong> Uses <strong>animal detection events per camera</strong>, scaled by <strong>movement-based time units</strong> and the <strong>viewshed area</strong>. Shorter effective time between encounters implies higher density.</p>
-            <details>
-              <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
-              <div style="margin: 1rem 0; padding-left: 1rem;">
-                <p>Per-camera Poisson model:</p>
-                <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j), \\qquad \\log \\lambda_j \\;=\\; \\log D \\;+\\; \\log(\\mathrm{days}_j)\\;+\\;\\log(U_j)\\;+\\;\\log(A_j)\\;+\\;\\epsilon_j$$</p>
-                <p>Movement-based encounter multiplier, viewshed area, and camera effect:</p>
-                <p>$$U_j \\;=\\; \\frac{v}{f(\\theta_j)\\,r_j}, \\qquad A_j \\;=\\; \\pi r_j^2 \\frac{\\theta_{\\mathrm{deg},j}}{360}, \\qquad \\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
-                <p>with \\(f(\\theta_j) = 0.3324 + 0.005580\\,\\theta_j - 1.454\\times10^{-5}\\,\\theta_j^2\\), where \\(\\theta_j\\) is the full camera detection angle in degrees.</p>
-                <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
-                <h3>Variables</h3>
-                <ul>
-                  <li>\\(y_j\\) — number of animal detection events for camera \\(j\\).</li>
-                  <li>\\(\\mathrm{days}_j\\) — total deployed days for camera \\(j\\).</li>
-                  <li>\\(U_j\\) — the time needed to move across the average camera viewshed width \\(j\\).</li>
-                  <li>\\(v\\) — movement speed (km/day); prior on \\(\\log v\\) as below.</li>
-                  <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
-                  <li>\\(\\theta_{\\mathrm{deg},j}\\) — full detection angle used for camera \\(j\\) (degrees).</li>
-                  <li>\\(A_j\\) — viewshed area for camera \\(j\\) (km²).</li>
-                  <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts.</li>
-                </ul>
-                <h3>Default priors/inputs used in the app</h3>
-                <ul>
-                  <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
-                  <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day.</li>
-                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
-                  <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
-                </ul>
-              </div>
-            </details>
-            '),
-            tags$script(HTML("
-              function processMathJax(element) {
-                if (window.MathJax) {
-                  if (window.MathJax.typesetPromise) {
-                    MathJax.typesetPromise([element]).catch(function(err) {
-                      console.log('MathJax error:', err);
-                    });
-                  } else if (window.MathJax.typeset) {
-                    MathJax.typeset([element]);
-                  }
-                }
-              }
-              setTimeout(function() {
-                var content = document.getElementById('tte-content');
-                if (content) {
-                  processMathJax(content);
-                  var details = content.querySelector('details');
-                  if (details) {
-                    details.addEventListener('toggle', function(e) {
-                      if (e.target.open) {
-                        setTimeout(function() {
-                          processMathJax(content);
-                        }, 300);
-                      }
-                    });
-                  }
-                }
-              }, 500);
-            "))
-          ),
-          hr(),
-          h4("Uploaded field data"),
-          div(
-            actionButton("run_tte_nps", "Run TTE on uploaded data", class = "btn-primary"),
-            actionButton("stop_tte_nps", "Stop", class = "btn-danger", style = "margin-left: 10px;"),
-            style = "margin-bottom: 10px;"
-          ),
-          br(),
-          verbatimTextOutput("tte_nps_text"),
-          h5("Run status & troubleshooting"),
-          verbatimTextOutput("tte_nps_debug"),
-          
-          hr(),
-          h4("Simulated data"),
-          p(
-            style = "max-width: 52rem;",
-            "TTE runs on the",
-            tags$strong("shared spatial simulator"),
-            " generated in the Simulate data tab, so it can be compared and combined with simulated USCR and REM."
-          ),
-          div(
-            actionButton("run_tte_sim", "Run TTE on simulated data", class = "btn-primary"),
-            style = "margin-bottom: 10px;"
-          ),
-          br(),
-          verbatimTextOutput("tte_sim_text"),
-          h5("Run status & troubleshooting"),
-          verbatimTextOutput("tte_sim_debug"),
-          tags$div(
-            style = "text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0;",
-            tags$h3(style = "margin: 0; color: var(--rw3);", "DEER App"),
-            tags$p(style = "margin: 5px 0 0 0; color: var(--muted);", "Density Estimation from Encounter Rates")
-          )
-        ),
-        
-        # ---------------------- COMPARE & COMBINE --------------------
-        nav_panel(
-          "Compare & combine",
-          markdown(paste(
-            "**Uploaded field data:** the table updates as REM, TTE, and USCR finish. If only some models have completed, the table will still summarize the completed fits.",
-            "",
-            "1. Compute ΔWAIC and WAIC weights when multiple models are available and WAIC is available for all completed fits;",
-            "2. Combine posterior draws of density (animals/km²) across the completed fits;",
-            "3. Report model-specific densities, and when possible also report unweighted and WAIC-weighted summaries plus the probability that density exceeds the user-set threshold. If WAIC is missing for one or more completed fits, only the unweighted summary is shown.",
-            "",
-            "**Simulated data:** if you run USCR, REM, and TTE from the **shared spatial simulator**, the table below will compare and combine those completed simulated fits too.",
-            "",
-            "Run the models from their tabs first, then check the tables.",
-            sep = "\n"
-          )),
-          numericInput(
-            "combo_density_threshold",
-            "Density threshold for probability summary (animals/km²)",
-            value = 20,
-            min = 0,
-            step = 1
-          ),
-          
-          h4("Uploaded field data – model comparison and combined results (animals/km²)"),
-          DTOutput("nps_combo_table"),
-          h5("Visual summaries"),
-          plotOutput("nps_combo_interval_plot", height = "320px"),
-          div(
-            downloadButton("dl_nps_combo_interval_png", "Download uploaded-data interval plot (PNG)"),
-            style = "margin-bottom: 12px;"
-          ),
-          plotOutput("nps_combo_density_plot", height = "320px"),
-          div(
-            downloadButton("dl_nps_combo_density_png", "Download uploaded-data posterior overlay (PNG)"),
-            style = "margin-bottom: 12px;"
-          ),
-          p("Posterior summaries (all monitored parameters, mean, 95% CI) for each completed model:"),
-          downloadButton("dl_nps_all_csv", "Download available uploaded-data posterior summaries (CSV)"),
-
-          hr(),
-          h4("Simulated data – shared spatial simulator comparison (animals/km²)"),
-          DTOutput("sim_combo_table"),
-          h5("Visual summaries"),
-          plotOutput("sim_combo_interval_plot", height = "320px"),
-          div(
-            downloadButton("dl_sim_combo_interval_png", "Download simulated interval plot (PNG)"),
-            style = "margin-bottom: 12px;"
-          ),
-          plotOutput("sim_combo_density_plot", height = "320px"),
-          div(
-            downloadButton("dl_sim_combo_density_png", "Download simulated posterior overlay (PNG)"),
-            style = "margin-bottom: 12px;"
-          ),
-          p(class = "small", style = "color: var(--muted);",
-            "Only fits from the current shared spatial simulator are combined here."),
-          downloadButton("dl_sim_uscr_csv", "Download available shared-simulation posterior summaries (CSV)")
         )
   )
 )
@@ -1943,7 +1984,7 @@ server <- function(input, output, session) {
         alpha = 0.75
       ) +
       ggrepel::geom_label_repel(
-        aes(label = Site),
+        aes(label = `Site Name`),
         size = 3,
         max.overlaps = Inf,
         fill = "white",
@@ -2415,7 +2456,7 @@ server <- function(input, output, session) {
       {
         withCallingHandlers(
           {
-            check_deployments(deployment_raw)
+            check_deployments(deployment_raw, hemisphere = input$hemisphere, lat_hemisphere = input$lat_hemisphere)
           },
           message = function(m) {
             msgs  <<- c(msgs, m$message)
@@ -2504,8 +2545,23 @@ server <- function(input, output, session) {
       )
     )
     
-    images_raw <- clean_images_import(images_raw)
-    
+    images_raw <- tryCatch(
+      clean_images_import(images_raw),
+      error = function(e) {
+        showNotification(
+          paste("Images file could not be processed:", e$message),
+          type = "error"
+        )
+        images_checked(NULL)
+        images_issues(list(
+          messages = character(),
+          warnings = paste0("ERROR: ", e$message)
+        ))
+        NULL
+      }
+    )
+    if (is.null(images_raw)) return(NULL)
+
     # Re-run deployment QC with images (malfunction date rules use site overlap)
     dep_msgs  <- character()
     dep_warns <- character()
@@ -2513,7 +2569,7 @@ server <- function(input, output, session) {
       {
         withCallingHandlers(
           {
-            check_deployments(deployment_checked(), images_raw)
+            check_deployments(deployment_checked(), images_raw, hemisphere = input$hemisphere, lat_hemisphere = input$lat_hemisphere)
           },
           message = function(m) {
             dep_msgs <<- c(dep_msgs, m$message)
@@ -2554,8 +2610,10 @@ server <- function(input, output, session) {
         withCallingHandlers(
           {
             checked <- check_images(
-              images      = images_raw,
-              deployments = dep_res
+              images         = images_raw,
+              deployments    = dep_res,
+              hemisphere     = input$hemisphere,
+              lat_hemisphere = input$lat_hemisphere
             )
           },
           message = function(m) {
@@ -2580,42 +2638,17 @@ server <- function(input, output, session) {
     )
     
     if (is.null(res)) return(NULL)
-    
-    if (isTRUE(input$apply_56day_trim)) {
-      trim_msgs <- character()
-      trim_days <- input$trim_days
-      if (is.null(trim_days) || is.na(trim_days)) trim_days <- 56L
-      trim_days <- max(1L, as.integer(trim_days))
-      
-      trimmed <- withCallingHandlers(
-        {
-          trim_images_to_days(res, max_days = trim_days)
-        },
-        message = function(m) {
-          trim_msgs <<- c(trim_msgs, m$message)
-          invokeRestart("muffleMessage")
-        },
-        warning = function(w) {
-          warns <<- c(warns, w$message)
-          invokeRestart("muffleWarning")
-        }
-      )
-      
-      images_checked(trimmed)
-      images_issues(list(
-        messages = c(msgs, trim_msgs),
-        warnings = warns
-      ))
-    } else {
-      images_checked(res)
-      images_issues(list(
-        messages = c(
-          msgs,
-          "Skipped the optional deployment-length trim; using all validated images that fall within the deployment windows."
-        ),
-        warnings = warns
-      ))
-    }
+
+    # The deployment-length trim (if enabled) is applied once, anchored on
+    # each camera's Start Date, inside build_nps_model_inputs() via
+    # format_deployments(). Images are stored here unfiltered; the trim
+    # takes effect through the per-camera Start/End Index window rather than
+    # by removing image rows at upload time.
+    images_checked(res)
+    images_issues(list(
+      messages = msgs,
+      warnings = warns
+    ))
   })
   
   output$images_check_log <- renderText({
@@ -2643,13 +2676,7 @@ server <- function(input, output, session) {
   output$download_images_checked <- downloadHandler(
     filename = function() {
       base <- tools::file_path_sans_ext(input$images_csv$name)
-      if (isTRUE(input$apply_56day_trim)) {
-        trim_days <- input$trim_days
-        if (is.null(trim_days) || is.na(trim_days)) trim_days <- 56L
-        paste0(base, "_CHECKED_TRIM", max(1L, as.integer(trim_days)), ".csv")
-      } else {
-        paste0(base, "_CHECKED.csv")
-      }
+      paste0(base, "_CHECKED.csv")
     },
     content = function(file) {
       req(images_checked())
@@ -2666,18 +2693,13 @@ server <- function(input, output, session) {
     summarize_deployments(deployment_checked())
   })
   
-  images_standardized <- reactive({
-    req(images_checked())
-    standardize_deer_species(images_checked())
-  })
-  
   image_summary <- reactive({
-    summarize_images_by_species(images_standardized())
+    summarize_images_by_species(images_checked())
   })
-  
+
   available_species <- reactive({
-    req(images_standardized())
-    species <- sort(unique(images_standardized()$Species))
+    req(images_checked())
+    species <- sort(unique(images_checked()$Species))
     species <- species[!is.na(species) & nzchar(species)]
     species
   })
@@ -2701,16 +2723,16 @@ server <- function(input, output, session) {
   })
   
   species_objects <- reactive({
-    req(images_standardized(), input$summary_species)
-    
+    req(images_checked(), input$summary_species)
+
     list(
-      species_summary = species_summary_per_site(images_standardized(), input$summary_species),
+      species_summary = species_summary_per_site(images_checked(), input$summary_species),
       species_counts  = species_counts_per_camera(
-        images_standardized(),
+        images_checked(),
         input$summary_species,
         deployments = deployment_checked()
       ),
-      daily_species   = species_daily_detections(images_standardized(), input$summary_species)
+      daily_species   = species_daily_detections(images_checked(), input$summary_species)
     )
   })
   
@@ -2898,12 +2920,10 @@ server <- function(input, output, session) {
       guidance = "No run has been started yet.",
       raw_error = NULL,
       context = character(),
-      pause_queued = FALSE,
-      stop_queued = FALSE,
       history = character()
     )
   }
-  
+
   update_model_debug <- function(rv,
                                  status = NULL,
                                  stage = NULL,
@@ -2911,21 +2931,17 @@ server <- function(input, output, session) {
                                  finished_at = NULL,
                                  guidance = NULL,
                                  raw_error = NULL,
-                                 pause_queued = NULL,
-                                 stop_queued = NULL,
                                  context = NULL,
                                  log_entry = NULL) {
     state <- rv()
     if (is.null(state)) state <- list()
-    
+
     if (!is.null(status)) state$status <- status
     if (!is.null(stage)) state$stage <- stage
     if (!is.null(started_at)) state$started_at <- started_at
     if (!is.null(finished_at)) state$finished_at <- finished_at
     if (!is.null(guidance)) state$guidance <- guidance
     if (!is.null(raw_error)) state$raw_error <- raw_error
-    if (!is.null(pause_queued)) state$pause_queued <- pause_queued
-    if (!is.null(stop_queued)) state$stop_queued <- stop_queued
     if (!is.null(context)) state$context <- context
     if (!is.null(log_entry)) {
       state$history <- c(
@@ -2943,26 +2959,26 @@ server <- function(input, output, session) {
     format(round(x, digits), nsmall = digits, trim = TRUE)
   }
 
-  get_camera_angle_vector <- function(out, fallback_deg = 55) {
-    fallback_deg <- as.numeric(fallback_deg[[1]])
-    if (!is.finite(fallback_deg)) fallback_deg <- 55
-    fallback_deg <- max(1, min(360, fallback_deg))
+  get_camera_angle_vector <- function(out, default_deg = 55) {
+    default_deg <- as.numeric(default_deg[[1]])
+    if (!is.finite(default_deg)) default_deg <- 55
+    default_deg <- max(1, min(360, default_deg))
 
     if (!"Camera Detection Angle" %in% names(out)) {
-      return(rep(fallback_deg, nrow(out)))
+      return(rep(default_deg, nrow(out)))
     }
 
     theta_raw <- suppressWarnings(as.numeric(out$`Camera Detection Angle`))
     theta_use <- theta_raw
-    theta_use[is.na(theta_use) | theta_use <= 0 | theta_use > 360] <- fallback_deg
+    theta_use[is.na(theta_use) | theta_use <= 0 | theta_use > 360] <- default_deg
     theta_use
   }
 
-  summarize_camera_angle_source <- function(out, fallback_deg = 55) {
-    theta_use <- get_camera_angle_vector(out, fallback_deg = fallback_deg)
+  summarize_camera_angle_source <- function(out, default_deg = 55) {
+    theta_use <- get_camera_angle_vector(out, default_deg = default_deg)
     has_column <- "Camera Detection Angle" %in% names(out)
     theta_raw <- if (has_column) suppressWarnings(as.numeric(out$`Camera Detection Angle`)) else numeric(0)
-    n_fallback <- if (has_column) {
+    n_default <- if (has_column) {
       sum(is.na(theta_raw) | theta_raw <= 0 | theta_raw > 360, na.rm = FALSE)
     } else {
       nrow(out)
@@ -2976,25 +2992,25 @@ server <- function(input, output, session) {
     )
 
     if (!has_column) {
-      return(paste("Camera detection angle:", range_text, "(all cameras using fallback from Model settings)"))
+      return(paste("Camera detection angle:", range_text, "(all cameras using default from Model settings)"))
     }
 
-    if (n_fallback > 0) {
+    if (n_default > 0) {
       return(paste(
         "Camera detection angle:",
         range_text,
-        paste0("(", n_fallback, " camera(s) using the fallback angle from Model settings)")
+        paste0("(", n_default, " camera(s) using the default angle from Model settings)")
       ))
     }
 
     paste("Camera detection angle:", range_text, "(from uploaded deployment data)")
   }
   
-  summarize_uscr_context <- function(d, source_label = "Uploaded", sim_truth = NULL, fast_mode = FALSE) {
-    effective_iter <- if (isTRUE(fast_mode)) min(as.integer(input$iter_uscr), 4000L) else as.integer(input$iter_uscr)
-    effective_burnin <- if (isTRUE(fast_mode)) min(as.integer(input$burnin_uscr), 500L) else as.integer(input$burnin_uscr)
-    effective_thin <- if (isTRUE(fast_mode)) max(1L, min(as.integer(input$thin_uscr), 4L)) else as.integer(input$thin_uscr)
-    effective_M <- if (isTRUE(fast_mode)) min(as.integer(input$M_uscr), 200L) else as.integer(input$M_uscr)
+  summarize_uscr_context <- function(d, source_label = "Uploaded", sim_truth = NULL) {
+    effective_iter <- as.integer(input$iter_uscr)
+    effective_burnin <- as.integer(input$burnin_uscr)
+    effective_thin <- as.integer(input$thin_uscr)
+    effective_M <- as.integer(input$M_uscr)
 
     det_dist <- if ("Detection Distance" %in% names(d$out)) {
       paste0(
@@ -3023,11 +3039,7 @@ server <- function(input, output, session) {
         )
       ),
       paste("USCR state-space buffer:", format_num(input$uscr_buffer_m, 0), "m"),
-      if (isTRUE(fast_mode)) {
-        "USCR fast test mode is ON: adaptive reruns are capped and lighter run settings are used for faster exploratory runs."
-      } else {
-        "Adaptive tuning may start with shorter runs but now uses the same chain count shown above."
-      },
+      "USCR reruns automatically at the same chain count shown above: iterations and burn-in double when Rhat is too high, M doubles when psi indicates the augmentation bound is too small, and the state-space buffer grows when the posterior sigma implies animals near the edge could still be detected.",
       if (source_label == "Uploaded") {
         "Supported sources here: uploaded field data and the shared spatial simulator."
       } else {
@@ -3066,7 +3078,7 @@ server <- function(input, output, session) {
           " m"
         )
       ),
-      summarize_camera_angle_source(d$out, fallback_deg = input$theta),
+      summarize_camera_angle_source(d$out, default_deg = input$theta),
       paste(
         "Requested REM run:",
         paste0(
@@ -3095,7 +3107,7 @@ server <- function(input, output, session) {
           " m"
         )
       ),
-      summarize_camera_angle_source(d$out, fallback_deg = input$theta),
+      summarize_camera_angle_source(d$out, default_deg = input$theta),
       paste(
         "Requested TTE run:",
         paste0(
@@ -3106,7 +3118,7 @@ server <- function(input, output, session) {
         )
       ),
       "Supported sources here: uploaded field data only.",
-      "Current app preprocessing: TTE is receiving total animal events per camera and camera-days."
+      "Preprocessing: TTE uses total animal events per camera and camera-days."
     )
   }
   
@@ -3121,7 +3133,7 @@ server <- function(input, output, session) {
           ", burn-in=", input$burnin_rem_tte,
           ", thin=", input$thin_rem_tte,
           ", chains=", app_n_chains(),
-          ", fallback angle=", input$theta,
+          ", default angle=", input$theta,
           " degrees"
         )
       ),
@@ -3132,7 +3144,7 @@ server <- function(input, output, session) {
           ", burn-in=", input$burnin_rem_tte,
           ", thin=", input$thin_rem_tte,
           ", chains=", app_n_chains(),
-          ", fallback angle=", input$theta,
+          ", default angle=", input$theta,
           " degrees"
         )
       ),
@@ -3173,53 +3185,44 @@ server <- function(input, output, session) {
     }
     
     if (identical(model, "USCR")) {
-      tips <- c(tips, "USCR does short adaptive tuning runs before the full run, and the final run is checked against the same convergence target. If it is too slow for testing, reduce chains, iterations, or M.")
+      tips <- c(tips, "USCR doubles iterations and burn-in automatically when Rhat is too high, doubles M when psi indicates the augmentation bound is too small, and grows the state-space buffer when the posterior sigma is larger than the buffer safely covers, so longer runs can be expected when any check fails. If it is too slow for testing, reduce chains, iterations, or M.")
     }
     if (identical(model, "REM")) {
       tips <- c(tips, "REM expects per-camera animal events, camera-days, and detection distances.")
-      tips <- c(tips, "REM now doubles iterations automatically until the maximum Rhat is acceptable, so longer runs can be expected when convergence is slow.")
+      tips <- c(tips, "REM doubles iterations and burn-in automatically when Rhat is too high, so longer runs can be expected when convergence is slow.")
     }
     if (identical(model, "TTE")) {
-      tips <- c(tips, "TTE expects per-camera animal events, camera-days, and detection distances. The current build passes total animal events per camera to TTE.")
-      tips <- c(tips, "TTE now doubles iterations automatically until the maximum Rhat is acceptable, so longer runs can be expected when convergence is slow.")
+      tips <- c(tips, "TTE expects per-camera animal events, camera-days, and detection distances.")
+      tips <- c(tips, "TTE doubles iterations and burn-in automatically when Rhat is too high, so longer runs can be expected when convergence is slow.")
     }
     
     paste(tips, collapse = "\n")
   }
 
-  make_encounter_status_callback <- function(rv, model_label, set_progress = NULL, notification_id = NULL) {
-    function(stage, detail = NULL, value = NULL) {
-      stage_label <- switch(
-        stage,
-        setup = "Preparing model code",
-        tuning = "Adaptive tuning / convergence checks",
-        final_run = "Final MCMC run",
-        stage
-      )
-      progress_detail <- detail %||% paste(model_label, "stage:", stage_label)
-
-      if (is.function(set_progress)) {
-        if (!is.null(value)) {
-          set_progress(value = value, detail = progress_detail)
-        } else {
-          set_progress(detail = progress_detail)
-        }
+  # Single shared status callback used by all six run paths (USCR/REM/TTE x
+  # simulated/uploaded). The model engine calls this once per MCMC round with
+  # the round number and this round's settings; once a second round happens
+  # (Rhat didn't hit the target, so the model reruns with more iterations),
+  # it also gets the previous round's elapsed time so we can show a rough ETA.
+  # USCR also passes M (its augmentation bound) and buffer_m (state-space
+  # buffer); REM/TTE don't have either.
+  make_model_status_callback <- function(rv, model_label, notification_id) {
+    function(round, iter, burnin, M = NULL, buffer_m = NULL, prev_elapsed_min = NULL, prev_iter = NULL) {
+      message <- paste0(model_label, ": ")
+      if (!is.null(M)) message <- paste0(message, "M=", M, ", ")
+      if (!is.null(buffer_m)) message <- paste0(message, "buffer=", round(buffer_m), "m, ")
+      message <- paste0(message, iter, " iterations, ", burnin, " burn-in")
+      if (round > 1L && !is.null(prev_elapsed_min) && !is.null(prev_iter) && prev_iter > 0) {
+        est_min <- prev_elapsed_min * (iter / prev_iter)
+        message <- paste0(message, " — approx. ", format(round(est_min, 1), nsmall = 1), " min")
       }
-
-      if (!is.null(notification_id) && nzchar(notification_id)) {
-        showNotification(
-          progress_detail,
-          type = "message",
-          duration = NULL,
-          id = notification_id
-        )
-      }
-
-      update_model_debug(
-        rv,
-        stage = stage_label,
-        log_entry = progress_detail
+      showNotification(
+        message,
+        type = "message",
+        duration = NULL,
+        id = notification_id
       )
+      update_model_debug(rv, stage = paste("Round", round), log_entry = message)
     }
   }
   
@@ -3244,21 +3247,6 @@ server <- function(input, output, session) {
       lines <- c(lines, paste("Elapsed:", format_num(elapsed_min, 1), "minutes"))
     }
 
-    if (isTRUE(state$pause_queued) && identical(state$status, "running")) {
-      lines <- c(
-        lines,
-        "Pause request: queued",
-        "The app will save a provisional USCR estimate after the current round finishes."
-      )
-    }
-    if (isTRUE(state$stop_queued) && identical(state$status, "running")) {
-      lines <- c(
-        lines,
-        "Stop request: queued",
-        "The app will stop the USCR run after the current round finishes."
-      )
-    }
-    
     lines <- c(lines, "", "Guidance:", state$guidance)
     
     if (length(state$context)) {
@@ -3275,27 +3263,19 @@ server <- function(input, output, session) {
       if (!is.null(fit$settings$M)) {
         setting_lines <- c(paste0("- Final M: ", fit$settings$M), setting_lines)
       }
+      if (!is.null(fit$settings$buffer_m)) {
+        setting_lines <- c(setting_lines, paste0("- Final buffer: ", round(fit$settings$buffer_m), " m"))
+      }
       lines <- c(lines, "", "Run settings used:", setting_lines)
       if (!is.null(fit$final_rhat_max) && is.finite(fit$final_rhat_max)) {
         lines <- c(lines, paste0("- Final max Rhat: ", format_num(fit$final_rhat_max, 3)))
       }
     }
 
-    if (!is.null(fit) && isTRUE(fit$provisional)) {
-      lines <- c(
-        lines,
-        "",
-        "Provisional result:",
-        paste0("- Stage saved: ", fit$provisional_stage %||% "latest completed round"),
-        paste0("- Reason: ", fit$provisional_reason %||% "Paused before a final converged fit was produced."),
-        "- This paused fit is excluded from Compare & combine until you resume or rerun USCR."
-      )
-    }
-    
-    if (!is.null(fit) && !is.null(fit$tuning_history) && nrow(fit$tuning_history) > 0) {
-      tuning_df <- fit$tuning_history
-      tuning_lines <- apply(
-        tuning_df,
+    if (!is.null(fit) && !is.null(fit$round_history) && nrow(fit$round_history) > 0) {
+      round_df <- fit$round_history
+      round_lines <- apply(
+        round_df,
         1,
         function(row) {
           parts <- c(
@@ -3305,43 +3285,24 @@ server <- function(input, output, session) {
             paste0("chains=", row[["n_chains"]]),
             paste0("rhat=", format_num(as.numeric(row[["rhat_max"]]), 3))
           )
-          if ("M" %in% names(tuning_df)) {
+          if ("M" %in% names(round_df)) {
             parts <- append(parts, paste0("M=", row[["M"]]), after = 1)
           }
-          if ("M_too_small" %in% names(tuning_df)) {
+          if ("buffer_m" %in% names(round_df)) {
+            parts <- append(parts, paste0("buffer=", round(as.numeric(row[["buffer_m"]])), "m"), after = 2)
+          }
+          if ("M_too_small" %in% names(round_df)) {
             parts <- c(parts, paste0("M_too_small=", row[["M_too_small"]]))
+          }
+          if ("buffer_too_small" %in% names(round_df)) {
+            parts <- c(parts, paste0("buffer_too_small=", row[["buffer_too_small"]]))
           }
           paste(parts, collapse = ", ")
         }
       )
-      lines <- c(lines, "", paste0(state$model, " tuning history:"), paste0("- ", tuning_lines))
+      lines <- c(lines, "", paste0(state$model, " run history:"), paste0("- ", round_lines))
     }
 
-    if (!is.null(fit) && !is.null(fit$final_run_history) && nrow(fit$final_run_history) > 0) {
-      final_df <- fit$final_run_history
-      final_lines <- apply(
-        final_df,
-        1,
-        function(row) {
-          parts <- c(
-            paste0("round ", row[["round"]]),
-            paste0("iter=", row[["niter"]]),
-            paste0("thin=", row[["thin"]]),
-            paste0("chains=", row[["n_chains"]]),
-            paste0("rhat=", format_num(as.numeric(row[["rhat_max"]]), 3))
-          )
-          if ("M" %in% names(final_df)) {
-            parts <- append(parts, paste0("M=", row[["M"]]), after = 1)
-          }
-          if ("M_too_small" %in% names(final_df)) {
-            parts <- c(parts, paste0("M_too_small=", row[["M_too_small"]]))
-          }
-          paste(parts, collapse = ", ")
-        }
-      )
-      lines <- c(lines, "", paste0(state$model, " final-run checks:"), paste0("- ", final_lines))
-    }
-    
     if (!is.null(state$raw_error)) {
       lines <- c(lines, "", "Raw error:", state$raw_error)
     }
@@ -3373,7 +3334,7 @@ server <- function(input, output, session) {
     make_model_debug("REM", "Uploaded field data", "Uploaded field data only", "REM uses total animal events per camera and camera-days.")
   )
   tte_nps_debug <- reactiveVal(
-    make_model_debug("TTE", "Uploaded field data", "Uploaded field data only", "Current build passes total animal events per camera and camera-days.")
+    make_model_debug("TTE", "Uploaded field data", "Uploaded field data only", "TTE uses total animal events per camera and camera-days.")
   )
   
   # Status tracking for model runs
@@ -3383,16 +3344,7 @@ server <- function(input, output, session) {
   uscr_nps_running <- reactiveVal(FALSE)
   rem_nps_running <- reactiveVal(FALSE)
   tte_nps_running <- reactiveVal(FALSE)
-  rem_nps_background <- reactiveVal(FALSE)
-  
-  # Stop flags for interrupting model runs
-  stop_uscr_sim <- reactiveVal(FALSE)
-  stop_uscr_nps <- reactiveVal(FALSE)
-  pause_uscr_nps <- reactiveVal(FALSE)
-  stop_rem_nps <- reactiveVal(FALSE)
-  stop_tte_nps <- reactiveVal(FALSE)
-  uscr_nps_resume_settings <- reactiveVal(NULL)
-  
+
   nps_model_inputs <- reactive({
     req(
       deployment_checked(),
@@ -3413,155 +3365,20 @@ server <- function(input, output, session) {
     )
   })
   
-  # --- Stop handlers ---
-  
-  # Use a global environment to store stop flags that can be checked during execution
-  stop_flags_env <- new.env()
-  
-  observeEvent(input$stop_uscr_sim, {
-    stop_uscr_sim(TRUE)
-    stop_flags_env$stop_uscr_sim <- TRUE
-    showNotification("Stopping USCR (sim) run...", 
-                     type = "warning", duration = 3)
-  })
-  
-  observeEvent(input$stop_uscr_nps, {
-    stop_uscr_nps(TRUE)
-    stop_flags_env$stop_uscr_nps <- TRUE
-    update_model_debug(
-      uscr_nps_debug,
-      stop_queued = TRUE,
-      guidance = paste(
-        "Stop has been queued for uploaded-data USCR.",
-        "The current USCR round still has to finish before the run can terminate cleanly."
-      ),
-      log_entry = "USCR stop requested; waiting for the current round to finish."
-    )
-    showNotification("Stopping USCR (uploaded data) run...", 
-                     type = "warning", duration = 3)
-  })
-
-  refresh_uscr_pause_resume_button <- function() {
-    if (isTRUE(uscr_nps_running())) {
-      updateActionButton(session, "pause_resume_uscr_nps", label = "Pause after current round")
-      shinyjs::enable("pause_resume_uscr_nps")
-    } else if (!is.null(uscr_nps_resume_settings())) {
-      updateActionButton(session, "pause_resume_uscr_nps", label = "Resume from paused settings")
-      shinyjs::enable("pause_resume_uscr_nps")
-    } else {
-      updateActionButton(session, "pause_resume_uscr_nps", label = "Pause/Resume")
-      shinyjs::disable("pause_resume_uscr_nps")
-    }
-  }
-
-  observe({
-    uscr_nps_running()
-    uscr_nps_resume_settings()
-    refresh_uscr_pause_resume_button()
-  })
-
-  observeEvent(input$pause_resume_uscr_nps, {
-    if (isTRUE(uscr_nps_running())) {
-      if (isTRUE(pause_uscr_nps())) {
-        showNotification(
-          "USCR pause is already queued for the end of the current round.",
-          type = "warning",
-          duration = 4
-        )
-        return(NULL)
-      }
-      pause_uscr_nps(TRUE)
-      stop_flags_env$pause_uscr_nps <- TRUE
-      update_model_debug(
-        uscr_nps_debug,
-        pause_queued = TRUE,
-        guidance = paste(
-          "Pause has been queued for uploaded-data USCR.",
-          "The current USCR round still has to finish before a provisional estimate can be saved."
-        ),
-        stop_queued = FALSE,
-        log_entry = "USCR pause requested; waiting for the current round to finish."
-      )
-      showNotification(
-        "Pausing USCR (uploaded data) after the current round finishes...",
-        type = "warning",
-        duration = 5
-      )
-      return(NULL)
-    }
-
-    resume_override <- uscr_nps_resume_settings()
-    if (is.null(resume_override)) {
-      showNotification(
-        "No paused USCR round is available to resume from yet.",
-        type = "warning",
-        duration = 5
-      )
-      return(NULL)
-    }
-
-    start_uscr_nps_run(resume_override = resume_override, resumed_from_pause = TRUE)
-  })
-  
-  observeEvent(input$stop_rem_nps, {
-    if (isTRUE(rem_nps_background())) {
-      update_model_debug(
-        rem_nps_debug,
-        status = "running",
-        stage = "Background run in progress",
-        guidance = "This REM run is already running in a background worker. It will keep running until it finishes or fails; server-side cancellation is not available yet for this path.",
-        log_entry = "Stop requested, but background REM cancellation is not available."
-      )
-      showNotification(
-        "REM background jobs cannot be cancelled after launch yet. This run will keep going in the background.",
-        type = "warning",
-        duration = 8
-      )
-      return(NULL)
-    }
-    stop_rem_nps(TRUE)
-    stop_flags_env$stop_rem_nps <- TRUE
-    showNotification("Stopping REM (uploaded data) run...", 
-                     type = "warning", duration = 3)
-  })
-  
-  observeEvent(input$stop_tte_nps, {
-    stop_tte_nps(TRUE)
-    stop_flags_env$stop_tte_nps <- TRUE
-    showNotification("Stopping TTE (uploaded data) run...", 
-                     type = "warning", duration = 3)
-  })
-  
-  # Helper function to check stop flag and throw error if set
-  check_stop_flag <- function(flag_name) {
-    if (exists(flag_name, envir = stop_flags_env) && 
-        isTRUE(get(flag_name, envir = stop_flags_env))) {
-      err <- simpleError("Model execution stopped by user")
-      class(err) <- c("model_stop_requested", class(err))
-      stop(err)
-    }
-  }
-
-  check_interrupt_action <- function(stop_flag_name = NULL, pause_flag_name = NULL) {
-    if (!is.null(stop_flag_name) &&
-        exists(stop_flag_name, envir = stop_flags_env) &&
-        isTRUE(get(stop_flag_name, envir = stop_flags_env))) {
-      return("stop")
-    }
-    if (!is.null(pause_flag_name) &&
-        exists(pause_flag_name, envir = stop_flags_env) &&
-        isTRUE(get(pause_flag_name, envir = stop_flags_env))) {
-      return("pause")
-    }
-    NULL
-  }
-
   app_n_chains <- function() {
     max(2L, as.integer(input$n_chains))
   }
-  
-  uscr_run_args <- function(waic = TRUE, status_callback = NULL, fast_mode = FALSE,
-                            override = NULL, interrupt_callback = NULL) {
+
+  # Keep the USCR buffer default in sync with the log(sigma) prior: the
+  # buffer should comfortably contain a 99% home range under that prior, so
+  # if the prior mean/SD change, recompute and refresh the displayed default.
+  observe({
+    req(is.numeric(input$log_sigma_mean), is.numeric(input$log_sigma_sd))
+    new_default <- uscr_default_buffer_m(input$log_sigma_mean, input$log_sigma_sd)
+    updateNumericInput(session, "uscr_buffer_m", value = ceiling(new_default / 50) * 50)
+  })
+
+  uscr_run_args <- function(waic = TRUE, status_callback = NULL) {
     args <- list(
       iter = input$iter_uscr,
       burnin = input$burnin_uscr,
@@ -3578,32 +3395,11 @@ server <- function(input, output, session) {
       adaptive = TRUE,
       compute_WAIC = waic,
       diagnostic_mode = FALSE,
-      tuning_n_chains = app_n_chains(),
       parallel_chains = isTRUE(app_n_chains() > 1),
-      interrupt_callback = interrupt_callback,
       status_callback = status_callback,
       verbose = FALSE
     )
 
-    if (isTRUE(fast_mode)) {
-      args$iter <- min(as.integer(input$iter_uscr), 4000L)
-      args$burnin <- min(as.integer(input$burnin_uscr), 500L)
-      args$thin <- max(1L, min(as.integer(input$thin_uscr), 4L))
-      args$M <- min(as.integer(input$M_uscr), 200L)
-      args$iter_tune <- max(args$burnin + 500L, 1500L)
-      args$thin_tune <- 1L
-      args$max_adapt_rounds <- 3L
-      args$iter_cap <- 4000L
-      args$M_cap <- 200L
-    }
-
-    if (!is.null(override)) {
-      if (!is.null(override$iter)) args$iter <- max(as.integer(args$iter), as.integer(override$iter))
-      if (!is.null(override$thin)) args$thin <- max(as.integer(args$thin), as.integer(override$thin))
-      if (!is.null(override$M)) args$M <- max(as.integer(args$M), as.integer(override$M))
-      if (!is.null(override$burnin)) args$burnin <- max(as.integer(args$burnin), as.integer(override$burnin))
-    }
-    
     # Keep the app compatible with whichever run_USCR() definition is
     # currently loaded, including older variants without these extras.
     valid_names <- names(formals(run_USCR_app))
@@ -3626,64 +3422,33 @@ server <- function(input, output, session) {
       status = "running",
       stage = "Preflight checks",
       started_at = Sys.time(),
-      guidance = "USCR supports simulated and uploaded field data. Watch this panel for tuning rounds and the final run stage.",
+      guidance = "USCR supports simulated and uploaded field data. Watch this panel for round-by-round Rhat, M, and buffer checks.",
       raw_error = NULL,
       context = summarize_uscr_context(d, source_label = "Simulated", sim_truth = sim()$truth),
       log_entry = "Simulated USCR run requested."
     )
     
-    # Reset stop flag
-    stop_uscr_sim(FALSE)
-    stop_flags_env$stop_uscr_sim <- FALSE
     uscr_sim_running(TRUE)
     uscr_sim_fit(NULL)  # Clear previous results
     uscr_sim_dataset_id(current_shared_sim_id())
-    
+
     showNotification(
       "Running USCR on simulated data.",
       type = "message",
       duration = NULL,
       id = "uscr_sim_status"
     )
-    
+
     fit <- tryCatch(
       {
-        # Check if stopped before starting
-        check_stop_flag("stop_uscr_sim")
-        
         update_model_debug(
           uscr_sim_debug,
           stage = "Preparing run",
           log_entry = "Input checks passed. Starting USCR setup."
         )
-        
-        # Check stop flag again before running
-        check_stop_flag("stop_uscr_sim")
-        
-        status_callback <- function(stage, detail = NULL, value = NULL) {
-          check_stop_flag("stop_uscr_sim")
-          stage_label <- switch(
-            stage,
-            setup = "Preparing state space and model code",
-            tuning = "Adaptive tuning",
-            final_run = "Final MCMC run / convergence check",
-            stage
-          )
-          progress_detail <- detail %||% paste("USCR stage:", stage_label)
-          update_model_debug(
-            uscr_sim_debug,
-            status = "running",
-            stage = stage_label,
-            log_entry = progress_detail
-          )
-          showNotification(
-            progress_detail,
-            type = "message",
-            duration = NULL,
-            id = "uscr_sim_status"
-          )
-        }
-        
+
+        status_callback <- make_model_status_callback(uscr_sim_debug, "USCR", "uscr_sim_status")
+
         do.call(
           run_USCR_app,
           c(
@@ -3698,51 +3463,36 @@ server <- function(input, output, session) {
       },
       error = function(e) {
         removeNotification("uscr_sim_status")
-        if (stop_uscr_sim() || grepl("stopped by user", e$message, ignore.case = TRUE)) {
-          update_model_debug(
-            uscr_sim_debug,
-            status = "stopped",
-            stage = "Stopped by user",
-            finished_at = Sys.time(),
-            guidance = "The simulated USCR run was stopped manually before completion.",
-            raw_error = e$message,
-            log_entry = "Simulated USCR run stopped by user."
-          )
-          showNotification("USCR (sim) run stopped by user.", type = "warning")
-        } else {
-          update_model_debug(
-            uscr_sim_debug,
-            status = "error",
-            stage = "Failed",
-            finished_at = Sys.time(),
-            guidance = friendly_model_error("USCR", "simulated data", e$message),
-            raw_error = e$message,
-            log_entry = paste("Simulated USCR failed:", e$message)
-          )
-          showNotification(
-            paste("USCR (sim) failed:", e$message),
-            type = "error", duration = NULL
-          )
-        }
+        update_model_debug(
+          uscr_sim_debug,
+          status = "error",
+          stage = "Failed",
+          finished_at = Sys.time(),
+          guidance = friendly_model_error("USCR", "simulated data", e$message),
+          raw_error = e$message,
+          log_entry = paste("Simulated USCR failed:", e$message)
+        )
+        showNotification(
+          paste("USCR (sim) failed:", e$message),
+          type = "error", duration = NULL
+        )
         # If nimble compilation failed, errors can be inspected via nimble::printErrors() in the console
         return(NULL)
       },
       finally = {
         removeNotification("uscr_sim_status")
         uscr_sim_running(FALSE)
-        stop_uscr_sim(FALSE)  # Reset stop flag
-        stop_flags_env$stop_uscr_sim <- FALSE
       }
     )
     uscr_sim_fit(fit)
-    if (!is.null(fit) && !stop_uscr_sim()) {
+    if (!is.null(fit)) {
       removeNotification("uscr_sim_status")
       update_model_debug(
         uscr_sim_debug,
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "Simulated USCR completed successfully. Review the summary above and the tuning history below.",
+        guidance = "Simulated USCR completed successfully. Review the summary above and the run history below.",
         log_entry = "Simulated USCR run completed."
       )
       showNotification("USCR (sim) complete!", type = "message")
@@ -3794,17 +3544,8 @@ server <- function(input, output, session) {
     
     fit <- tryCatch(
       {
-        status_callback <- make_encounter_status_callback(
-          rem_sim_debug,
-          "REM",
-          notification_id = "rem_sim_status"
-        )
-        status_callback(
-          stage = "setup",
-          detail = "Preparing REM inputs from the shared spatial simulator and initial model build...",
-          value = 0.1
-        )
-        
+        status_callback <- make_model_status_callback(rem_sim_debug, "REM", "rem_sim_status")
+
         run_REM(
           y            = shared_d$camera_counts,
           r_km         = shared_d$out$`Detection Distance` / 1000,
@@ -3905,17 +3646,8 @@ server <- function(input, output, session) {
     
     fit <- tryCatch(
       {
-        status_callback <- make_encounter_status_callback(
-          tte_sim_debug,
-          "TTE",
-          notification_id = "tte_sim_status"
-        )
-        status_callback(
-          stage = "setup",
-          detail = "Preparing TTE inputs from the shared spatial simulator and initial model build...",
-          value = 0.1
-        )
-        
+        status_callback <- make_model_status_callback(tte_sim_debug, "TTE", "tte_sim_status")
+
         run_TTE(
           y            = shared_d$camera_counts,
           r_km         = shared_d$out$`Detection Distance` / 1000,
@@ -3973,10 +3705,9 @@ server <- function(input, output, session) {
   
   # --- USCR: NPS ---
   
-  start_uscr_nps_run <- function(resume_override = NULL, resumed_from_pause = FALSE) {
+  start_uscr_nps_run <- function() {
     req(nps_model_inputs())
     d <- nps_model_inputs()
-    uscr_fast_mode <- isTRUE(input$uscr_fast_mode_nps)
     uscr_nps_debug(make_model_debug(
       "USCR",
       "Uploaded field data",
@@ -3988,100 +3719,38 @@ server <- function(input, output, session) {
       status = "running",
       stage = "Preflight checks",
       started_at = Sys.time(),
-      guidance = if (resumed_from_pause) {
-        "USCR resumed from the latest paused round settings. This panel will show whether the run is still in setup, adaptive tuning, or the final run."
-      } else {
-        "USCR supports uploaded field data. This panel will show whether the run is still in setup, adaptive tuning, or the final run."
-      },
+      guidance = "USCR supports uploaded field data. Watch this panel for round-by-round Rhat, M, and buffer checks.",
       raw_error = NULL,
-      pause_queued = FALSE,
-      stop_queued = FALSE,
-      context = summarize_uscr_context(d, source_label = "Uploaded", fast_mode = uscr_fast_mode),
-      log_entry = if (resumed_from_pause) {
-        "Uploaded-data USCR resume requested from paused settings."
-      } else if (uscr_fast_mode) {
-        "Uploaded-data USCR run requested with fast test mode enabled."
-      } else {
-        "Uploaded-data USCR run requested."
-      }
+      context = summarize_uscr_context(d, source_label = "Uploaded"),
+      log_entry = "Uploaded-data USCR run requested."
     )
     validate(
+      need(nrow(d$out) >= 2,
+           "At least 2 cameras are required to estimate density; only 1 camera was found in this dataset."),
       need(all(d$camera_days > 0),
-           "Some cameras have zero camera-days; check deployment dates.")
+           "Some cameras have zero or negative camera-days; check deployment dates, or check for overlapping/duplicate Cluster IDs at the same site (overlapping detection events can double-count time and drive camera-days to zero or below).")
     )
-    
-    # Reset stop flag
-    stop_uscr_nps(FALSE)
-    pause_uscr_nps(FALSE)
-    stop_flags_env$stop_uscr_nps <- FALSE
-    stop_flags_env$pause_uscr_nps <- FALSE
+
     uscr_nps_running(TRUE)
     uscr_nps_fit(NULL)  # Clear previous results
-    
+
     showNotification(
-      if (resumed_from_pause) {
-        "Resuming USCR on uploaded data from paused settings."
-      } else if (uscr_fast_mode) {
-        "Running USCR on uploaded data (fast test mode)."
-      } else {
-        "Running USCR on uploaded data."
-      },
+      "Running USCR on uploaded data.",
       type = "message",
       duration = NULL,
       id = "uscr_nps_status"
     )
-    
+
     fit <- tryCatch(
       {
-        # Check if stopped before starting
-        if (stop_uscr_nps()) {
-          showNotification("USCR (uploaded data) run cancelled.", type = "warning")
-          return(NULL)
-        }
-        
         update_model_debug(
           uscr_nps_debug,
           stage = "Preparing run",
           log_entry = "Input checks passed. Starting USCR setup."
         )
-        
-        # Check stop flag again before running
-        if (stop_uscr_nps()) {
-          showNotification("USCR (uploaded data) run cancelled.", type = "warning")
-          return(NULL)
-        }
 
-        interrupt_callback <- function() {
-          check_interrupt_action(
-            stop_flag_name = "stop_uscr_nps",
-            pause_flag_name = "pause_uscr_nps"
-          )
-        }
-        
-        status_callback <- function(stage, detail = NULL, value = NULL) {
-          check_stop_flag("stop_uscr_nps")
-          stage_label <- switch(
-            stage,
-            setup = "Preparing state space and model code",
-            tuning = "Adaptive tuning",
-            final_run = "Final MCMC run / convergence check",
-            stage
-          )
-          progress_detail <- detail %||% paste("USCR stage:", stage_label)
-          update_model_debug(
-            uscr_nps_debug,
-            status = "running",
-            stage = stage_label,
-            log_entry = progress_detail
-          )
-          showNotification(
-            progress_detail,
-            type = "message",
-            duration = NULL,
-            id = "uscr_nps_status"
-          )
-        }
-        
+        status_callback <- make_model_status_callback(uscr_nps_debug, "USCR", "uscr_nps_status")
+
         do.call(
           run_USCR_app,
           c(
@@ -4092,90 +3761,42 @@ server <- function(input, output, session) {
             ),
             uscr_run_args(
               waic = TRUE,
-              status_callback = status_callback,
-              fast_mode = uscr_fast_mode,
-              override = resume_override,
-              interrupt_callback = interrupt_callback
+              status_callback = status_callback
             )
           )
         )
       },
       error = function(e) {
         removeNotification("uscr_nps_status")
-        if (stop_uscr_nps()) {
-          update_model_debug(
-            uscr_nps_debug,
-        status = "stopped",
-        stage = "Stopped by user",
-        finished_at = Sys.time(),
-            guidance = "The uploaded-data USCR run was stopped manually before completion.",
-            raw_error = e$message,
-            pause_queued = FALSE,
-            stop_queued = FALSE,
-            log_entry = "Uploaded-data USCR run stopped by user."
-          )
-          showNotification("USCR (uploaded data) run stopped by user.", type = "warning")
-        } else {
-          update_model_debug(
-            uscr_nps_debug,
-            status = "error",
-            stage = "Failed",
-            finished_at = Sys.time(),
-            guidance = friendly_model_error("USCR", "uploaded field data", e$message),
-            raw_error = e$message,
-            pause_queued = FALSE,
-            stop_queued = FALSE,
-            log_entry = paste("Uploaded-data USCR failed:", e$message)
-          )
-          showNotification(
-            paste("USCR (uploaded data) failed:", e$message),
-            type = "error", duration = NULL
-          )
-        }
+        update_model_debug(
+          uscr_nps_debug,
+          status = "error",
+          stage = "Failed",
+          finished_at = Sys.time(),
+          guidance = friendly_model_error("USCR", "uploaded field data", e$message),
+          raw_error = e$message,
+          log_entry = paste("Uploaded-data USCR failed:", e$message)
+        )
+        showNotification(
+          paste("USCR (uploaded data) failed:", e$message),
+          type = "error", duration = NULL
+        )
         return(NULL)
       },
       finally = {
         removeNotification("uscr_nps_status")
         uscr_nps_running(FALSE)
-        stop_uscr_nps(FALSE)  # Reset stop flag
-        pause_uscr_nps(FALSE)
-        stop_flags_env$stop_uscr_nps <- FALSE
-        stop_flags_env$pause_uscr_nps <- FALSE
       }
     )
     uscr_nps_fit(fit)
-    if (!is.null(fit) && isTRUE(fit$provisional)) {
-      uscr_nps_resume_settings(fit$resumable_settings)
-      removeNotification("uscr_nps_status")
-      update_model_debug(
-        uscr_nps_debug,
-        status = "paused",
-        stage = "Paused after completed round",
-        finished_at = Sys.time(),
-        guidance = paste(
-          "A provisional USCR estimate was saved from the most recent completed round.",
-          "Use it for troubleshooting only, then click 'Pause/Resume' to continue from these settings."
-        ),
-        pause_queued = FALSE,
-        stop_queued = FALSE,
-        log_entry = "Uploaded-data USCR paused and provisional fit saved."
-      )
-      showNotification(
-        "USCR paused after the latest completed round. A provisional estimate was saved.",
-        type = "warning",
-        duration = 8
-      )
-    } else if (!is.null(fit) && !stop_uscr_nps()) {
-      uscr_nps_resume_settings(NULL)
+    if (!is.null(fit)) {
       removeNotification("uscr_nps_status")
       update_model_debug(
         uscr_nps_debug,
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "Uploaded-data USCR completed successfully. Review the summary above and the tuning history below.",
-        pause_queued = FALSE,
-        stop_queued = FALSE,
+        guidance = "Uploaded-data USCR completed successfully. Review the summary above and the run history below.",
         log_entry = "Uploaded-data USCR run completed."
       )
       showNotification("USCR (uploaded data) complete!", type = "message")
@@ -4193,36 +3814,8 @@ server <- function(input, output, session) {
   # --- REM: NPS ---
   
   observeEvent(input$run_rem_nps, {
-    if (rem_nps_running()) {
-      showNotification(
-        "REM (uploaded data) is already running in this session. Wait for it to finish before starting another REM job.",
-        type = "warning",
-        duration = 6
-      )
-      return(NULL)
-    }
     req(nps_model_inputs())
     d <- nps_model_inputs()
-    requested_chains <- app_n_chains()
-    rem_context <- c(
-      summarize_rem_context(d),
-      paste("Chains requested in UI:", requested_chains)
-    )
-    rem_args <- list(
-      y            = d$camera_counts,
-      r_km         = d$out$`Detection Distance` / 1000,
-      camera_days  = d$camera_days,
-      theta_deg    = get_camera_angle_vector(d$out, fallback_deg = input$theta),
-      iter         = input$iter_rem_tte,
-      burnin       = input$burnin_rem_tte,
-      thin         = input$thin_rem_tte,
-      n_chains     = requested_chains,
-      D_max        = input$D_max,
-      log_v_mean   = input$log_v_mean,
-      log_v_sd     = input$log_v_sd,
-      sd_eps_shape = input$sd_eps_shape,
-      sd_eps_rate  = input$sd_eps_rate
-    )
     rem_nps_debug(make_model_debug(
       "REM",
       "Uploaded field data",
@@ -4232,94 +3825,86 @@ server <- function(input, output, session) {
     update_model_debug(
       rem_nps_debug,
       status = "running",
-      stage = "Queued background run",
+      stage = "Preflight checks",
       started_at = Sys.time(),
-      guidance = paste(
-        "REM on uploaded field data is running in a background worker so this session should stay responsive.",
-        "This path does not provide live round-by-round tuning updates while the worker is running,",
-        "but the requested run settings are shown below and the full tuning history will appear after completion."
-      ),
+      guidance = "REM only runs on uploaded field data in this app.",
       raw_error = NULL,
-      context = rem_context,
-      log_entry = paste(
-        "Uploaded-data REM run requested.",
-        paste0(
-          "Requested settings: iter=", input$iter_rem_tte,
-          ", burn-in=", input$burnin_rem_tte,
-          ", thin=", input$thin_rem_tte,
-          ", chains=", requested_chains,
-          "."
-        )
-      )
+      context = summarize_rem_context(d),
+      log_entry = "Uploaded-data REM run requested."
     )
     validate(
+      need(nrow(d$out) >= 2,
+           "At least 2 cameras are required to estimate density; only 1 camera was found in this dataset."),
       need(all(d$camera_days > 0),
-           "Some cameras have zero camera-days; check deployment dates.")
+           "Some cameras have zero or negative camera-days; check deployment dates, or check for overlapping/duplicate Cluster IDs at the same site (overlapping detection events can double-count time and drive camera-days to zero or below).")
     )
-    
-    # Reset stop flag
-    stop_rem_nps(FALSE)
-    stop_flags_env$stop_rem_nps <- FALSE
+
     rem_nps_running(TRUE)
-    rem_nps_background(TRUE)
     rem_nps_fit(NULL)  # Clear previous results
-    
-    update_model_debug(
-      rem_nps_debug,
-      stage = "Background run in progress",
-      log_entry = paste(
-        "Submitted REM background job.",
-        "Chains used =", requested_chains,
-        "(minimum enforced by the app).",
-        "Live tuning updates are not available for this background path.",
-        "REM may internally increase iterations until max Rhat is acceptable."
-      )
+
+    showNotification(
+      "Running REM on uploaded data... This may take several minutes.",
+      type = "message",
+      duration = NULL,
+      id = "rem_nps_status"
     )
-    
-    rem_future <- future::future({
-      do.call(run_REM, rem_args)
-    })
-    
-    promises::as.promise(rem_future) %...>% (function(fit) {
-      removeNotification("rem_nps_progress")
-      rem_nps_fit(fit)
-      rem_nps_running(FALSE)
-      rem_nps_background(FALSE)
-      stop_rem_nps(FALSE)
-      stop_flags_env$stop_rem_nps <- FALSE
+
+    fit <- tryCatch(
+      {
+        status_callback <- make_model_status_callback(rem_nps_debug, "REM", "rem_nps_status")
+
+        run_REM(
+          y            = d$camera_counts,
+          r_km         = d$out$`Detection Distance` / 1000,
+          camera_days  = d$camera_days,
+          theta_deg    = get_camera_angle_vector(d$out, default_deg = input$theta),
+          iter         = input$iter_rem_tte,
+          burnin       = input$burnin_rem_tte,
+          thin         = input$thin_rem_tte,
+          n_chains     = app_n_chains(),
+          D_max        = input$D_max,
+          log_v_mean   = input$log_v_mean,
+          log_v_sd     = input$log_v_sd,
+          sd_eps_shape = input$sd_eps_shape,
+          sd_eps_rate  = input$sd_eps_rate,
+          status_callback = status_callback
+        )
+      },
+      error = function(e) {
+        removeNotification("rem_nps_status")
+        update_model_debug(
+          rem_nps_debug,
+          status = "error",
+          stage = "Failed",
+          finished_at = Sys.time(),
+          guidance = friendly_model_error("REM", "uploaded field data", e$message),
+          raw_error = e$message,
+          log_entry = paste("Uploaded-data REM failed:", e$message)
+        )
+        showNotification(
+          paste("REM (uploaded data) failed:", e$message),
+          type = "error", duration = NULL
+        )
+        return(NULL)
+      },
+      finally = {
+        removeNotification("rem_nps_status")
+        rem_nps_running(FALSE)
+      }
+    )
+    rem_nps_fit(fit)
+    if (!is.null(fit)) {
+      removeNotification("rem_nps_status")
       update_model_debug(
         rem_nps_debug,
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "REM completed successfully. Review the summary above and the tuning history below.",
-        log_entry = "Uploaded-data REM background run completed."
+        guidance = "REM completed successfully. Review the summary above and the run history below.",
+        log_entry = "Uploaded-data REM run completed."
       )
-      showNotification("REM (uploaded data) complete!", type = "message", duration = 5)
-      invisible(NULL)
-    }) %...!% (function(e) {
-      removeNotification("rem_nps_progress")
-      rem_nps_fit(NULL)
-      rem_nps_running(FALSE)
-      rem_nps_background(FALSE)
-      stop_rem_nps(FALSE)
-      stop_flags_env$stop_rem_nps <- FALSE
-      update_model_debug(
-        rem_nps_debug,
-        status = "error",
-        stage = "Failed",
-        finished_at = Sys.time(),
-        guidance = friendly_model_error("REM", "uploaded field data", conditionMessage(e)),
-        raw_error = conditionMessage(e),
-        log_entry = paste("Uploaded-data REM background run failed:", conditionMessage(e))
-      )
-      showNotification(
-        paste("REM (uploaded data) failed:", conditionMessage(e)),
-        type = "error",
-        duration = NULL
-      )
-      invisible(NULL)
-    })
+      showNotification("REM (uploaded data) complete!", type = "message")
+    }
   })
   
   # --- TTE: NPS ---
@@ -4331,7 +3916,7 @@ server <- function(input, output, session) {
       "TTE",
       "Uploaded field data",
       "Uploaded field data only",
-      "Current build passes total animal events per camera and camera-days."
+      "TTE uses total animal events per camera and camera-days."
     ))
     update_model_debug(
       tte_nps_debug,
@@ -4344,52 +3929,31 @@ server <- function(input, output, session) {
       log_entry = "Uploaded-data TTE run requested."
     )
     validate(
+      need(nrow(d$out) >= 2,
+           "At least 2 cameras are required to estimate density; only 1 camera was found in this dataset."),
       need(all(d$camera_days > 0),
-           "Some cameras have zero camera-days; check deployment dates.")
+           "Some cameras have zero or negative camera-days; check deployment dates, or check for overlapping/duplicate Cluster IDs at the same site (overlapping detection events can double-count time and drive camera-days to zero or below).")
     )
     
-    # Reset stop flag
-    stop_tte_nps(FALSE)
     tte_nps_running(TRUE)
     tte_nps_fit(NULL)  # Clear previous results
-    
+
     showNotification(
       "Running TTE on uploaded data... This may take several minutes.",
       type = "message",
       duration = NULL,
       id = "tte_nps_status"
     )
-    
+
     fit <- tryCatch(
       {
-        # Check if stopped before starting
-        if (stop_tte_nps()) {
-          showNotification("TTE (uploaded data) run cancelled.", type = "warning")
-          return(NULL)
-        }
-        
-        status_callback <- make_encounter_status_callback(
-          tte_nps_debug,
-          "TTE",
-          notification_id = "tte_nps_status"
-        )
-        status_callback(
-          stage = "setup",
-          detail = "Preparing TTE inputs from uploaded data and initial model build...",
-          value = 0.1
-        )
-        
-        # Check stop flag again before running
-        if (stop_tte_nps()) {
-          showNotification("TTE (uploaded data) run cancelled.", type = "warning")
-          return(NULL)
-        }
-        
+        status_callback <- make_model_status_callback(tte_nps_debug, "TTE", "tte_nps_status")
+
         run_TTE(
           y            = d$camera_counts,
           r_km         = d$out$`Detection Distance` / 1000,
           camera_days  = d$camera_days,
-          theta_deg    = get_camera_angle_vector(d$out, fallback_deg = input$theta),
+          theta_deg    = get_camera_angle_vector(d$out, default_deg = input$theta),
           iter         = input$iter_rem_tte,
           burnin       = input$burnin_rem_tte,
           thin         = input$thin_rem_tte,
@@ -4404,49 +3968,35 @@ server <- function(input, output, session) {
       },
       error = function(e) {
         removeNotification("tte_nps_status")
-        if (stop_tte_nps()) {
-          update_model_debug(
-            tte_nps_debug,
-            status = "stopped",
-            stage = "Stopped by user",
-            finished_at = Sys.time(),
-              guidance = "The uploaded-data TTE run was stopped manually before completion.",
-              raw_error = e$message,
-              log_entry = "Uploaded-data TTE run stopped by user."
-          )
-          showNotification("TTE (uploaded data) run stopped by user.", type = "warning")
-        } else {
-          update_model_debug(
-            tte_nps_debug,
-            status = "error",
-            stage = "Failed",
-            finished_at = Sys.time(),
-            guidance = friendly_model_error("TTE", "uploaded field data", e$message),
-            raw_error = e$message,
-            log_entry = paste("Uploaded-data TTE failed:", e$message)
-          )
-          showNotification(
-            paste("TTE (uploaded data) failed:", e$message),
-            type = "error", duration = NULL
-          )
-        }
+        update_model_debug(
+          tte_nps_debug,
+          status = "error",
+          stage = "Failed",
+          finished_at = Sys.time(),
+          guidance = friendly_model_error("TTE", "uploaded field data", e$message),
+          raw_error = e$message,
+          log_entry = paste("Uploaded-data TTE failed:", e$message)
+        )
+        showNotification(
+          paste("TTE (uploaded data) failed:", e$message),
+          type = "error", duration = NULL
+        )
         return(NULL)
       },
       finally = {
         removeNotification("tte_nps_status")
         tte_nps_running(FALSE)
-        stop_tte_nps(FALSE)  # Reset stop flag
       }
     )
     tte_nps_fit(fit)
-    if (!is.null(fit) && !stop_tte_nps()) {
+    if (!is.null(fit)) {
       removeNotification("tte_nps_status")
       update_model_debug(
         tte_nps_debug,
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "TTE completed successfully. Review the summary above.",
+        guidance = "TTE completed successfully. Review the summary above and the run history below.",
         log_entry = "Uploaded-data TTE run completed."
       )
       showNotification("TTE (uploaded data) complete!", type = "message")
@@ -4469,10 +4019,6 @@ server <- function(input, output, session) {
     if (identical(dbg$status, "error")) {
       cat("USCR (simulated): the last run failed.\n")
       cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-      return(invisible(NULL))
-    }
-    if (identical(dbg$status, "stopped")) {
-      cat("USCR (simulated): the last run was stopped before completion.\n")
       return(invisible(NULL))
     }
     fit <- uscr_sim_fit()
@@ -4505,10 +4051,6 @@ server <- function(input, output, session) {
       cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
       return(invisible(NULL))
     }
-    if (identical(dbg$status, "stopped")) {
-      cat("USCR (uploaded data): the last run was stopped before completion.\n")
-      return(invisible(NULL))
-    }
     fit <- uscr_nps_fit()
     if (is.null(fit)) {
       cat("USCR (uploaded data): not run yet. Click 'Run USCR on uploaded data'.")
@@ -4521,13 +4063,9 @@ server <- function(input, output, session) {
       CI95_km2                  = c(round(s$q2.5_km2, 2), round(s$q97.5_km2, 2))
     )
     if (is.finite(s$waic)) out$WAIC <- round(s$waic, 2)
-    if (isTRUE(fit$provisional)) {
-      out$Status <- "Provisional paused estimate"
-      out$Warning <- fit$provisional_reason %||% "This estimate comes from the most recent completed USCR round and should not be interpreted as a final converged result."
-    }
     out
   })
-  
+
   # REM summaries
   output$rem_sim_text <- renderPrint({
     dbg <- rem_sim_debug()
@@ -4566,19 +4104,14 @@ server <- function(input, output, session) {
   output$rem_nps_text <- renderPrint({
     dbg <- rem_nps_debug()
     if (rem_nps_running()) {
-      cat("⏳ REM model is running in the background...\n")
+      cat("⏳ REM model is running...\n")
       cat("Current stage:", dbg$stage, "\n")
-      cat("This session should stay responsive while the REM job runs.\n")
       cat("Open 'Run status & troubleshooting' below for more detail.\n")
       return(invisible(NULL))
     }
     if (identical(dbg$status, "error")) {
       cat("REM (uploaded data): the last run failed.\n")
       cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-      return(invisible(NULL))
-    }
-    if (identical(dbg$status, "stopped")) {
-      cat("REM (uploaded data): the last run was stopped before completion.\n")
       return(invisible(NULL))
     }
     fit <- rem_nps_fit()
@@ -4642,10 +4175,6 @@ server <- function(input, output, session) {
     if (identical(dbg$status, "error")) {
       cat("TTE (uploaded data): the last run failed.\n")
       cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-      return(invisible(NULL))
-    }
-    if (identical(dbg$status, "stopped")) {
-      cat("TTE (uploaded data): the last run was stopped before completion.\n")
       return(invisible(NULL))
     }
     fit <- tte_nps_fit()
@@ -4760,8 +4289,6 @@ server <- function(input, output, session) {
       USCR = uscr_nps_fit()
     )
     fits[!vapply(fits, is.null, logical(1))]
-    fits <- fits[!vapply(fits, function(x) isTRUE(x$provisional), logical(1))]
-    fits
   })
 
   nps_combo_interval_plot_obj <- reactive({
@@ -4870,11 +4397,7 @@ server <- function(input, output, session) {
   output$nps_combo_table <- renderDT({
     combo <- nps_combo()
     if (is.null(combo)) {
-      note_text <- if (isTRUE(uscr_nps_fit()$provisional)) {
-        "A paused provisional USCR fit is currently saved, but provisional USCR fits are excluded from Compare & combine until you resume or rerun that model."
-      } else {
-        "Run at least one uploaded-data model from its tab first. The table will update as REM, TTE, and USCR finish."
-      }
+      note_text <- "Run at least one uploaded-data model from its tab first. The table will update as REM, TTE, and USCR finish."
       return(DT::datatable(
         data.frame(
           Note = note_text

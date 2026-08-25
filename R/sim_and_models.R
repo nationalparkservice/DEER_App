@@ -12,36 +12,6 @@ quiet_require <- function(pkg) {
   }
 }
 
-coerce_and_validate_coordinates <- function(df,
-                                            lon_col = "Longitude",
-                                            lat_col = "Latitude",
-                                            site_col = NULL,
-                                            context = "coordinates") {
-  lon <- suppressWarnings(as.numeric(df[[lon_col]]))
-  lat <- suppressWarnings(as.numeric(df[[lat_col]]))
-  bad <- which(!is.finite(lon) | !is.finite(lat))
-
-  if (length(bad) > 0) {
-    site_vals <- if (!is.null(site_col) && site_col %in% names(df)) {
-      as.character(df[[site_col]][bad])
-    } else {
-      as.character(bad)
-    }
-    site_vals[is.na(site_vals) | trimws(site_vals) == ""] <- paste0("row ", bad)
-    stop(
-      "Missing or invalid ",
-      context,
-      " for site(s): ",
-      paste(unique(site_vals), collapse = ", "),
-      call. = FALSE
-    )
-  }
-
-  df[[lon_col]] <- lon
-  df[[lat_col]] <- lat
-  df
-}
-
 # -------------------------------------------------------------------
 # 1. Simulation helpers (for teaching/sim tab)
 # -------------------------------------------------------------------
@@ -189,7 +159,7 @@ sim_model_inputs <- function(sim,
   
   out <- traps_df |>
     dplyr::mutate(
-      Site              = paste0("C", dplyr::row_number()),
+      `Site Name`       = paste0("C", dplyr::row_number()),
       utm_e             = x / 1000,   # treat metres as km for consistency
       utm_n             = y / 1000,
       `Detection Distance` = detection_radius_m,
@@ -215,7 +185,7 @@ build_teaching_sim_grid <- function(n_side, spacing_m, detection_radius_m, days)
   
   coords |>
     dplyr::mutate(
-      Site = paste0("C", dplyr::row_number()),
+      `Site Name` = paste0("C", dplyr::row_number()),
       utm_e = x / 1000,
       utm_n = y / 1000,
       `Detection Distance` = detection_radius_m,
@@ -325,49 +295,59 @@ build_nps_model_inputs <- function(
   }
   
   deps <- format_deployments(deployments, max_days = max_days)
-  images <- standardize_deer_species(images)
-  
-  if (!inherits(images$Timestamp, "POSIXt")) {
-    images <- images |>
-      dplyr::mutate(Timestamp = parse_timestamp_robust(Timestamp))
-  }
-  
-  deps <- deps |>
-    dplyr::rename(Site = `Site Name`)
 
-  deps <- coerce_and_validate_coordinates(
-    deps,
-    lon_col = "Longitude",
-    lat_col = "Latitude",
-    site_col = "Site",
-    context = "deployment coordinates"
-  )
-  
-  # UTM conversion and centering (same logic as Rmd)
+  # Timestamp is already parsed to POSIXct in check_images() before
+  # images_checked() is ever set, so no re-parsing is needed here.
+
+  # Latitude/Longitude presence and validity are already enforced as a hard
+  # stop in check_deployments() at upload time, so all that's needed here is
+  # numeric coercion (deployment$Longitude/Latitude may still be character
+  # columns coming out of CSV import even though every value parses cleanly).
+  deps <- deps |>
+    dplyr::mutate(
+      Longitude = as.numeric(Longitude),
+      Latitude  = as.numeric(Latitude)
+    )
+
+  # UTM conversion and centering. Longitude/Latitude are treated as WGS84
+  # (EPSG:4326, the standard GPS datum) and projected into the matching
+  # WGS84 UTM zone, so this works for deployments anywhere in the world
+  # rather than assuming North America. The UTM zone comes from the mean
+  # longitude and the hemisphere (for choosing the Northern- vs.
+  # Southern-Hemisphere EPSG series) comes from the mean latitude; as
+  # before, this assumes all cameras in a single dataset fall within one
+  # UTM zone, which holds for a spatially clustered deployment/array.
   mean_lon  <- mean(deps$Longitude, na.rm = TRUE)
+  mean_lat  <- mean(deps$Latitude, na.rm = TRUE)
   utm_zone  <- floor((mean_lon + 180) / 6) + 1
-  epsg_code <- 26900 + utm_zone
-  
+  utm_zone  <- min(60L, max(1L, as.integer(utm_zone)))
+  epsg_code <- if (mean_lat >= 0) 32600 + utm_zone else 32700 + utm_zone
+
   utm_coords <- deps |>
-    sf::st_as_sf(coords = c("Longitude", "Latitude"), crs = 4269) |>
+    sf::st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) |>
     sf::st_transform(crs = epsg_code) |>
     sf::st_coordinates()
   
   deps <- deps |>
     dplyr::mutate(
       utm_e = (utm_coords[, "X"] -
-                 mean(range(utm_coords[, "X"]))) / 1000,
+                 mean(range(utm_coords[, "X"], na.rm = TRUE))) / 1000,
       utm_n = (utm_coords[, "Y"] -
-                 mean(range(utm_coords[, "Y"]))) / 1000
+                 mean(range(utm_coords[, "Y"], na.rm = TRUE))) / 1000
     )
   
+  # Grouping by Site Name and Cluster ID together (rather than Cluster ID
+  # alone) means a Cluster ID that happens to appear at more than one site
+  # (e.g. an event-numbering scheme that isn't actually unique per camera)
+  # produces separate groups per site instead of silently merging their
+  # detections under one site. check_images() also flags this case directly
+  # at upload time.
   seqs <- images |>
     dplyr::filter(Species == species_to_analyze) |>
-    dplyr::group_by(`Cluster ID`) |>
+    dplyr::group_by(`Site Name`, `Cluster ID`) |>
     dplyr::summarise(
-      Site           = dplyr::first(`Site Name`),
       detection_date = lubridate::date(min(Timestamp)),
-      deer_count     = max(as.numeric(`Sighting Count`), na.rm = TRUE),
+      species_count  = max(as.numeric(`Sighting Count`), na.rm = TRUE),
       start          = min(Timestamp),
       end            = max(Timestamp),
       .groups        = "drop"
@@ -376,73 +356,26 @@ build_nps_model_inputs <- function(
       cluster_length_days = as.numeric(difftime(end, start, units = "days"))
     )
   
-  # Ensure Start/End are Dates (try multiple formats like the Rmd)
-  start_dates <- deps$`Start Date`
-  end_dates   <- deps$`End Date`
-  
-  # Helper function to parse dates robustly (handles 2-digit years like "2/3/25")
-  parse_date_robust <- function(x) {
-    if (inherits(x, "Date")) return(x)
-    if (inherits(x, "POSIXct")) return(as.Date(x))
-    
-    # Try lubridate first (handles 2-digit years automatically)
-    parsed <- lubridate::parse_date_time(
-      x,
-      orders = c("mdy", "ymd", "m-d-y", "y-m-d", "mdY", "Ymd"),
-      quiet = TRUE
+  # Parse Start/End Date into real Date columns, carried on deps from here
+  # on (through the join into `out` below) so they only need to be parsed
+  # once. A plain as.Date() with a fixed format is sufficient here: format_
+  # deployments() always re-normalizes End Date to mm/dd/yyyy, and
+  # check_deployments() now hard-stops any Start Date/End Date that isn't
+  # already in that format, so nothing reaches this function needing a
+  # more permissive multi-format parser.
+  deps <- deps |>
+    dplyr::mutate(
+      Start_Date_parsed = as.Date(`Start Date`, format = "%m/%d/%Y"),
+      End_Date_parsed   = as.Date(`End Date`,   format = "%m/%d/%Y")
     )
-    
-    # If still NA, try as.Date with common formats (including 2-digit year)
-    if (any(is.na(parsed))) {
-      parsed <- as.Date(x, tryFormats = c("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d/%m/%Y"))
-    }
-    
-    # Convert POSIXct to Date
-    if (inherits(parsed, "POSIXct")) parsed <- as.Date(parsed)
-    
-    return(parsed)
-  }
-  
-  start_dates <- parse_date_robust(start_dates)
-  end_dates   <- parse_date_robust(end_dates)
-  
-  # Check for parsing failures
-  if (all(is.na(start_dates)) || all(is.na(end_dates))) {
-    # Show sample of what we're trying to parse
-    cat("Sample Start Date values:", head(deps$`Start Date`, 3), "\n")
-    cat("Sample End Date values:", head(deps$`End Date`, 3), "\n")
-    stop("Failed to parse Start Date or End Date. Check date format in deployment file.",
-         call. = FALSE)
-  }
-  
-  # Warn about partial parsing failures
-  if (any(is.na(start_dates)) || any(is.na(end_dates))) {
-    n_missing_start <- sum(is.na(start_dates))
-    n_missing_end <- sum(is.na(end_dates))
-    warning("Could not parse ", n_missing_start, " Start Date(s) and ", 
-            n_missing_end, " End Date(s). These rows will be excluded.")
-  }
-  
-  # Filter out rows with missing dates
-  valid_rows <- !is.na(start_dates) & !is.na(end_dates)
-  if (!all(valid_rows)) {
-    deps <- deps[valid_rows, ]
-    start_dates <- start_dates[valid_rows]
-    end_dates <- end_dates[valid_rows]
-    warning("Excluded ", sum(!valid_rows), " deployment row(s) with missing dates.")
-  }
-  
-  # Check that we have valid date ranges
-  min_start <- min(start_dates, na.rm = TRUE)
-  max_end   <- max(end_dates, na.rm = TRUE)
-  
-  if (!is.finite(min_start) || !is.finite(max_end)) {
-    stop("No valid date range found. All dates failed to parse.", call. = FALSE)
-  }
-  
+
+
+  min_start <- min(deps$Start_Date_parsed, na.rm = TRUE)
+  max_end   <- max(deps$End_Date_parsed, na.rm = TRUE)
+
   # Zero-count rows across all sites × all days in deployment window
   zero_counts <- expand.grid(
-    Site = unique(deps$Site),
+    `Site Name` = unique(deps$`Site Name`),
     detection_date = seq(
       from = min_start,
       to   = max_end,
@@ -450,15 +383,15 @@ build_nps_model_inputs <- function(
     )
   ) |>
     dplyr::mutate(
-      deer_count         = 0,
+      species_count       = 0,
       cluster_length_days = 0
     )
-  
+
   counts_time <- seqs |>
     dplyr::bind_rows(zero_counts) |>
-    dplyr::group_by(Site, detection_date) |>
+    dplyr::group_by(`Site Name`, detection_date) |>
     dplyr::summarise(
-      detections       = sum(deer_count),
+      detections       = sum(species_count),
       camera_time_days = sum(cluster_length_days),
       .groups          = "drop"
     )
@@ -473,12 +406,12 @@ build_nps_model_inputs <- function(
     )
   
   out <- counts |>
-    dplyr::left_join(deps, by = "Site")
-  
+    dplyr::left_join(deps, by = "Site Name")
+
   detection_matrix <- counts |>
-    tibble::column_to_rownames("Site") |>
+    tibble::column_to_rownames("Site Name") |>
     as.matrix()
-  
+
   camera_time_matrix <- counts_time |>
     dplyr::select(-detections) |>
     tidyr::pivot_wider(
@@ -487,23 +420,21 @@ build_nps_model_inputs <- function(
       values_fill = 0,
       names_sort  = TRUE
     ) |>
-    tibble::column_to_rownames("Site") |>
+    tibble::column_to_rownames("Site Name") |>
     as.matrix()
   
   # Create Start Index and End Index columns
-  # These map each camera's deployment dates to column indices in the detection matrix
-  all_dates <- sort(unique(counts_time$detection_date))
-  
-  # Parse Start/End dates from out (they should already be formatted by format_deployments)
-  out_start_dates <- parse_date_robust(out$`Start Date`)
-  out_end_dates   <- parse_date_robust(out$`End Date`)
-  
-  # Find column indices for each camera's deployment period
+  # These map each camera's deployment dates to column indices in the detection matrix.
+  # Derived directly from detection_matrix's own column names (rather than an
+  # independently-sorted copy of counts_time$detection_date) so all_dates[k]
+  # is guaranteed to be the date of column k by construction, not by relying
+  # on pivot_wider's string-based names_sort happening to agree with a
+  # separate chronological Date sort.
+  all_dates <- as.Date(colnames(detection_matrix))
+
+  # Start_Date_parsed/End_Date_parsed already arrived on `out` via the
+  # left_join(deps, ...) above, so no re-parsing is needed here.
   out <- out |>
-    dplyr::mutate(
-      Start_Date_parsed = out_start_dates,
-      End_Date_parsed   = out_end_dates
-    ) |>
     dplyr::rowwise() |>
     dplyr::mutate(
       `Start Index` = {
@@ -517,10 +448,6 @@ build_nps_model_inputs <- function(
     ) |>
     dplyr::ungroup() |>
     dplyr::select(-Start_Date_parsed, -End_Date_parsed)
-  
-  # Ensure indices are valid
-  out$`Start Index` <- pmax(1L, pmin(out$`Start Index`, ncol(detection_matrix)))
-  out$`End Index`   <- pmax(out$`Start Index`, pmin(out$`End Index`, ncol(detection_matrix)))
   
   camera_counts <- camera_days <- numeric(nrow(out))
   
@@ -541,11 +468,9 @@ build_nps_model_inputs <- function(
   }
   
   list(
-    out                = out,
-    detection_matrix   = detection_matrix,
-    camera_time_matrix = camera_time_matrix,
-    camera_counts      = camera_counts,
-    camera_days        = camera_days
+    out           = out,
+    camera_counts = camera_counts,
+    camera_days   = camera_days
   )
 }
 
@@ -673,20 +598,15 @@ run_encounter_rate_model <- function(method,
                                      status_callback = NULL,
                                      seed = NULL,
                                      verbose = FALSE) {
-  report_status <- function(stage, detail = NULL, value = NULL) {
+  report_status <- function(round, iter, burnin, prev_elapsed_min = NULL, prev_iter = NULL) {
     if (is.function(status_callback)) {
-      cb_err <- tryCatch(
-        {
-          status_callback(stage = stage, detail = detail, value = value)
-          NULL
-        },
-        error = function(e) e
+      status_callback(
+        round = round,
+        iter = iter,
+        burnin = burnin,
+        prev_elapsed_min = prev_elapsed_min,
+        prev_iter = prev_iter
       )
-      if (inherits(cb_err, "model_stop_requested") ||
-          (inherits(cb_err, "error") &&
-             grepl("stopped by user", conditionMessage(cb_err), ignore.case = TRUE))) {
-        stop(cb_err)
-      }
     }
   }
 
@@ -695,12 +615,6 @@ run_encounter_rate_model <- function(method,
   thin <- as.integer(max(1, thin))
   n_chains <- as.integer(max(1, n_chains))
 
-  report_status(
-    "setup",
-    paste0("Prepared ", method, " model code and inputs."),
-    value = 0.1
-  )
-
   current_iter <- iter
   current_burnin <- burnin
   current_thin <- thin
@@ -708,6 +622,8 @@ run_encounter_rate_model <- function(method,
   current_rhat <- Inf
   adapt_log <- list()
   last_fit <- NULL
+  prev_elapsed_min <- NULL
+  prev_iter <- NULL
 
   repeat {
     round_i <- round_i + 1L
@@ -726,21 +642,21 @@ run_encounter_rate_model <- function(method,
       break
     }
 
-    detail <- paste0(
-      method, " MCMC round ", round_i,
-      ": iter=", current_iter,
-      ": burnin=", current_burnin,
-      ", thin=", current_thin,
-      ", chains=", n_chains
-    )
-
     if (isTRUE(verbose)) {
-      message(detail)
+      message(
+        method, " MCMC round ", round_i,
+        ": iter=", current_iter,
+        ", burnin=", current_burnin,
+        ", thin=", current_thin,
+        ", chains=", n_chains
+      )
     }
     report_status(
-      "MCMC running",
-      detail,
-      value = min(0.15 + 0.2 * round_i, 0.9)
+      round = round_i,
+      iter = current_iter,
+      burnin = current_burnin,
+      prev_elapsed_min = prev_elapsed_min,
+      prev_iter = prev_iter
     )
     round_started <- Sys.time()
 
@@ -773,21 +689,8 @@ run_encounter_rate_model <- function(method,
     )
 
     last_fit <- fit
-
-    elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
-    report_status(
-      "MCMC running",
-      paste0(
-        method, " MCMC round ", round_i,
-        " complete: max Rhat=",
-        if (is.finite(current_rhat)) format(round(current_rhat, 3), nsmall = 3) else "NA",
-        "; processing time=",
-        format(round(elapsed_min, 1), nsmall = 1),
-        " minutes",
-        if (!converged) "; the next round will take longer." else "."
-      ),
-      value = min(0.2 + 0.2 * round_i, 0.95)
-    )
+    prev_elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
+    prev_iter <- current_iter
 
     if (converged || !isTRUE(adaptive)) {
       break
@@ -795,7 +698,7 @@ run_encounter_rate_model <- function(method,
 
     current_iter <- current_iter * 2L
     current_burnin <- current_burnin * 2L
-    current_thin <- max(1L, floor((current_iter - burnin) / 1000))
+    current_thin <- current_thin * 2L
   }
 
   samples_list <- lapply(last_fit, `[[`, "samples")
@@ -807,7 +710,7 @@ run_encounter_rate_model <- function(method,
     samples_all = samples_all,
     waic = extract_waic_mean(last_fit),
     fit_objects = last_fit,
-    tuning_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
+    round_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
     final_rhat_max = current_rhat,
     settings = list(
       iter = current_iter,
@@ -848,6 +751,9 @@ run_REM <- function(y,
   J <- length(y)
   if (length(r_km) != J || length(camera_days) != J) {
     stop("run_REM: y, r_km, and camera_days must have same length.", call. = FALSE)
+  }
+  if (J < 2L) {
+    stop("run_REM: at least 2 cameras are required to estimate density.", call. = FALSE)
   }
   if (length(theta_deg) == 1L) {
     theta_deg <- rep(as.numeric(theta_deg), J)
@@ -955,6 +861,9 @@ run_TTE <- function(y,
   if (length(r_km) != J || length(camera_days) != J) {
     stop("run_TTE: y, r_km, and camera_days must have same length.", call. = FALSE)
   }
+  if (J < 2L) {
+    stop("run_TTE: at least 2 cameras are required to estimate density.", call. = FALSE)
+  }
   if (length(theta_deg) == 1L) {
     theta_deg <- rep(as.numeric(theta_deg), J)
   } else if (length(theta_deg) != J) {
@@ -1036,18 +945,43 @@ run_TTE <- function(y,
 }
 
 # -------------------------------------------------------------------
+# USCR: buffer sizing from sigma (movement/space-use scale)
+# -------------------------------------------------------------------
+# 99% circular home-range radius (km) implied by a given sigma (km).
+uscr_home_range_radius_km <- function(sigma_km, p = 0.99) {
+  sigma_km * sqrt(stats::qchisq(p, df = 2))
+}
+
+# Suggested state-space buffer (m), given a sigma value (km) and a safety
+# multiplier on the home-range radius. Used both to size the buffer up front
+# (from the log(sigma) prior) and to check it after fitting (from the
+# posterior). A bigger multiplier is safer but increases the state space
+# (and run time).
+uscr_buffer_from_sigma_km <- function(sigma_km, p = 0.99, multiplier = 1.05) {
+  multiplier * uscr_home_range_radius_km(sigma_km, p = p) * 1000
+}
+
+# Default buffer (m) computed from the log(sigma) prior before any data are
+# fit: uses the p-quantile of the prior as a quick, conservative guess at
+# sigma, then sizes the buffer from that guess via uscr_buffer_from_sigma_km().
+uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = 0.99, multiplier = 1.05) {
+  sigma_q <- exp(log_sigma_mean + log_sigma_sd * stats::qnorm(p))
+  uscr_buffer_from_sigma_km(sigma_q, p = p, multiplier = multiplier)
+}
+
+# -------------------------------------------------------------------
 # USCR: state space, buffer, area
 # Drop-in replacement for the USCR section in sim_and_models.R
 # -------------------------------------------------------------------
 
 uscr_state_space_and_area <- function(out,
                                       buffer_m = NULL,
-                                      buffer_chi_p = 0.99,
-                                      buffer_scale = 0.40) {
+                                      log_sigma_mean = -1.5269,
+                                      log_sigma_sd = 0.1535) {
   if (!is.null(buffer_m) && is.finite(buffer_m) && buffer_m > 0) {
     buffer <- as.numeric(buffer_m) / 1000
   } else {
-    buffer <- buffer_scale * sqrt(stats::qchisq(buffer_chi_p, df = 2))
+    buffer <- uscr_default_buffer_m(log_sigma_mean, log_sigma_sd) / 1000
   }
   buffer_sq <- buffer ^ 2
 
@@ -1063,20 +997,23 @@ uscr_state_space_and_area <- function(out,
   if (all(c("Longitude", "Latitude") %in% names(out))) {
     quiet_require("sf")
 
-    site_col <- if ("Site" %in% names(out)) "Site" else NULL
+    site_col <- if ("Site Name" %in% names(out)) "Site Name" else NULL
     coords_df <- unique(out[, c(site_col, "Longitude", "Latitude"), drop = FALSE])
-    coords_df <- coerce_and_validate_coordinates(
-      coords_df,
-      lon_col = "Longitude",
-      lat_col = "Latitude",
-      site_col = site_col,
-      context = "USCR state-space coordinates"
-    )
+    # Latitude/Longitude validity is enforced at upload time (see
+    # check_deployments()); simulated grids never reach this branch, since
+    # they have no Longitude/Latitude columns at all. All that's needed here
+    # is numeric coercion.
+    coords_df$Longitude <- as.numeric(coords_df$Longitude)
+    coords_df$Latitude  <- as.numeric(coords_df$Latitude)
+    # Same WGS84/UTM approach as build_nps_model_inputs(): global rather
+    # than North-America-only, with the hemisphere taken from mean latitude.
     mean_lon <- mean(coords_df$Longitude, na.rm = TRUE)
+    mean_lat <- mean(coords_df$Latitude, na.rm = TRUE)
     utm_zone <- floor((mean_lon + 180) / 6) + 1
-    epsg_code <- 26900 + utm_zone
+    utm_zone <- min(60L, max(1L, as.integer(utm_zone)))
+    epsg_code <- if (mean_lat >= 0) 32600 + utm_zone else 32700 + utm_zone
 
-    cam_buff <- sf::st_as_sf(coords_df, coords = c("Longitude", "Latitude"), crs = 4269) |>
+    cam_buff <- sf::st_as_sf(coords_df, coords = c("Longitude", "Latitude"), crs = 4326) |>
       sf::st_transform(crs = epsg_code) |>
       sf::st_buffer(buffer * 1000) |>
       sf::st_union()
@@ -1085,7 +1022,7 @@ uscr_state_space_and_area <- function(out,
   } else {
     if (any(!is.finite(out$utm_e) | !is.finite(out$utm_n))) {
       bad <- which(!is.finite(out$utm_e) | !is.finite(out$utm_n))
-      bad_sites <- if ("Site" %in% names(out)) as.character(out$Site[bad]) else as.character(bad)
+      bad_sites <- if ("Site Name" %in% names(out)) as.character(out$`Site Name`[bad]) else as.character(bad)
       stop(
         "Missing or invalid projected coordinates for site(s): ",
         paste(unique(bad_sites), collapse = ", "),
@@ -1109,99 +1046,60 @@ uscr_state_space_and_area <- function(out,
 # USCR model code builder
 # -------------------------------------------------------------------
 
-build_uscr_code <- function(J) {
+# USCR requires at least 2 cameras: sigma (the spatial decay of detection
+# with distance) is estimated from spatial contrast in detections across
+# cameras at different locations, so a single camera can't identify it.
+# This is the only supported model form; run_USCR() enforces J >= 2 before
+# calling this.
+build_uscr_code <- function() {
   quiet_require("nimble")
 
-  if (J == 1L) {
-    nimble::nimbleCode({
-      log_sigma ~ dnorm(log_sigma_mean, sd = log_sigma_sd)
-      log_lam_0 ~ dnorm(log_lam0_mean, sd = log_lam0_sd)
-      psi ~ dunif(0, 1)
-      sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
+  nimble::nimbleCode({
+    log_sigma ~ dnorm(log_sigma_mean, sd = log_sigma_sd)
+    log_lam_0 ~ dnorm(log_lam0_mean, sd = log_lam0_sd)
+    psi ~ dunif(0, 1)
+    sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
 
-      sigma <- exp(log_sigma)
-      lam_0 <- exp(log_lam_0)
+    sigma <- exp(log_sigma)
+    lam_0 <- exp(log_lam_0)
 
-      for (i in 1:M) {
-        z[i] ~ dbern(psi)
+    for (i in 1:M) {
+      z[i] ~ dbern(psi)
 
-        hrc[i, 1] ~ dunif(xlim[1], xlim[2])
-        hrc[i, 2] ~ dunif(ylim[1], ylim[2])
-
-        dist2[i, 1] <- (hrc[i, 1] - cam[1, 1]) ^ 2 +
-          (hrc[i, 2] - cam[1, 2]) ^ 2
-
-        lambda[i, 1] <- z[i] * lam_0 *
-          exp(-dist2[i, 1] / (2 * sigma ^ 2))
-
-        in_ss[i] ~ dconstraint(dist2[i, 1] < buffer_sq)
-      }
-
-      eps[1] ~ dnorm(0, sd = sd_eps)
-      Lambda[1] <- sum(lambda[1:M, 1])
-      log(mu[1]) <- log(Lambda[1]) + log(day1) + eps[1]
-
-      y[1] ~ dpois(mu[1])
-      y_sim[1] ~ dpois(mu[1])
-
-      pearson_obs[1] <- (y[1] - mu[1]) ^ 2 / mu[1]
-      pearson_sim[1] <- (y_sim[1] - mu[1]) ^ 2 / mu[1]
-
-      sum_obs <- pearson_obs[1]
-      sum_sim <- pearson_sim[1]
-      bp <- step(sum_sim - sum_obs)
-
-      N <- sum(z[1:M])
-      D_mi2 <- N / area_mi2
-    })
-  } else {
-    nimble::nimbleCode({
-      log_sigma ~ dnorm(log_sigma_mean, sd = log_sigma_sd)
-      log_lam_0 ~ dnorm(log_lam0_mean, sd = log_lam0_sd)
-      psi ~ dunif(0, 1)
-      sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
-
-      sigma <- exp(log_sigma)
-      lam_0 <- exp(log_lam_0)
-
-      for (i in 1:M) {
-        z[i] ~ dbern(psi)
-
-        hrc[i, 1] ~ dunif(xlim[1], xlim[2])
-        hrc[i, 2] ~ dunif(ylim[1], ylim[2])
-
-        for (j in 1:J) {
-          dist2[i, j] <- (hrc[i, 1] - cam[j, 1]) ^ 2 +
-            (hrc[i, 2] - cam[j, 2]) ^ 2
-
-          lambda[i, j] <- z[i] * lam_0 *
-            exp(-dist2[i, j] / (2 * sigma ^ 2))
-        }
-
-        min_dist2[i] <- min(dist2[i, 1:J])
-        in_ss[i] ~ dconstraint(min_dist2[i] < buffer_sq)
-      }
+      hrc[i, 1] ~ dunif(xlim[1], xlim[2])
+      hrc[i, 2] ~ dunif(ylim[1], ylim[2])
 
       for (j in 1:J) {
-        eps[j] ~ dnorm(0, sd = sd_eps)
-        Lambda[j] <- sum(lambda[1:M, j])
-        log(mu[j]) <- log(Lambda[j]) + log(days_per_cam[j]) + eps[j]
+        dist2[i, j] <- (hrc[i, 1] - cam[j, 1]) ^ 2 +
+          (hrc[i, 2] - cam[j, 2]) ^ 2
 
-        y[j] ~ dpois(mu[j])
-        y_sim[j] ~ dpois(mu[j])
-
-        pearson_obs[j] <- (y[j] - mu[j]) ^ 2 / mu[j]
-        pearson_sim[j] <- (y_sim[j] - mu[j]) ^ 2 / mu[j]
+        lambda[i, j] <- z[i] * lam_0 *
+          exp(-dist2[i, j] / (2 * sigma ^ 2))
       }
 
-      sum_obs <- sum(pearson_obs[1:J])
-      sum_sim <- sum(pearson_sim[1:J])
-      bp <- step(sum_sim - sum_obs)
+      min_dist2[i] <- min(dist2[i, 1:J])
+      in_ss[i] ~ dconstraint(min_dist2[i] < buffer_sq)
+    }
 
-      N <- sum(z[1:M])
-      D_mi2 <- N / area_mi2
-    })
-  }
+    for (j in 1:J) {
+      eps[j] ~ dnorm(0, sd = sd_eps)
+      Lambda[j] <- sum(lambda[1:M, j])
+      log(mu[j]) <- log(Lambda[j]) + log(days_per_cam[j]) + eps[j]
+
+      y[j] ~ dpois(mu[j])
+      y_sim[j] ~ dpois(mu[j])
+
+      pearson_obs[j] <- (y[j] - mu[j]) ^ 2 / mu[j]
+      pearson_sim[j] <- (y_sim[j] - mu[j]) ^ 2 / mu[j]
+    }
+
+    sum_obs <- sum(pearson_obs[1:J])
+    sum_sim <- sum(pearson_sim[1:J])
+    bp <- step(sum_sim - sum_obs)
+
+    N <- sum(z[1:M])
+    D_mi2 <- N / area_mi2
+  })
 }
 
 # -------------------------------------------------------------------
@@ -1217,14 +1115,12 @@ make_uscr_constants <- function(out,
                                 log_lam0_sd,
                                 sd_eps_shape,
                                 sd_eps_rate,
-                                buffer_m,
-                                buffer_chi_p,
-                                buffer_scale) {
+                                buffer_m) {
   ss <- uscr_state_space_and_area(
     out,
     buffer_m = buffer_m,
-    buffer_chi_p = buffer_chi_p,
-    buffer_scale = buffer_scale
+    log_sigma_mean = log_sigma_mean,
+    log_sigma_sd = log_sigma_sd
   )
 
   const <- list(
@@ -1243,11 +1139,7 @@ make_uscr_constants <- function(out,
     sd_eps_rate = sd_eps_rate
   )
 
-  if (const$J == 1L) {
-    const$day1 <- as.numeric(camera_days[1])
-  } else {
-    const$days_per_cam <- as.numeric(camera_days)
-  }
+  const$days_per_cam <- as.numeric(camera_days)
 
   const
 }
@@ -1439,11 +1331,11 @@ extract_waic_mean <- function(fits) {
 run_USCR <- function(out,
                      camera_counts,
                      camera_days,
-                     iter = 11000,
+                     iter = 6000,
                      burnin = 1000,
-                     thin = 10,
+                     thin = 5,
                      n_chains = 2,
-                     M = 1000,
+                     M = 100,
                      log_sigma_mean = -1.5269,
                      log_sigma_sd = 0.1535,
                      log_lam0_mean = 0,
@@ -1451,96 +1343,66 @@ run_USCR <- function(out,
                      sd_eps_shape = 1,
                      sd_eps_rate = 1,
                      buffer_m = NULL,
-                     buffer_chi_p = 0.99,
-                     buffer_scale = 0.40,
                      adaptive = TRUE,
                      compute_WAIC = TRUE,
                      diagnostic_mode = FALSE,
                      rhat_target = 1.1,
                      psi_threshold = 0.9,
                      psi_prob_cutoff = 0.01,
+                     buffer_p = 0.99,
+                     buffer_multiplier = 1.05,
+                     buffer_safety_factor = 1.01,
                      max_adapt_rounds = NULL,
-                     tuning_n_chains = NULL,
-                     iter_tune = NULL,
-                     thin_tune = 1,
                      iter_cap = NULL,
                      M_cap = NULL,
-                     interrupt_callback = NULL,
                      parallel_chains = TRUE,
                      status_callback = NULL,
                      seed = NULL,
                      verbose = FALSE) {
 
   quiet_require("nimble")
-  
-  report_status <- function(stage, detail = NULL, value = NULL) {
-    if (is.function(status_callback)) {
-      cb_err <- tryCatch(
-        {
-          status_callback(stage = stage, detail = detail, value = value)
-          NULL
-        },
-        error = function(e) e
-      )
-      if (inherits(cb_err, "model_stop_requested") ||
-          (inherits(cb_err, "error") &&
-             grepl("stopped by user", conditionMessage(cb_err), ignore.case = TRUE))) {
-        stop(cb_err)
-      }
-    }
-  }
 
-  get_interrupt_action <- function() {
-    if (!is.function(interrupt_callback)) return(NULL)
-    action <- tryCatch(interrupt_callback(), error = function(e) NULL)
-    if (is.null(action) || !nzchar(action)) return(NULL)
-    as.character(action)[1]
+  report_status <- function(round, iter, burnin, M = NULL, buffer_m = NULL, prev_elapsed_min = NULL, prev_iter = NULL) {
+    if (is.function(status_callback)) {
+      status_callback(
+        round = round,
+        iter = iter,
+        burnin = burnin,
+        M = M,
+        buffer_m = buffer_m,
+        prev_elapsed_min = prev_elapsed_min,
+        prev_iter = prev_iter
+      )
+    }
   }
 
   build_uscr_result <- function(fit_objects,
                                 samples_list,
                                 samples_all,
-                                tuning_fit_objects,
-                                tuning_history,
-                                final_run_history,
+                                round_history,
                                 final_rhat_max,
                                 settings_M,
                                 settings_iter,
+                                settings_burnin,
                                 settings_thin,
-                                area_mi2 = NA_real_,
-                                provisional = FALSE,
-                                provisional_stage = NULL,
-                                provisional_reason = NULL) {
+                                settings_buffer_m,
+                                area_mi2 = NA_real_) {
     list(
       method = "USCR",
       samples_list = samples_list,
       samples_all = samples_all,
       waic = extract_waic_mean(fit_objects),
       fit_objects = fit_objects,
-      tuning_fit_objects = tuning_fit_objects,
-      tuning_history = tuning_history,
-      final_run_history = final_run_history,
+      round_history = round_history,
       final_rhat_max = final_rhat_max,
-      provisional = provisional,
-      provisional_stage = provisional_stage,
-      provisional_reason = provisional_reason,
-      resumable_settings = list(
-        M = settings_M,
-        iter = settings_iter,
-        burnin = burnin,
-        thin = settings_thin
-      ),
       settings = list(
         M = settings_M,
         iter = settings_iter,
-        burnin = burnin,
+        burnin = settings_burnin,
         thin = settings_thin,
-        iter_tune = iter_tune,
-        thin_tune = thin_tune,
         iter_cap = iter_cap,
         M_cap = M_cap,
         n_chains = n_chains,
-        tuning_n_chains = tuning_n_chains,
         compute_WAIC = compute_WAIC,
         diagnostic_mode = diagnostic_mode,
         adaptive = adaptive,
@@ -1548,9 +1410,9 @@ run_USCR <- function(out,
         rhat_target = rhat_target,
         psi_threshold = psi_threshold,
         psi_prob_cutoff = psi_prob_cutoff,
-        buffer_m = buffer_m,
-        buffer_chi_p = buffer_chi_p,
-        buffer_scale = buffer_scale,
+        buffer_m = settings_buffer_m,
+        buffer_p = buffer_p,
+        buffer_multiplier = buffer_multiplier,
         area_mi2 = area_mi2,
         log_sigma_mean = log_sigma_mean,
         log_sigma_sd = log_sigma_sd,
@@ -1569,13 +1431,20 @@ run_USCR <- function(out,
       call. = FALSE
     )
   }
+  if (J < 2L) {
+    stop(
+      "run_USCR: at least 2 cameras are required. USCR estimates the spatial ",
+      "scale parameter sigma from detection contrast across cameras at ",
+      "different locations, which a single camera cannot provide.",
+      call. = FALSE
+    )
+  }
 
   iter <- as.integer(iter)
   burnin <- as.integer(burnin)
   thin <- as.integer(max(1, thin))
   n_chains <- as.integer(max(1, n_chains))
   M <- as.integer(max(1, M))
-  thin_tune <- as.integer(max(1, thin_tune))
   if (!is.null(iter_cap)) {
     iter_cap <- as.integer(max(1, iter_cap))
     iter <- min(iter, iter_cap)
@@ -1583,22 +1452,6 @@ run_USCR <- function(out,
   if (!is.null(M_cap)) {
     M_cap <- as.integer(max(1, M_cap))
     M <- min(M, M_cap)
-  }
-
-  if (is.null(tuning_n_chains)) {
-    tuning_n_chains <- if (n_chains > 1L) min(2L, n_chains) else 1L
-  } else {
-    tuning_n_chains <- as.integer(max(1, tuning_n_chains))
-  }
-
-  if (is.null(iter_tune)) {
-    iter_tune <- max(burnin + 500L, as.integer(floor(iter / 4)))
-    iter_tune <- min(iter, iter_tune)
-  } else {
-    iter_tune <- as.integer(iter_tune)
-  }
-  if (!is.null(iter_cap)) {
-    iter_tune <- min(iter_tune, iter_cap)
   }
 
   base_monitors <- c(
@@ -1613,271 +1466,44 @@ run_USCR <- function(out,
     base_monitors
   }
 
-  code <- build_uscr_code(J)
-  report_status("setup", "Prepared USCR state space and model code.", value = 0.15)
+  code <- build_uscr_code()
 
   current_M <- M
-  current_iter <- iter_tune
-  current_thin <- thin_tune
-  adapt_log <- list()
-  last_tune_fit <- NULL
-  latest_completed <- NULL
+  current_iter <- iter
+  current_burnin <- burnin
+  current_thin <- thin
+  current_buffer_m <- if (!is.null(buffer_m) && is.finite(buffer_m) && buffer_m > 0) {
+    as.numeric(buffer_m)
+  } else {
+    uscr_default_buffer_m(log_sigma_mean, log_sigma_sd, p = buffer_p, multiplier = buffer_multiplier)
+  }
+  round_log <- list()
   current_rhat <- Inf
-  M_too_small <- isTRUE(adaptive)
   round_i <- 0L
-
-  if (isTRUE(adaptive)) {
-    repeat {
-      action <- get_interrupt_action()
-      if (identical(action, "stop")) {
-        err <- simpleError("Model execution stopped by user")
-        class(err) <- c("model_stop_requested", class(err))
-        stop(err)
-      }
-      if (identical(action, "pause") && !is.null(latest_completed)) {
-        return(build_uscr_result(
-          fit_objects = latest_completed$fit_objects,
-          samples_list = latest_completed$samples_list,
-          samples_all = latest_completed$samples_all,
-          tuning_fit_objects = last_tune_fit,
-          tuning_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
-          final_run_history = NULL,
-          final_rhat_max = latest_completed$rhat_max,
-          settings_M = latest_completed$M,
-          settings_iter = latest_completed$iter,
-          settings_thin = latest_completed$thin,
-          area_mi2 = if (!is.null(latest_completed$area_mi2)) latest_completed$area_mi2 else NA_real_,
-          provisional = TRUE,
-          provisional_stage = latest_completed$stage,
-          provisional_reason = "Paused after the latest completed USCR tuning round before convergence criteria were fully satisfied."
-        ))
-      }
-
-      round_i <- round_i + 1L
-
-      if (!is.null(max_adapt_rounds) && round_i > as.integer(max_adapt_rounds)) {
-        warning(
-          "USCR adaptive tuning reached max_adapt_rounds = ",
-          max_adapt_rounds,
-          " before both tuning checks cleared. Proceeding with the latest settings."
-        )
-        break
-      }
-
-      const <- make_uscr_constants(
-        out = out,
-        camera_days = camera_days,
-        M = current_M,
-        log_sigma_mean = log_sigma_mean,
-        log_sigma_sd = log_sigma_sd,
-        log_lam0_mean = log_lam0_mean,
-        log_lam0_sd = log_lam0_sd,
-        sd_eps_shape = sd_eps_shape,
-        sd_eps_rate = sd_eps_rate,
-        buffer_m = buffer_m,
-        buffer_chi_p = buffer_chi_p,
-        buffer_scale = buffer_scale
-      )
-
-      data_list <- list(
-        y = as.numeric(camera_counts),
-        in_ss = rep(1L, const$M)
-      )
-
-      if (isTRUE(verbose)) {
-        message(
-          "USCR tuning round ", round_i,
-          ": M=", const$M,
-          ", iter=", current_iter,
-          ", thin=", current_thin,
-          ", chains=", tuning_n_chains
-        )
-      }
-      report_status(
-        "tuning",
-        paste0(
-          "USCR tuning round ", round_i,
-          ": M=", const$M,
-          ", iter=", current_iter,
-          ", thin=", current_thin,
-          ", chains=", tuning_n_chains
-        ),
-        value = min(0.2 + 0.15 * round_i, 0.7)
-      )
-      round_started <- Sys.time()
-
-      tune_fit <- run_uscr_chains(
-        code = code,
-        constants = const,
-        data = data_list,
-        monitors = base_monitors,
-        niter = current_iter,
-        nburnin = burnin,
-        thin = current_thin,
-        n_chains = tuning_n_chains,
-        parallel_chains = parallel_chains,
-        compute_WAIC = FALSE,
-        seed = if (is.null(seed)) NULL else seed + round_i
-      )
-
-      samples_list <- lapply(tune_fit, `[[`, "samples")
-      samples_all <- do.call(rbind, samples_list)
-      psi_post <- samples_all[, "psi"]
-
-      current_rhat <- safe_rhat_max(samples_list)
-      M_too_small <- mean(psi_post > psi_threshold, na.rm = TRUE) > psi_prob_cutoff
-      converged <- is.na(current_rhat) || current_rhat <= rhat_target
-
-      adapt_log[[round_i]] <- data.frame(
-        round = round_i,
-        M = const$M,
-        niter = current_iter,
-        nburnin = burnin,
-        thin = current_thin,
-        n_chains = tuning_n_chains,
-        rhat_max = current_rhat,
-        M_too_small = M_too_small,
-        stringsAsFactors = FALSE
-      )
-
-      last_tune_fit <- tune_fit
-      latest_completed <- list(
-        fit_objects = tune_fit,
-        samples_list = samples_list,
-        samples_all = samples_all,
-        rhat_max = current_rhat,
-        M = const$M,
-        iter = current_iter,
-        thin = current_thin,
-        area_mi2 = const$area_mi2,
-        stage = "tuning"
-      )
-
-      elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
-      report_status(
-        "tuning",
-        paste0(
-          "USCR tuning round ", round_i,
-          " complete: max Rhat=",
-          if (is.finite(current_rhat)) format(round(current_rhat, 3), nsmall = 3) else "NA",
-          "; processing time=",
-          format(round(elapsed_min, 1), nsmall = 1),
-          " minutes",
-          if (!converged && M_too_small) {
-            "; the next round will take longer, and psi suggests increasing M before the final run."
-          } else if (!converged) {
-            "; the next round will take longer."
-          } else if (M_too_small) {
-            "; psi suggests increasing M before the final run."
-          } else {
-            "."
-          }
-        ),
-        value = min(0.25 + 0.15 * round_i, 0.78)
-      )
-
-      action <- get_interrupt_action()
-      if (identical(action, "stop")) {
-        err <- simpleError("Model execution stopped by user")
-        class(err) <- c("model_stop_requested", class(err))
-        stop(err)
-      }
-      if (identical(action, "pause")) {
-        return(build_uscr_result(
-          fit_objects = tune_fit,
-          samples_list = samples_list,
-          samples_all = samples_all,
-          tuning_fit_objects = last_tune_fit,
-          tuning_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
-          final_run_history = NULL,
-          final_rhat_max = current_rhat,
-          settings_M = const$M,
-          settings_iter = current_iter,
-          settings_thin = current_thin,
-          area_mi2 = const$area_mi2,
-          provisional = TRUE,
-          provisional_stage = "tuning",
-          provisional_reason = "Paused after the latest completed USCR tuning round before convergence criteria were fully satisfied."
-        ))
-      }
-
-      if (converged && !M_too_small) {
-        break
-      }
-
-      if (!converged) {
-        current_iter <- current_iter * 2L
-        if (!is.null(iter_cap)) {
-          current_iter <- min(current_iter, iter_cap)
-        }
-        current_thin <- max(1L, floor((current_iter - burnin) / 1000))
-      }
-
-      if (converged && M_too_small) {
-        current_M <- current_M * 2L
-        if (!is.null(M_cap)) {
-          current_M <- min(current_M, M_cap)
-        }
-      }
-    }
-  }
-
-  final_iter <- max(iter, current_iter)
-  if (!is.null(iter_cap)) {
-    final_iter <- min(final_iter, iter_cap)
-  }
-  final_thin <- max(thin, current_thin)
-  final_adapt_log <- list()
-  final_fit <- NULL
+  prev_elapsed_min <- NULL
+  prev_iter <- NULL
+  fit <- NULL
   samples_list <- NULL
   samples_all <- NULL
-  final_const <- NULL
-  final_rhat <- Inf
-  final_M_too_small <- isTRUE(adaptive)
-  final_round <- 0L
+  const <- NULL
 
   repeat {
-    action <- get_interrupt_action()
-    if (identical(action, "stop")) {
-      err <- simpleError("Model execution stopped by user")
-      class(err) <- c("model_stop_requested", class(err))
-      stop(err)
-    }
-    if (identical(action, "pause") && !is.null(latest_completed)) {
-      return(build_uscr_result(
-        fit_objects = latest_completed$fit_objects,
-        samples_list = latest_completed$samples_list,
-        samples_all = latest_completed$samples_all,
-        tuning_fit_objects = last_tune_fit,
-        tuning_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
-        final_run_history = if (length(final_adapt_log) > 0L) do.call(rbind, final_adapt_log) else NULL,
-        final_rhat_max = latest_completed$rhat_max,
-        settings_M = latest_completed$M,
-        settings_iter = latest_completed$iter,
-        settings_thin = latest_completed$thin,
-        area_mi2 = if (!is.null(latest_completed$area_mi2)) latest_completed$area_mi2 else NA_real_,
-        provisional = TRUE,
-        provisional_stage = latest_completed$stage,
-        provisional_reason = "Paused after the latest completed USCR round before the next round began."
-      ))
-    }
+    round_i <- round_i + 1L
 
-    final_round <- final_round + 1L
-
-    if (!isTRUE(adaptive) && final_round > 1L) {
+    if (!isTRUE(adaptive) && round_i > 1L) {
       break
     }
 
-    if (!is.null(max_adapt_rounds) && final_round > as.integer(max_adapt_rounds)) {
+    if (!is.null(max_adapt_rounds) && round_i > as.integer(max_adapt_rounds)) {
       warning(
-        "USCR final run reached max_adapt_rounds = ",
+        "USCR reached max_adapt_rounds = ",
         max_adapt_rounds,
-        " before the final convergence checks cleared. Proceeding with the latest fit."
+        " before both the Rhat and M checks cleared. Proceeding with the latest fit."
       )
       break
     }
 
-    final_const <- make_uscr_constants(
+    const <- make_uscr_constants(
       out = out,
       camera_days = camera_days,
       M = current_M,
@@ -1887,132 +1513,80 @@ run_USCR <- function(out,
       log_lam0_sd = log_lam0_sd,
       sd_eps_shape = sd_eps_shape,
       sd_eps_rate = sd_eps_rate,
-      buffer_m = buffer_m,
-      buffer_chi_p = buffer_chi_p,
-      buffer_scale = buffer_scale
+      buffer_m = current_buffer_m
     )
 
-    final_data <- list(
+    data_list <- list(
       y = as.numeric(camera_counts),
-      in_ss = rep(1L, final_const$M)
-    )
-
-    final_detail <- paste0(
-      "USCR final run round ", final_round,
-      ": M=", final_const$M,
-      ", iter=", final_iter,
-      ", thin=", final_thin,
-      ", chains=", n_chains
-    )
-    report_status(
-      "final_run",
-      final_detail,
-      value = min(0.8 + 0.05 * (final_round - 1L), 0.98)
+      in_ss = rep(1L, const$M)
     )
 
     if (isTRUE(verbose)) {
       message(
-        final_detail,
-        ", WAIC=", compute_WAIC,
-        ", diagnostic_mode=", diagnostic_mode
+        "USCR round ", round_i,
+        ": M=", const$M,
+        ", buffer=", round(current_buffer_m), "m",
+        ", iter=", current_iter,
+        ", burnin=", current_burnin,
+        ", thin=", current_thin,
+        ", chains=", n_chains
       )
     }
+    report_status(
+      round = round_i,
+      iter = current_iter,
+      burnin = current_burnin,
+      M = const$M,
+      buffer_m = current_buffer_m,
+      prev_elapsed_min = prev_elapsed_min,
+      prev_iter = prev_iter
+    )
     round_started <- Sys.time()
 
-    final_fit <- run_uscr_chains(
+    fit <- run_uscr_chains(
       code = code,
-      constants = final_const,
-      data = final_data,
+      constants = const,
+      data = data_list,
       monitors = final_monitors,
-      niter = final_iter,
-      nburnin = burnin,
-      thin = final_thin,
+      niter = current_iter,
+      nburnin = current_burnin,
+      thin = current_thin,
       n_chains = n_chains,
       parallel_chains = parallel_chains,
       compute_WAIC = compute_WAIC,
-      seed = if (is.null(seed)) NULL else seed + 1000L + final_round
+      seed = if (is.null(seed)) NULL else seed + round_i
     )
 
-    samples_list <- lapply(final_fit, `[[`, "samples")
+    samples_list <- lapply(fit, `[[`, "samples")
     samples_all <- do.call(rbind, samples_list)
-    psi_post_final <- samples_all[, "psi"]
+    psi_post <- samples_all[, "psi"]
+    sigma_post_max <- max(samples_all[, "sigma"], na.rm = TRUE)
 
-    final_rhat <- safe_rhat_max(samples_list)
-    final_M_too_small <- mean(psi_post_final > psi_threshold, na.rm = TRUE) > psi_prob_cutoff
-    final_converged <- is.na(final_rhat) || final_rhat <= rhat_target
+    current_rhat <- safe_rhat_max(samples_list)
+    M_too_small <- mean(psi_post > psi_threshold, na.rm = TRUE) > psi_prob_cutoff
+    converged <- is.na(current_rhat) || current_rhat <= rhat_target
 
-    final_adapt_log[[final_round]] <- data.frame(
-      round = final_round,
-      M = final_const$M,
-      niter = final_iter,
-      nburnin = burnin,
-      thin = final_thin,
+    required_buffer_m <- uscr_buffer_from_sigma_km(sigma_post_max, p = buffer_p, multiplier = buffer_multiplier)
+    buffer_too_small <- is.finite(required_buffer_m) && current_buffer_m < required_buffer_m
+
+    round_log[[round_i]] <- data.frame(
+      round = round_i,
+      M = const$M,
+      buffer_m = current_buffer_m,
+      niter = current_iter,
+      nburnin = current_burnin,
+      thin = current_thin,
       n_chains = n_chains,
-      rhat_max = final_rhat,
-      M_too_small = final_M_too_small,
+      rhat_max = current_rhat,
+      M_too_small = M_too_small,
+      buffer_too_small = buffer_too_small,
       stringsAsFactors = FALSE
     )
-    latest_completed <- list(
-      fit_objects = final_fit,
-      samples_list = samples_list,
-      samples_all = samples_all,
-      rhat_max = final_rhat,
-      M = final_const$M,
-      iter = final_iter,
-      thin = final_thin,
-      area_mi2 = final_const$area_mi2,
-      stage = "final_run"
-    )
 
-    elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
-    report_status(
-      "final_run",
-      paste0(
-        "USCR final run round ", final_round,
-        " complete: max Rhat=",
-        if (is.finite(final_rhat)) format(round(final_rhat, 3), nsmall = 3) else "NA",
-        "; processing time=",
-        format(round(elapsed_min, 1), nsmall = 1),
-        " minutes",
-        if (!final_converged && final_M_too_small) {
-          "; the next round will take longer, and psi still suggests increasing M."
-        } else if (!final_converged) {
-          "; the next round will take longer."
-        } else if (final_M_too_small) {
-          "; psi still suggests increasing M."
-        } else {
-          "."
-        }
-      ),
-      value = min(0.88 + 0.03 * final_round, 0.99)
-    )
+    prev_elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
+    prev_iter <- current_iter
 
-    action <- get_interrupt_action()
-    if (identical(action, "stop")) {
-      err <- simpleError("Model execution stopped by user")
-      class(err) <- c("model_stop_requested", class(err))
-      stop(err)
-    }
-    if (identical(action, "pause")) {
-      return(build_uscr_result(
-        fit_objects = final_fit,
-        samples_list = samples_list,
-        samples_all = samples_all,
-        tuning_fit_objects = last_tune_fit,
-        tuning_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
-        final_run_history = if (length(final_adapt_log) > 0L) do.call(rbind, final_adapt_log) else NULL,
-        final_rhat_max = final_rhat,
-        settings_M = final_const$M,
-        settings_iter = final_iter,
-        settings_thin = final_thin,
-        area_mi2 = final_const$area_mi2,
-        provisional = TRUE,
-        provisional_stage = "final_run",
-        provisional_reason = "Paused after the latest completed USCR final round before convergence criteria were fully satisfied."
-      ))
-    }
-
-    if (final_converged && !final_M_too_small) {
+    if (converged && !M_too_small && !buffer_too_small) {
       break
     }
 
@@ -2020,34 +1594,39 @@ run_USCR <- function(out,
       break
     }
 
-    if (!final_converged) {
-      final_iter <- final_iter * 2L
+    if (!converged) {
+      current_iter <- current_iter * 2L
+      current_burnin <- current_burnin * 2L
+      current_thin <- current_thin * 2L
       if (!is.null(iter_cap)) {
-        final_iter <- min(final_iter, iter_cap)
+        current_iter <- min(current_iter, iter_cap)
       }
-      final_thin <- max(thin, max(1L, floor((final_iter - burnin) / 1000)))
     }
 
-    if (final_M_too_small) {
+    if (M_too_small) {
       current_M <- current_M * 2L
       if (!is.null(M_cap)) {
         current_M <- min(current_M, M_cap)
       }
     }
+
+    if (buffer_too_small) {
+      current_buffer_m <- required_buffer_m * buffer_safety_factor
+    }
   }
 
   build_uscr_result(
-    fit_objects = final_fit,
+    fit_objects = fit,
     samples_list = samples_list,
     samples_all = samples_all,
-    tuning_fit_objects = last_tune_fit,
-    tuning_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
-    final_run_history = if (length(final_adapt_log) > 0L) do.call(rbind, final_adapt_log) else NULL,
-    final_rhat_max = final_rhat,
-    settings_M = final_const$M,
-    settings_iter = final_iter,
-    settings_thin = final_thin,
-    area_mi2 = final_const$area_mi2
+    round_history = if (length(round_log) > 0L) do.call(rbind, round_log) else NULL,
+    final_rhat_max = current_rhat,
+    settings_M = const$M,
+    settings_iter = current_iter,
+    settings_burnin = current_burnin,
+    settings_thin = current_thin,
+    settings_buffer_m = current_buffer_m,
+    area_mi2 = const$area_mi2
   )
 }
 
@@ -2058,7 +1637,7 @@ run_USCR <- function(out,
 #   out = out,
 #   camera_counts = camera_counts,
 #   camera_days = camera_days,
-#   M = 300,
+#   M = 100,
 #   iter = 6000,
 #   burnin = 1000,
 #   thin = 5,
@@ -2069,70 +1648,3 @@ run_USCR <- function(out,
 #   seed = 123,
 #   verbose = TRUE
 # )
-
-
-# -------------------------------------------------------------------
-# 6. WAIC-based model averaging — mirrors Rmd logic
-# -------------------------------------------------------------------
-waic_model_average <- function(rem_fit,
-                               tte_fit,
-                               uscr_fit,
-                               prob_threshold = 20) {
-  quiet_require("dplyr")
-  quiet_require("tibble")
-  
-  # Expect samples_all with column D_mi2
-  rem_D  <- rem_fit$samples_all[, "D_mi2"]
-  tte_D  <- tte_fit$samples_all[, "D_mi2"]
-  uscr_D <- uscr_fit$samples_all[, "D_mi2"]
-  
-  waic_tbl <- tibble::tibble(
-    model = c("REM", "TTE", "USCR"),
-    waic  = c(rem_fit$waic, tte_fit$waic, uscr_fit$waic)
-  ) |>
-    dplyr::mutate(
-      deltaWAIC = waic - min(waic),
-      rel_lik   = exp(-0.5 * deltaWAIC),
-      w         = rel_lik / sum(rel_lik)
-    ) |>
-    dplyr::arrange(model)
-  
-  density_estimates <- tibble::tibble(
-    REM  = rem_D,
-    TTE  = tte_D,
-    USCR = uscr_D
-  ) |>
-    dplyr::mutate(
-      unweighted_mean = apply(cbind(sort(REM), sort(TTE), sort(USCR)), 1, mean),
-      weighted_mean   = apply(
-        waic_tbl$w * t(cbind(sort(REM), sort(TTE), sort(USCR))), 2, sum
-      )
-    )
-  
-  # Summaries per column (REM, TTE, USCR, unweighted, weighted)
-  stats_mat <- apply(
-    density_estimates,
-    2,
-    function(x) c(
-      mean   = mean(x),
-      lower  = stats::quantile(x, 0.025),
-      upper  = stats::quantile(x, 0.975),
-      probgt = mean(x > prob_threshold)
-    )
-  )
-  
-  table_out <- tibble::tibble(
-    Method          = c(waic_tbl$model, "unweighted mean", "weighted mean"),
-    `Mean density`  = stats_mat["mean", ],
-    `Lower 2.5%`    = stats_mat["lower", ],
-    `Upper 97.5%`   = stats_mat["upper", ],
-    `Prob > 20 APSM`= stats_mat["probgt", ],
-    `WAIC weight`   = c(waic_tbl$w, NA, NA)
-  )
-  
-  list(
-    waic_table    = waic_tbl,
-    draws_table   = density_estimates,
-    summary_table = table_out
-  )
-}
