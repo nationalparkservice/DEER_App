@@ -102,12 +102,63 @@ clean_images_import <- function(images) {
     }
   }
   
-  # Split multi-species rows like "Deer|Raccoon" into separate rows
+  # Split multi-species rows like "Deer|Raccoon" into separate rows, pairing
+  # each Species entry with the Sighting Count entry in the same position
+  # (e.g. Species = "Deer|Squirrel", Sighting Count = "1|4" becomes one row
+  # for 1 deer and one row for 4 squirrels; all other columns are repeated
+  # unchanged on both new rows).
   if (all(c("Species", "Sighting Count") %in% names(images))) {
     images <- images %>%
-      dplyr::mutate(`Sighting Count` = as.character(`Sighting Count`)) %>%
-      tidyr::separate_rows(Species, `Sighting Count`, sep = "\\|") %>%
-      dplyr::mutate(`Sighting Count` = suppressWarnings(as.numeric(`Sighting Count`)))
+      dplyr::mutate(`Sighting Count` = as.character(`Sighting Count`))
+
+    # tidyr::separate_rows() hard-errors with an unhelpful "can't recycle"
+    # message if a row's Species and Sighting Count split into different
+    # numbers of pipe-delimited pieces, so check for that explicitly first
+    # and only for rows that actually use the pipe-delimited feature (a
+    # single, non-piped Species with a blank Sighting Count is a separate,
+    # already-handled "missing field" issue, not a mismatch).
+    has_pipe <- grepl("|", images$Species, fixed = TRUE) |
+      grepl("|", images$`Sighting Count`, fixed = TRUE)
+    has_pipe[is.na(has_pipe)] <- FALSE
+    if (any(has_pipe)) {
+      species_n <- lengths(strsplit(images$Species[has_pipe], "|", fixed = TRUE))
+      count_n   <- lengths(strsplit(images$`Sighting Count`[has_pipe], "|", fixed = TRUE))
+      mismatch_rows <- which(has_pipe)[species_n != count_n]
+      if (length(mismatch_rows) > 0) {
+        stop(
+          "clean_images_import: Species and Sighting Count have a different number ",
+          "of pipe-delimited values in row(s) ", paste(mismatch_rows, collapse = ", "),
+          ". Each pipe-delimited Species entry needs a matching Sighting Count entry ",
+          "(for example Species = 'Deer|Squirrel' needs Sighting Count = '1|4')."
+        )
+      }
+    }
+
+    images <- images %>%
+      tidyr::separate_rows(Species, `Sighting Count`, sep = "\\|")
+
+    # Sighting Count must be numeric. Checked here, right after splitting and
+    # before the as.numeric() coercion below, while the original text is
+    # still available to report — as.numeric() would otherwise silently turn
+    # a value like "unknown" into NA, losing the offending value and letting
+    # build_nps_model_inputs() silently produce -Inf/NA detection counts
+    # downstream instead of failing clearly here.
+    bad_count <- which(
+      !is.na(images$`Sighting Count`) & images$`Sighting Count` != "" &
+        is.na(suppressWarnings(as.numeric(images$`Sighting Count`)))
+    )
+    if (length(bad_count) > 0) {
+      stop(
+        "clean_images_import: Sighting Count has non-numeric value(s) in row(s) ",
+        paste(bad_count, collapse = ", "), ": ",
+        paste(images$`Sighting Count`[bad_count], collapse = ", "), ". ",
+        "Sighting Count must be a number (or pipe-delimited numbers for multi-species rows, ",
+        "for example '1|4')."
+      )
+    }
+
+    images <- images %>%
+      dplyr::mutate(`Sighting Count` = as.numeric(`Sighting Count`))
   }
   
   images
@@ -117,8 +168,20 @@ clean_images_import <- function(images) {
 # QC: check_deployments (as before)
 # -------------------------------------------------------------------
 
-check_deployments <- function(deployment, images = NULL) {
+check_deployments <- function(deployment, images = NULL, hemisphere = "Western",
+                               lat_hemisphere = "Northern") {
   issues <- list()
+  hemisphere <- if (identical(hemisphere, "Eastern")) "Eastern" else "Western"
+  lat_hemisphere <- if (identical(lat_hemisphere, "Southern")) "Southern" else "Northern"
+
+  # Rows with a missing/unparseable Start Date or End Date, or a missing/
+  # invalid Latitude or Longitude, are collected here and treated as a hard
+  # stop after the per-row loop (see below) rather than a warning, because
+  # every model run depends on these four fields: Start/End Date drive the
+  # deployment-window trim and the detection-matrix date range in
+  # build_nps_model_inputs(), and Latitude/Longitude drive the UTM
+  # projection used by every model's spatial/distance calculations.
+  blocking_issues <- character()
   
   # ---- Column presence ----
   required_cols <- c(
@@ -130,16 +193,14 @@ check_deployments <- function(deployment, images = NULL) {
   
   missing_cols <- setdiff(required_cols, names(deployment))
   if (length(missing_cols) > 0) {
-    cat(
-      "❌ Missing required column(s):", paste(missing_cols, collapse = ", "), "\n\n",
-      "💡 Guidance:\n",
-      "• If these columns are truly missing from your dataset (for example, no Start Time or End Time was ever recorded),\n",
-      "  please **add the column names** to your CSV file and leave the cells blank.\n",
-      "• If you believe these columns exist but are labeled slightly differently (e.g., 'Start_Date' instead of 'Start Date'),\n",
-      "  please rename them to match exactly the expected column names above.\n\n",
-      "After fixing the file, re-run `check_deployments()`.\n"
+    stop(
+      "Deployment file is missing required column(s): ", paste(missing_cols, collapse = ", "), ". ",
+      "If these columns are truly missing from your dataset (for example, no Start Time or End Time was ",
+      "ever recorded), add the column names to your CSV file and leave the cells blank. If you believe ",
+      "these columns exist but are labeled slightly differently (e.g. 'Start_Date' instead of 'Start Date'), ",
+      "rename them to match exactly. After fixing the file, re-upload it.",
+      call. = FALSE
     )
-    stop("Deployment file is missing one or more required columns.")
   }
   
   # ---- Auto-fix Site Names missing leading zero ----
@@ -155,7 +216,23 @@ check_deployments <- function(deployment, images = NULL) {
     sn
   }, character(1))
   
-  # --- Site Name validation ---
+  # ---- Site Name uniqueness (hard stop) ----
+  # A duplicate Site Name would silently collide downstream (camera counts,
+  # coordinate lookups, the trap array used by USCR, etc.), so this is a hard
+  # error rather than a warning like the checks below.
+  site_names <- trimws(deployment$`Site Name`)
+  dup_sites <- unique(site_names[duplicated(site_names) & !is.na(site_names) & site_names != ""])
+  if (length(dup_sites) > 0) {
+    stop(
+      "Deployment file has duplicate Site Name value(s): ", paste(dup_sites, collapse = ", "), ". ",
+      "Each row must have a unique Site Name. If two cameras were deployed at the same physical site at ",
+      "different times, give them distinct Site Names (for example, add a suffix). If this is a duplicate ",
+      "row from a data-entry mistake, remove the extra row(s). After fixing the file, re-upload it.",
+      call. = FALSE
+    )
+  }
+
+  # --- Site Name format ---
   valid_regex <- paste0(
     "^(",
     "[A-Z]{4}_(0[1-9]|[1-9][0-9]|[1-9][0-9]{2})",
@@ -167,50 +244,68 @@ check_deployments <- function(deployment, images = NULL) {
     "[A-Z]{4}[A-Z]{2,}_(0[1-9]|[1-9][0-9]|[1-9][0-9]{2})",
     ")$"
   )
+
+  # ---- Per-row checks ----
+  deployment_cols <- setdiff(required_cols, "Site Name")
+
   for (i in seq_len(nrow(deployment))) {
+    row_values <- deployment[i, deployment_cols]
+
+    # Skip row if all deployment columns except Site Name and Notes are blank
+    if (all(is.na(row_values) | row_values == "")) next
+
+    # --- Site Name ---
     sn <- trimws(deployment$`Site Name`[i])
-    if (!is.na(sn) && sn != "" && !grepl(valid_regex, sn)) {
+    if (is.na(sn) || sn == "") {
+      issues <- c(issues, paste("❌ Site Name missing in row", i))
+    } else if (!grepl(valid_regex, sn)) {
       issues <- c(issues, paste0(
         "Invalid Site_Name: ", sn,
         " → must follow an allowed format such as 'PARK_##', 'UNIT_##', 'PARK_UNIT_##', or 'PARKUNIT_##'."
       ))
     }
-  }
-  
-  # ---- Per-row checks ----
-  deployment_cols <- setdiff(required_cols, "Site Name")
-  
-  for (i in seq_len(nrow(deployment))) {
-    row_values <- deployment[i, deployment_cols]
-    
-    # Skip row if all deployment columns except Site Name and Notes are blank
-    if (all(is.na(row_values) | row_values == "")) next
-    
+
     # --- Dates ---
     date_cols <- c("Start Date", "End Date")
     for (col in date_cols) {
       val <- deployment[[col]][i]
-      if (!is.na(val) && val != "") {
-        if (is.na(as.Date(val, format = "%m/%d/%Y"))) {
-          issues <- c(issues, paste("❌ Bad date in", col, "row", i, ":", val, " — should be mm/dd/yyyy"))
-        }
+      if (is.na(val) || val == "") {
+        msg <- paste("❌", col, "missing in row", i)
+        issues <- c(issues, msg)
+        blocking_issues <- c(blocking_issues, msg)
+      } else if (is.na(as.Date(val, format = "%m/%d/%Y"))) {
+        msg <- paste("❌ Bad date in", col, "row", i, ":", val, " — should be mm/dd/yyyy")
+        issues <- c(issues, msg)
+        blocking_issues <- c(blocking_issues, msg)
       }
     }
-    
-    # Camera Malfunction Date: only check once images are available,
-    # and only for malfunctioning sites that actually have images.
+
+    # End Date must not be before Start Date. build_nps_model_inputs() maps
+    # each camera's Start/End Date to column indices in a shared date matrix,
+    # so a swapped/backward date range would otherwise silently produce a
+    # collapsed or wrong deployment window for that camera instead of an
+    # error.
+    start_parsed <- suppressWarnings(as.Date(deployment$`Start Date`[i], format = "%m/%d/%Y"))
+    end_parsed   <- suppressWarnings(as.Date(deployment$`End Date`[i],   format = "%m/%d/%Y"))
+    if (!is.na(start_parsed) && !is.na(end_parsed) && end_parsed < start_parsed) {
+      msg <- paste("❌ End Date is before Start Date in row", i, ":",
+                   deployment$`Start Date`[i], "→", deployment$`End Date`[i])
+      issues <- c(issues, msg)
+      blocking_issues <- c(blocking_issues, msg)
+    }
+
+    # Camera Malfunction Date is required whenever Camera Functioning = No.
+    # This only depends on columns already in the deployment file, so it
+    # doesn't need images to be uploaded first.
     cam_func <- deployment$`Camera Functioning`[i]
     if (!is.na(cam_func) && tolower(cam_func) == "no") {
       val <- deployment$`Camera Malfunction Date`[i]
-      cam_id <- deployment$`Site Name`[i]
-      if (!is.null(images) && nrow(images) > 0 && cam_id %in% images$`Site Name`) {
-        if (is.na(val) || val == "") {
-          issues <- c(issues, paste("❌ Camera Malfunction Date missing in row", i,
-                                    " — required because Camera Functioning = No"))
-        } else if (is.na(as.Date(val, format = "%m/%d/%Y"))) {
-          issues <- c(issues, paste("❌ Bad date in Camera Malfunction Date row", i, ":", val,
-                                    " — should be mm/dd/yyyy"))
-        }
+      if (is.na(val) || val == "") {
+        issues <- c(issues, paste("❌ Camera Malfunction Date missing in row", i,
+                                  " — required because Camera Functioning = No"))
+      } else if (is.na(as.Date(val, format = "%m/%d/%Y"))) {
+        issues <- c(issues, paste("❌ Bad date in Camera Malfunction Date row", i, ":", val,
+                                  " — should be mm/dd/yyyy"))
       }
     }
     
@@ -218,16 +313,18 @@ check_deployments <- function(deployment, images = NULL) {
     time_cols <- c("Start Time", "End Time")
     for (col in time_cols) {
       val <- deployment[[col]][i]
-      if (!is.na(val) && val != "") {
-        if (!grepl("^(?:[01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$", val)) {
-          issues <- c(issues, paste("❌ Bad time in", col, "row", i, ":", val, " — should be HH:MM or HH:MM:SS 24h"))
-        }
+      if (is.na(val) || val == "") {
+        issues <- c(issues, paste("❌", col, "missing in row", i))
+      } else if (!grepl("^(?:[01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$", val)) {
+        issues <- c(issues, paste("❌ Bad time in", col, "row", i, ":", val, " — should be HH:MM or HH:MM:SS 24h"))
       }
     }
-    
+
     # ---- Numeric checks with suppression ----
     dd_val <- deployment$`Detection Distance`[i]
-    if (!is.na(dd_val) && dd_val != "" && suppressWarnings(is.na(as.numeric(dd_val)))) {
+    if (is.na(dd_val) || dd_val == "") {
+      issues <- c(issues, paste("❌ Detection Distance missing in row", i))
+    } else if (suppressWarnings(is.na(as.numeric(dd_val)))) {
       issues <- c(issues, paste("❌ Non-numeric value in Detection Distance row", i, ":", dd_val))
     }
     
@@ -250,21 +347,34 @@ check_deployments <- function(deployment, images = NULL) {
       }
     }
     
-    # --- Latitude check (must exist and be non-zero) ---
+    # --- Latitude check (must exist and be non-zero; auto-fix sign to match
+    # the selected hemisphere in Model settings) ---
     lat_val <- suppressWarnings(as.numeric(deployment$Latitude[i]))
     if (is.na(lat_val) || lat_val == 0) {
-      issues <- c(issues, paste("❌ Latitude missing or invalid (0) in row", i))
+      msg <- paste("❌ Latitude missing or invalid (0) in row", i)
+      issues <- c(issues, msg)
+      blocking_issues <- c(blocking_issues, msg)
+    } else {
+      fixed_lat <- if (identical(lat_hemisphere, "Southern")) -abs(lat_val) else abs(lat_val)
+      if (fixed_lat != lat_val) {
+        deployment$Latitude[i] <- fixed_lat
+        message("🛠 Fixed Latitude in row ", i, ": ", lat_val, " → ", fixed_lat)
+      }
     }
-    
-    # --- Longitude check (must exist and be non-zero; auto-fix sign if positive) ---
+
+    # --- Longitude check (must exist and be non-zero; auto-fix sign to match
+    # the selected hemisphere in Model settings) ---
     long_val <- suppressWarnings(as.numeric(deployment$Longitude[i]))
     if (is.na(long_val) || long_val == 0) {
-      issues <- c(issues, paste("❌ Longitude missing or invalid (0) in row", i))
-    } else if (long_val > 0) {
-      # Auto-fix longitude sign
-      fixed_val <- -abs(long_val)
-      deployment$Longitude[i] <- fixed_val
-      message("🛠 Fixed Longitude in row ", i, ": ", long_val, " → ", fixed_val)
+      msg <- paste("❌ Longitude missing or invalid (0) in row", i)
+      issues <- c(issues, msg)
+      blocking_issues <- c(blocking_issues, msg)
+    } else {
+      fixed_val <- if (identical(hemisphere, "Eastern")) abs(long_val) else -abs(long_val)
+      if (fixed_val != long_val) {
+        deployment$Longitude[i] <- fixed_val
+        message("🛠 Fixed Longitude in row ", i, ": ", long_val, " → ", fixed_val)
+      }
     }
     
     # --- Camera Orientation ---
@@ -283,7 +393,9 @@ check_deployments <- function(deployment, images = NULL) {
     
     # --- Camera Functioning ---
     val <- deployment$`Camera Functioning`[i]
-    if (!is.na(val) && val != "") {
+    if (is.na(val) || val == "") {
+      issues <- c(issues, paste("❌ Camera Functioning missing in row", i))
+    } else {
       val_lower <- tolower(val)
       if (!(val_lower %in% c("yes","no"))) {
         issues <- c(issues, paste("❌ Invalid Camera Functioning value in row", i, ":", val, " — must be Yes or No"))
@@ -291,7 +403,48 @@ check_deployments <- function(deployment, images = NULL) {
     }
     
   } # end row loop
-  
+
+  # ---- Duplicate coordinates check (warning) ----
+  # Two different Site Names sharing the exact same Latitude AND Longitude
+  # usually means a copy-paste error created two records for what's actually
+  # one physical camera location. It's fine for Latitude values or Longitude
+  # values to repeat individually (e.g. cameras on the same north-south
+  # transect) — only a duplicated (Latitude, Longitude) pair is flagged. Runs
+  # after the per-row loop so it checks the sign-corrected coordinates.
+  lat_num_all <- suppressWarnings(as.numeric(deployment$Latitude))
+  lon_num_all <- suppressWarnings(as.numeric(deployment$Longitude))
+  has_coords  <- !is.na(lat_num_all) & !is.na(lon_num_all)
+  coord_key   <- paste(lat_num_all, lon_num_all)
+  dup_keys    <- unique(coord_key[has_coords][duplicated(coord_key[has_coords])])
+  for (k in dup_keys) {
+    dup_rows <- which(has_coords & coord_key == k)
+    issues <- c(issues, paste0(
+      "⚠️ Duplicate coordinates in ", length(dup_rows), " row(s) (Site Name: ",
+      paste(deployment$`Site Name`[dup_rows], collapse = ", "),
+      ") — same Latitude/Longitude; verify these are meant to be different camera locations."
+    ))
+  }
+
+  # ---- Hard stop: missing/invalid Start Date, End Date, Latitude, or
+  # Longitude ----
+  # Unlike the row-level issues above (which are surfaced as warnings so
+  # users can see everything at once and decide whether to proceed), these
+  # four fields are load-bearing for every model run, so a missing or
+  # invalid value blocks upload entirely rather than silently propagating
+  # into the deployment-window trim or the UTM projection.
+  if (length(blocking_issues) > 0) {
+    stop(
+      "Deployment file has missing or invalid Start Date, End Date, Latitude, and/or Longitude ",
+      "value(s) in ", length(blocking_issues), " place(s):\n",
+      paste0("  - ", blocking_issues, collapse = "\n"),
+      "\nStart Date and End Date must be present, in mm/dd/yyyy format, and End Date must be on or after ",
+      "Start Date for every row; they set each camera's deployment window. Latitude and Longitude must be ",
+      "present and non-zero for every row; ",
+      "they're used to project camera locations for every model. After fixing the file, re-upload it.",
+      call. = FALSE
+    )
+  }
+
   # ---- Output ----
   if (length(issues) == 0) {
     message("✅ Deployments file is formatted correctly!")
@@ -305,11 +458,14 @@ check_deployments <- function(deployment, images = NULL) {
 # QC: check_images (as before)
 # -------------------------------------------------------------------
 
-check_images <- function(images, deployments, survey_year = NULL) {
+check_images <- function(images, deployments, survey_year = NULL, hemisphere = "Western",
+                          lat_hemisphere = "Northern") {
   # survey_year is retained for backward compatibility with older callers.
   # The current app relies on parsed image timestamps instead.
   issues <- c()
   fixes  <- c()
+  hemisphere <- if (identical(hemisphere, "Eastern")) "Eastern" else "Western"
+  lat_hemisphere <- if (identical(lat_hemisphere, "Southern")) "Southern" else "Northern"
   
   # ---- Required columns ----
   required_cols <- c("Site Name", "Timestamp", "Species", "Sighting Count", "Cluster ID")
@@ -347,7 +503,15 @@ check_images <- function(images, deployments, survey_year = NULL) {
     "[A-Z]{4}[A-Z]{2,}_(0[1-9]|[1-9][0-9]|[1-9][0-9]{2})",
     ")$"
   )
-  invalid_idx <- which(!grepl(valid_regex, images$`Site Name`))
+  missing_site_idx <- which(is.na(images$`Site Name`) | trimws(images$`Site Name`) == "")
+  if (length(missing_site_idx) > 0) {
+    issues <- c(issues, paste0("❌ Site Name missing in ", length(missing_site_idx), " image(s)"))
+  }
+
+  invalid_idx <- which(
+    !is.na(images$`Site Name`) & trimws(images$`Site Name`) != "" &
+      !grepl(valid_regex, images$`Site Name`)
+  )
   if (length(invalid_idx) > 0) {
     site_counts <- table(images$`Site Name`[invalid_idx])
     for (sn in names(site_counts)) {
@@ -372,11 +536,20 @@ check_images <- function(images, deployments, survey_year = NULL) {
     if (length(bad_lon) > 0) {
       issues <- c(issues, paste0("❌ ", length(bad_lon), " image(s) have missing or zero Longitude"))
     }
-    
-    # Auto-fix positive longitudes
-    fix_lon <- which(!is.na(lon_num) & lon_num > 0 & lon_num <= 180)
+
+    # Auto-fix latitude sign to match the selected hemisphere in Model settings
+    fixed_lat <- if (identical(lat_hemisphere, "Southern")) -abs(lat_num) else abs(lat_num)
+    fix_lat <- which(!is.na(lat_num) & lat_num != 0 & fixed_lat != lat_num)
+    if (length(fix_lat) > 0) {
+      images$Latitude[fix_lat] <- fixed_lat[fix_lat]
+      message("🛠 Fixed Latitude for ", length(fix_lat), " image(s) ")
+    }
+
+    # Auto-fix longitude sign to match the selected hemisphere in Model settings
+    fixed_lon <- if (identical(hemisphere, "Eastern")) abs(lon_num) else -abs(lon_num)
+    fix_lon <- which(!is.na(lon_num) & lon_num != 0 & fixed_lon != lon_num)
     if (length(fix_lon) > 0) {
-      images$Longitude[fix_lon] <- -abs(lon_num[fix_lon])
+      images$Longitude[fix_lon] <- fixed_lon[fix_lon]
       message("🛠 Fixed Longitude for ", length(fix_lon), " image(s) ")
     }
   }
@@ -388,23 +561,58 @@ check_images <- function(images, deployments, survey_year = NULL) {
       issues <- c(issues, paste0("❌ Missing ", field, " in ", length(missing_rows), " image(s)"))
     }
   }
-  
-  # ---- Cluster ID numeric check ----
-  cluster_num <- suppressWarnings(as.numeric(images$`Cluster ID`))
-  bad_cluster <- which(!is.na(images$`Cluster ID`) & images$`Cluster ID` != "" & is.na(cluster_num))
-  if (length(bad_cluster) > 0) {
-    issues <- c(issues, paste0("❌ ", length(bad_cluster), " image(s) have non-numeric Cluster ID"))
+
+  # Cluster ID may be any format (character or numeric) — it just needs to be
+  # present, which the "Required fields check" above already covers. Multiple
+  # rows legitimately share the same Cluster ID (e.g. burst photos, or a
+  # multi-species image split into one row per species), so no uniqueness
+  # check is applied here. It should, however, always identify detections at
+  # a single camera: build_nps_model_inputs() groups by Site Name and
+  # Cluster ID together, so a Cluster ID spanning more than one Site Name no
+  # longer gets silently merged across cameras, but it usually still
+  # signals a real problem with how Cluster IDs were assigned upstream
+  # (e.g. an event-numbering scheme that isn't actually unique per camera),
+  # so it's flagged here for the user to check.
+  cluster_site_counts <- images %>%
+    dplyr::filter(!is.na(`Cluster ID`) & `Cluster ID` != "") %>%
+    dplyr::group_by(`Cluster ID`) %>%
+    dplyr::summarise(n_sites = dplyr::n_distinct(`Site Name`), .groups = "drop")
+  bad_clusters <- cluster_site_counts$`Cluster ID`[cluster_site_counts$n_sites > 1]
+  if (length(bad_clusters) > 0) {
+    issues <- c(issues, paste0(
+      "❌ ", length(bad_clusters), " Cluster ID value(s) appear at more than one Site Name: ",
+      paste(utils::head(bad_clusters, 10), collapse = ", "),
+      if (length(bad_clusters) > 10) ", ..." else ""
+    ))
   }
-  
+
   # ---- Cross-check Site Names with deployments ----
+  # This is a hard stop rather than a warning: build_nps_model_inputs() left-
+  # joins the wide detection matrix onto deployment metadata by Site Name, so
+  # an image Site Name with no matching deployment row would silently pick up
+  # NA Start Date/End Date/Latitude/Longitude/Detection Distance and surface
+  # as a confusing NA/NaN error deep inside the model instead of a clear
+  # message here.
   bad_site_match <- which(!images$`Site Name` %in% deployments$`Site Name`)
   if (length(bad_site_match) > 0) {
-    issues <- c(issues, paste0("❌ ", length(bad_site_match), " image(s) have Site Names not found in deployments"))
+    bad_site_names <- unique(images$`Site Name`[bad_site_match])
+    stop(
+      "Image file has ", length(bad_site_match), " row(s) with Site Name value(s) not found ",
+      "in the deployment file: ", paste(utils::head(bad_site_names, 10), collapse = ", "),
+      if (length(bad_site_names) > 10) ", ..." else "", ". ",
+      "Every Site Name in the images file must exactly match a Site Name in the deployment file. ",
+      "Fix the mismatched Site Name(s) (check for typos or a missing deployment row), then re-upload.",
+      call. = FALSE
+    )
   }
-  
+
   # ---- Timestamp parsing ----
   ts_parsed <- parse_timestamp_robust(images$Timestamp)
   ts_missing_input <- !is.na(images$Timestamp) & trimws(as.character(images$Timestamp)) != ""
+  missing_ts_idx <- which(!ts_missing_input)
+  if (length(missing_ts_idx) > 0) {
+    issues <- c(issues, paste0("❌ Timestamp missing in ", length(missing_ts_idx), " image(s)"))
+  }
   bad_ts <- which(ts_missing_input & is.na(ts_parsed))
   if (length(bad_ts) > 0) {
     site_counts <- table(images$`Site Name`[bad_ts])
@@ -532,63 +740,6 @@ format_deployments <- function(deployments, max_days = NULL) {
 }
 
 # -------------------------------------------------------------------
-# TRIM IMAGES TO A USER-DEFINED NUMBER OF DAYS
-# -------------------------------------------------------------------
-
-trim_images_to_days <- function(images, max_days = 56) {
-  max_days <- as.integer(max_days[[1]])
-  if (is.na(max_days) || max_days < 1) {
-    stop("max_days must be a positive integer.", call. = FALSE)
-  }
-
-  # Ensure Timestamp is POSIXct
-  if (!inherits(images$Timestamp, "POSIXt")) {
-    images$Timestamp <- parse_timestamp_robust(images$Timestamp)
-  }
-  
-  # Determine first timestamp per site
-  first_times <- images %>%
-    dplyr::group_by(`Site Name`) %>%
-    dplyr::summarize(first_date = min(Timestamp, na.rm = TRUE), .groups = "drop")
-  
-  # Join to images to calculate days from first image
-  images_check <- images %>%
-    dplyr::left_join(first_times, by = "Site Name") %>%
-    dplyr::mutate(days_from_start = as.numeric(difftime(Timestamp, first_date,
-                                                        units = "days")))
-  
-  # Check if any rows exceed the requested deployment length
-  rows_to_remove <- images_check %>% dplyr::filter(days_from_start > max_days)
-  
-  if (nrow(rows_to_remove) == 0) {
-    message("✅ No images taken after ", max_days, " days. Dataset left unchanged.")
-    return(images)
-  } else {
-    # Count rows removed per site
-    removal_counts <- rows_to_remove %>%
-      dplyr::group_by(`Site Name`) %>%
-      dplyr::summarize(removed = n(), .groups = "drop")
-    
-    message("⚠️ Images beyond ", max_days, " days were removed:")
-    for (i in seq_len(nrow(removal_counts))) {
-      message(paste0("  Site ", removal_counts$`Site Name`[i], ": ",
-                     removal_counts$removed[i], " row(s) removed"))
-    }
-    
-    # Keep only rows within the requested deployment length
-    images_trimmed <- images_check %>%
-      dplyr::filter(days_from_start <= max_days) %>%
-      dplyr::select(-first_date, -days_from_start)
-    
-    return(images_trimmed)
-  }
-}
-
-trim_images_56days <- function(images) {
-  trim_images_to_days(images, max_days = 56)
-}
-
-# -------------------------------------------------------------------
 # SUMMARY HELPERS (deployment, images, deer)
 # -------------------------------------------------------------------
 
@@ -620,27 +771,6 @@ summarize_images_by_species <- function(images) {
     dplyr::arrange(dplyr::desc(total_detections))
 }
 
-standardize_deer_species <- function(images) {
-  if (any(tolower(images$Species) %in% c("white-tailed deer", "white tailed deer"))) {
-    images <- images %>%
-      dplyr::mutate(
-        Species = dplyr::if_else(
-          tolower(Species) %in% c("white-tailed deer", "white tailed deer"),
-          "Deer",
-          Species
-        )
-      )
-    message("🦌 Standardized all 'white-tailed deer' classifications to 'Deer' for consistency.")
-  } else {
-    message("✅ No 'white-tailed deer' entries found — all deer species names already standardized.")
-  }
-  images
-}
-
-deer_summary_per_site <- function(images) {
-  species_summary_per_site(images, "Deer")
-}
-
 filter_species_rows <- function(images, species_name) {
   species_name <- trimws(as.character(species_name)[1])
   images %>%
@@ -662,52 +792,25 @@ species_summary_per_site <- function(images, species_name) {
     )
 }
 
-deer_counts_per_camera <- function(images) {
-  species_counts_per_camera(images, "Deer")
-}
-
 first_finite_or_na <- function(x) {
   vals <- suppressWarnings(as.numeric(x))
   vals <- vals[is.finite(vals)]
   if (length(vals)) vals[1] else NA_real_
 }
 
-species_counts_per_camera <- function(images, species_name, deployments = NULL) {
-  counts <- filter_species_rows(images, species_name) %>%
-    dplyr::group_by(`Site Name`) %>%
-    dplyr::summarise(
-      total_detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  if (!is.null(deployments) &&
-      all(c("Site Name", "Latitude", "Longitude") %in% names(deployments))) {
-    coords <- deployments %>%
-      dplyr::group_by(`Site Name`) %>%
-      dplyr::summarise(
-        Latitude = first_finite_or_na(Latitude),
-        Longitude = first_finite_or_na(Longitude),
-        .groups = "drop"
-      )
-    counts <- counts %>%
-      dplyr::left_join(coords, by = "Site Name")
-  } else if (all(c("Latitude", "Longitude") %in% names(images))) {
-    coords <- images %>%
-      dplyr::group_by(`Site Name`) %>%
-      dplyr::summarise(
-        Latitude = first_finite_or_na(Latitude),
-        Longitude = first_finite_or_na(Longitude),
-        .groups = "drop"
-      )
-    counts <- counts %>%
-      dplyr::left_join(coords, by = "Site Name")
-  }
-
-  counts
-}
-
-deer_daily_detections <- function(images) {
-  species_daily_detections(images, "Deer")
+species_counts_per_camera <- function(images, species_name, deployments) {
+  counts <- deployments %>%
+    left_join(
+      filter_species_rows(images, species_name) %>%
+        dplyr::group_by(`Site Name`) %>%
+        dplyr::summarise(
+          total_detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
+          .groups = "drop"
+        ),
+      by = "Site Name"
+    ) %>%
+    replace_na(list(total_detections = 0))
+  return(counts)
 }
 
 species_daily_detections <- function(images, species_name) {
