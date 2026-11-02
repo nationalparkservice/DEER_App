@@ -1938,8 +1938,21 @@ ui <- page_fillable(
       seed = input$pshared_seed
     )
     
+    # Settings are saved with the simulated data so that the model fits
+    # (priors, state-space buffer) and the truth-vs-estimate tables use the
+    # values the data were simulated with, even if a slider is moved
+    # afterwards without clicking 'Simulate shared design' again.
     list(uscr = list(sim = uscr_sim, data = uscr_data), rem = rem_sim, tte = tte_sim,
-         D_true = input$pshared_Dtrue)
+         D_true = input$pshared_Dtrue,
+         settings = list(
+           n_side   = input$pshared_n_side,
+           spacing  = input$pshared_spacing,
+           buffer_m = input$pshared_buffer_m,
+           lambda0  = input$pshared_lambda0,
+           v        = input$pshared_v,
+           theta    = input$pshared_theta,
+           sd_eps   = input$pshared_sd_eps
+         ))
   }, ignoreInit = TRUE)
   
   output$pshared_uscr_grid_plot <- renderPlot({
@@ -2040,15 +2053,15 @@ ui <- page_fillable(
                          paste("Cameras:", nrow(d$out)),
                          paste("True density:", s$D_true, "animals/km^2"),
                          paste("True sigma:", round(sigma_km_true, 3), "km"),
-                         paste("True lambda0:", input$pshared_lambda0)
+                         paste("True lambda0:", s$settings$lambda0)
                        ),
                        log_entry = "Shared-design USCR run requested.")
     showNotification("Running USCR on shared design...", type = "message", duration = NULL, id = "pshared_uscr_status")
     
-    state_extent_km <- (input$pshared_n_side - 1) * input$pshared_spacing / 1000
-    buffer_km <- input$pshared_buffer_m / 1000
+    state_extent_km <- (s$settings$n_side - 1) * s$settings$spacing / 1000
+    buffer_km <- s$settings$buffer_m / 1000
     state_area_km2 <- (state_extent_km + 2 * buffer_km)^2
-    suggested_M <- max(50, ceiling(2 * input$pshared_Dtrue * state_area_km2 / 50) * 50)
+    suggested_M <- max(50, ceiling(2 * s$D_true * state_area_km2 / 50) * 50)
     
     fit <- tryCatch(
       run_USCR_app(
@@ -2056,9 +2069,9 @@ ui <- page_fillable(
         iter = input$iter_uscr, burnin = input$burnin_uscr, thin = input$thin_uscr,
         n_chains = app_n_chains(), M = suggested_M,
         log_sigma_mean = log(sigma_km_true), log_sigma_sd = input$log_sigma_sd,
-        log_lam0_mean = log(input$pshared_lambda0), log_lam0_sd = input$log_lam0_sd,
+        log_lam0_mean = log(s$settings$lambda0), log_lam0_sd = input$log_lam0_sd,
         sd_eps_shape = input$sd_eps_shape, sd_eps_rate = input$sd_eps_rate,
-        buffer_m = input$pshared_buffer_m, adaptive = TRUE, compute_WAIC = FALSE,
+        buffer_m = s$settings$buffer_m, adaptive = TRUE, compute_WAIC = FALSE,
         diagnostic_mode = FALSE, parallel_chains = isTRUE(app_n_chains() > 1),
         status_callback = make_model_status_callback(pshared_uscr_debug, "USCR", "pshared_uscr_status"),
         verbose = FALSE
@@ -2086,7 +2099,7 @@ ui <- page_fillable(
     tbl <- summarize_vs_truth(fit, list(
       D_km2 = s$D_true,
       sigma = sigma_km_true,
-      lam_0 = input$pshared_lambda0
+      lam_0 = s$settings$lambda0
     ))
     datatable(tbl |> mutate(across(where(is.numeric), ~round(.x, 3))),
               options = list(dom = "t", paging = FALSE), rownames = FALSE)
@@ -2102,7 +2115,7 @@ ui <- page_fillable(
                        context = c(
                          paste("Cameras:", nrow(s$rem$out)),
                          paste("True density:", s$D_true, "animals/km^2"),
-                         paste("True speed:", input$pshared_v, "km/day")
+                         paste("True speed:", s$settings$v, "km/day")
                        ),
                        log_entry = "Shared-design REM run requested.")
     showNotification("Running REM on shared design...", type = "message", duration = NULL, id = "pshared_rem_status")
@@ -2110,10 +2123,10 @@ ui <- page_fillable(
     fit <- tryCatch(
       run_REM(
         y = s$rem$camera_counts, r_km = s$rem$out$`Detection Distance` / 1000,
-        camera_days = s$rem$camera_days, theta_deg = input$pshared_theta,
+        camera_days = s$rem$camera_days, theta_deg = s$settings$theta,
         iter = input$iter_rem_tte, burnin = input$burnin_rem_tte, thin = input$thin_rem_tte,
         n_chains = app_n_chains(), D_max = input$D_max,
-        log_v_mean = log(input$pshared_v), log_v_sd = input$log_v_sd,
+        log_v_mean = log(s$settings$v), log_v_sd = input$log_v_sd,
         sd_eps_shape = input$sd_eps_shape, sd_eps_rate = input$sd_eps_rate,
         status_callback = make_model_status_callback(pshared_rem_debug, "REM", "pshared_rem_status")
       ),
@@ -2136,7 +2149,7 @@ ui <- page_fillable(
     fit <- pshared_rem_fit()
     validate(need(!is.null(fit), "Simulate a design, then click 'Run REM'."))
     s <- pshared_sim()
-    tbl <- summarize_vs_truth(fit, list(D_km2 = s$D_true, v = input$pshared_v, sd_eps = input$pshared_sd_eps))
+    tbl <- summarize_vs_truth(fit, list(D_km2 = s$D_true, v = s$settings$v, sd_eps = s$settings$sd_eps))
     datatable(tbl |> mutate(across(where(is.numeric), ~round(.x, 3))),
               options = list(dom = "t", paging = FALSE), rownames = FALSE)
   })
@@ -2151,7 +2164,7 @@ ui <- page_fillable(
                        context = c(
                          paste("Cameras:", nrow(s$tte$out)),
                          paste("True density:", s$D_true, "animals/km^2"),
-                         paste("True speed:", input$pshared_v, "km/day")
+                         paste("True speed:", s$settings$v, "km/day")
                        ),
                        log_entry = "Shared-design TTE run requested.")
     showNotification("Running TTE on shared design...", type = "message", duration = NULL, id = "pshared_tte_status")
@@ -2159,10 +2172,10 @@ ui <- page_fillable(
     fit <- tryCatch(
       run_TTE(
         y = s$tte$camera_counts, r_km = s$tte$out$`Detection Distance` / 1000,
-        camera_days = s$tte$camera_days, theta_deg = input$pshared_theta,
+        camera_days = s$tte$camera_days, theta_deg = s$settings$theta,
         iter = input$iter_rem_tte, burnin = input$burnin_rem_tte, thin = input$thin_rem_tte,
         n_chains = app_n_chains(), D_max = input$D_max,
-        log_v_mean = log(input$pshared_v), log_v_sd = input$log_v_sd,
+        log_v_mean = log(s$settings$v), log_v_sd = input$log_v_sd,
         sd_eps_shape = input$sd_eps_shape, sd_eps_rate = input$sd_eps_rate,
         status_callback = make_model_status_callback(pshared_tte_debug, "TTE", "pshared_tte_status")
       ),
@@ -2185,7 +2198,7 @@ ui <- page_fillable(
     fit <- pshared_tte_fit()
     validate(need(!is.null(fit), "Simulate a design, then click 'Run TTE'."))
     s <- pshared_sim()
-    tbl <- summarize_vs_truth(fit, list(D_km2 = s$D_true, v = input$pshared_v, sd_eps = input$pshared_sd_eps))
+    tbl <- summarize_vs_truth(fit, list(D_km2 = s$D_true, v = s$settings$v, sd_eps = s$settings$sd_eps))
     datatable(tbl |> mutate(across(where(is.numeric), ~round(.x, 3))),
               options = list(dom = "t", paging = FALSE), rownames = FALSE)
   })
