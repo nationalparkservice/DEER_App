@@ -251,6 +251,17 @@ check_deployments <- function(deployment, images = NULL, hemisphere = "Western",
     # Skip row if all deployment columns except Site Name and Notes are blank
     if (all(is.na(row_values) | row_values == "")) next
     
+    # --- Site Name (hard stop) ---
+    # Any naming scheme is accepted, but a row with deployment data and no
+    # Site Name can't be linked to its images and would fail later inside the
+    # model with a confusing error, so it blocks upload here instead.
+    sn <- deployment$`Site Name`[i]
+    if (is.na(sn) || sn == "") {
+      msg <- paste("❌ Site Name missing in row", i)
+      issues <- c(issues, msg)
+      blocking_issues <- c(blocking_issues, msg)
+    }
+    
     # --- Dates ---
     date_cols <- c("Start Date", "End Date")
     for (col in date_cols) {
@@ -281,30 +292,51 @@ check_deployments <- function(deployment, images = NULL, hemisphere = "Western",
     }
     
     # Camera Malfunction Date is required whenever Camera Functioning = No.
-    # This only depends on columns already in the deployment file, so it
-    # doesn't need images to be uploaded first.
+    # It is the FIRST day whose data should be discarded: the day before it
+    # becomes the camera's last day of effort (End Date is replaced below).
+    # Every problem with it blocks upload, because otherwise images taken
+    # after the malfunction (e.g. a camera knocked to a bad angle that kept
+    # firing) would silently be included in the analysis.
     cam_func <- deployment$`Camera Functioning`[i]
     if (!is.na(cam_func) && tolower(cam_func) == "no") {
       val <- deployment$`Camera Malfunction Date`[i]
-      if (is.na(val) || val == "") {
-        issues <- c(issues, paste("❌ Camera Malfunction Date missing in row", i,
-                                  " — required because Camera Functioning = No"))
-      } else if (is.na(parse_mdY_strict(val))) {
-        issues <- c(issues, paste("❌ Bad date in Camera Malfunction Date row", i, ":", val,
-                                  " — should be mm/dd/yyyy (4-digit year). End Date was NOT replaced",
-                                  "for this row."))
+      # check_deployments() runs a second time when images are uploaded, after
+      # End Date has already been replaced, so compare against the saved
+      # pickup date (`Original End Date`) when it exists.
+      pickup_parsed <- if ("Original End Date" %in% names(deployment)) {
+        parse_mdY_strict(deployment$`Original End Date`[i])
       } else {
-        # The malfunction date replaces End Date below, so it should fall
-        # within the deployment; otherwise the camera's window gets stretched
-        # or inverted.
+        end_parsed
+      }
+      pickup_label <- if ("Original End Date" %in% names(deployment)) {
+        deployment$`Original End Date`[i]
+      } else {
+        deployment$`End Date`[i]
+      }
+      msg <- NULL
+      if (is.na(val) || val == "") {
+        msg <- paste("❌ Camera Malfunction Date missing in row", i,
+                     " — required because Camera Functioning = No")
+      } else if (is.na(parse_mdY_strict(val))) {
+        msg <- paste("❌ Bad date in Camera Malfunction Date row", i, ":", val,
+                     " — should be mm/dd/yyyy (4-digit year)")
+      } else {
         mal_parsed <- parse_mdY_strict(val)
-        if ((!is.na(start_parsed) && mal_parsed < start_parsed) ||
-            (!is.na(end_parsed) && mal_parsed > end_parsed)) {
-          issues <- c(issues, paste("⚠️ Camera Malfunction Date in row", i, ":", val,
-                                    "is outside the Start Date–End Date range",
-                                    paste0("(", deployment$`Start Date`[i], " – ",
-                                           deployment$`End Date`[i], ")")))
+        if (!is.na(start_parsed) && mal_parsed <= start_parsed) {
+          msg <- paste0("❌ Camera Malfunction Date in row ", i, " (", val,
+                        ") is on or before Start Date (", deployment$`Start Date`[i],
+                        "). The malfunction date is the first day to discard, so this camera ",
+                        "would have no usable days. Correct the date or remove the row.")
+        } else if (!is.na(pickup_parsed) && mal_parsed > pickup_parsed) {
+          msg <- paste0("❌ Camera Malfunction Date in row ", i, " (", val,
+                        ") is after End Date (", pickup_label, "). If the camera worked ",
+                        "until it was picked up, set Camera Functioning = Yes and leave ",
+                        "Camera Malfunction Date blank.")
         }
+      }
+      if (!is.null(msg)) {
+        issues <- c(issues, msg)
+        blocking_issues <- c(blocking_issues, msg)
       }
     }
     
@@ -433,19 +465,24 @@ check_deployments <- function(deployment, images = NULL, hemisphere = "Western",
   # into the deployment-window trim or the UTM projection.
   if (length(blocking_issues) > 0) {
     stop(
-      "Deployment file has missing or invalid Start Date, End Date, Latitude, and/or Longitude ",
-      "value(s) in ", length(blocking_issues), " place(s):\n",
+      "Deployment file has missing or invalid value(s) that block upload in ",
+      length(blocking_issues), " place(s):\n",
       paste0("  - ", blocking_issues, collapse = "\n"),
-      "\nStart Date and End Date must be present, in mm/dd/yyyy format, and End Date must be on or after ",
-      "Start Date for every row; they set each camera's deployment window. Latitude and Longitude must be ",
-      "present and non-zero for every row; ",
-      "they're used to project camera locations for every model. After fixing the file, re-upload it.",
+      "\nEvery row needs a Site Name. Start Date and End Date must be present, in mm/dd/yyyy format, and ",
+      "End Date must be on or after Start Date for every row; they set each camera's deployment window. ",
+      "Latitude and Longitude must be present and non-zero for every row; ",
+      "they're used to project camera locations for every model. When Camera Functioning = No, ",
+      "Camera Malfunction Date must be an mm/dd/yyyy date after Start Date and no later than End Date. ",
+      "After fixing the file, re-upload it.",
       call. = FALSE
     )
   }
   
   
-  #Replace End Date with Camera Malfunction Date for Site Names where Camera Functioning is "No"
+  # Replace End Date with the day BEFORE Camera Malfunction Date for cameras
+  # where Camera Functioning is "No". The malfunction date is the first day
+  # whose data should be discarded, so the last day of effort is the day
+  # before it.
   # The original End Date (when the camera was picked up) is kept in
   # `Original End Date` first. check_images() needs it: a malfunctioning
   # camera usually keeps taking (unusable) pictures until pickup, so those
@@ -455,17 +492,19 @@ check_deployments <- function(deployment, images = NULL, hemisphere = "Western",
   if (!"Original End Date" %in% names(deployment)) {
     deployment$`Original End Date` <- deployment$`End Date`
   }
-  # Only valid mm/dd/yyyy malfunction dates are used. Previously any non-blank
-  # value was copied in, so a badly formatted malfunction date (which is only a
-  # warning above) would overwrite a good End Date with an unparseable one
-  # *after* the End Date hard-stop had already passed.
+  # The per-row checks above already block upload for a missing, badly
+  # formatted, or out-of-range malfunction date, so every date used here is a
+  # valid mm/dd/yyyy date after Start Date. This is recomputed from the
+  # malfunction date (not from End Date), so the second check_deployments()
+  # run gives the same result.
+  malfunction_dates <- parse_mdY_strict(deployment$`Camera Malfunction Date`)
   malfunction_idx <- which(
     tolower(deployment$`Camera Functioning`) == "no" &
-      !is.na(parse_mdY_strict(deployment$`Camera Malfunction Date`))
+      !is.na(malfunction_dates)
   )
   
   deployment$`End Date`[malfunction_idx] <-
-    deployment$`Camera Malfunction Date`[malfunction_idx]
+    format(malfunction_dates[malfunction_idx] - 1, "%m/%d/%Y")
   
   # ---- Output ----
   if (length(issues) == 0) {
@@ -631,12 +670,12 @@ check_images <- function(images, deployments, survey_year = NULL, hemisphere = "
   # on the pickup date, or the following day, passes.
   #
   # Malfunctioning cameras: check_deployments() replaces End Date with the
-  # Camera Malfunction Date, but the camera often keeps firing until it's
+  # day before the Camera Malfunction Date, but the camera often keeps firing until it's
   # picked up. Those images are expected, not a clock error, so the window
   # here uses `Original End Date` (the pickup date) when it exists. Images
   # between the malfunction date and pickup are reported as an informational
   # message instead, since the model already leaves them out (the camera's
-  # End Index stops at the malfunction date in build_nps_model_inputs()).
+  # End Index stops the day before the malfunction date in build_nps_model_inputs()).
   grace_days <- suppressWarnings(as.integer(grace_days[1]))
   if (is.na(grace_days) || grace_days < 0) grace_days <- 1L
   
@@ -705,7 +744,7 @@ check_images <- function(images, deployments, survey_year = NULL, hemisphere = "
     if (w$n_post_malfunction > 0) {
       message(
         "ℹ️ Site ", w$`Site Name`, ": ", w$n_post_malfunction,
-        " image(s) are dated after the Camera Malfunction Date (", fmt_d(w$analysis_end),
+        " image(s) are dated on or after the Camera Malfunction Date (", fmt_d(w$analysis_end + 1),
         ") and will be excluded from the analysis."
       )
     }
