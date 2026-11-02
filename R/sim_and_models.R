@@ -1324,6 +1324,50 @@ extract_waic_mean <- function(fits) {
 }
 
 # -------------------------------------------------------------------
+# Power-analysis helpers: compare posterior draws to known simulated truth
+# -------------------------------------------------------------------
+
+# Pull posterior draws for a given parameter name, normalizing density to
+# D_km2 regardless of whether the fit monitors D (REM/TTE) or D_mi2 (USCR).
+extract_param_draws <- function(samples_all, param_name) {
+  cn <- colnames(samples_all)
+  if (identical(param_name, "D_km2")) {
+    if ("D" %in% cn) return(as.numeric(samples_all[, "D"]))
+    if ("D_mi2" %in% cn) return(as.numeric(samples_all[, "D_mi2"]) / 2.59)
+    return(NULL)
+  }
+  if (param_name %in% cn) return(as.numeric(samples_all[, param_name]))
+  NULL
+}
+
+# Build a truth-vs-estimate table for the power-analysis blocks.
+# truth: named list, e.g. list(D_km2 = 25, sigma = 0.217, lam_0 = 0.2)
+summarize_vs_truth <- function(fit, truth) {
+  if (is.null(fit) || is.null(fit$samples_all)) return(NULL)
+  
+  rows <- lapply(names(truth), function(param_name) {
+    true_val <- truth[[param_name]]
+    if (is.null(true_val) || !is.finite(true_val)) return(NULL)
+    
+    draws <- extract_param_draws(fit$samples_all, param_name)
+    if (is.null(draws) || !length(draws)) return(NULL)
+    
+    q <- stats::quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+    data.frame(
+      Parameter    = param_name,
+      Truth        = true_val,
+      Mean         = mean(draws, na.rm = TRUE),
+      `Lower 2.5%` = q[[1]],
+      `Upper 97.5%`= q[[2]],
+      Covered      = true_val >= q[[1]] && true_val <= q[[2]],
+      check.names  = FALSE
+    )
+  })
+  
+  do.call(rbind, rows[!vapply(rows, is.null, logical(1))])
+}
+
+# -------------------------------------------------------------------
 # Main USCR wrapper
 # Direct app implementation of the collaborator Rmd while-loop logic.
 # -------------------------------------------------------------------
