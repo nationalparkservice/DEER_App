@@ -11,14 +11,13 @@ The DEER App provides a user-friendly interface for running three Bayesian model
 ## Features
 
 - **Three Bayesian Models:**
-  - **USCR** (Unmarked Spatial Capture–Recapture): Estimates animal density by learning from spatial detection patterns across a camera array
+  - **USCR** (Unmarked Spatial Capture-Recapture): Estimates animal density by learning from spatial detection patterns across a camera array
   - **REM** (Random Encounter Model): Converts encounter rates into density, correcting for movement speed and camera view geometry
   - **TTE** (Time-to-Event): Uses animal detection events per camera, camera-days, and viewshed geometry to estimate density
 
 - **Data Options:**
   - Simulate camera trap data with customizable parameters using one shared spatial simulator for all three models
   - Upload deployment and images CSV files that follow the current TrapTagger / upload-workflow column names
-  - Design a camera array for a new site from uploaded spatial layers in the **Camera array design** tab
 
 - **Model Averaging (uploaded field data):**
   - WAIC-based model averaging across whichever uploaded-data models have completed
@@ -44,7 +43,7 @@ The app checks required packages on startup and can install missing ones automat
 
 ```r
 install.packages(c(
-  "shiny", "bslib", "shinyjs", "DT", "ggplot2", "dplyr", "tidyr",
+  "shiny", "bslib", "DT", "ggplot2", "dplyr", "tidyr",
   "readr", "purrr", "stringr", "data.table",
   "leaflet", "ggrepel",
   "nimble", "MCMCvis", "lubridate"
@@ -59,14 +58,14 @@ install.packages(c(
 
 If you use [Git](https://git-scm.com/), you can copy the project to your computer in one step:
 
-1. Open the repository on GitHub (this project: [github.com/kcring/DEER_app](https://github.com/kcring/DEER_app)).
-2. Click the green **Code** button, choose **HTTPS**, and copy the URL (it looks like `https://github.com/kcring/DEER_app.git`).
+1. Open the repository on GitHub (this project: [github.com/nationalparkservice/DEER_App](https://github.com/nationalparkservice/DEER_App)).
+2. Click the green **Code** button, choose **HTTPS**, and copy the URL (it looks like `https://github.com/nationalparkservice/DEER_App.git`).
 3. In a terminal, go to the folder where you want the project, then run:
    ```bash
-   git clone https://github.com/kcring/DEER_app.git
-   cd DEER_app
+   git clone https://github.com/nationalparkservice/DEER_App.git
+   cd DEER_App
    ```
-   That creates a folder named after the repository (here, `DEER_app`) with all files. To update later, run `git pull` inside that folder.
+   That creates a folder named after the repository (here, `DEER_App`) with all files. To update later, run `git pull` inside that folder.
 
 If you do not use Git, use **Code → Download ZIP** on GitHub and unzip the archive; then open the unzipped folder in RStudio.
 
@@ -81,7 +80,7 @@ If you do not use Git, use **Code → Download ZIP** on GitHub and unzip the arc
 From the command line:
 
 ```bash
-Rscript -e "shiny::runApp('/path/to/DEER_app')"
+Rscript -e "shiny::runApp('/path/to/DEER_App')"
 ```
 
 ## Usage
@@ -132,27 +131,17 @@ Navigate to the model tabs (USCR, REM, TTE):
   - **Uploaded field data:** results update as models finish; once multiple models are available the tab shows WAIC values and weights when WAIC is available for all completed fits, plus model-averaged density (animals/km²), 95% credible intervals, and probability of exceeding threshold densities
 - Download **CSV** posterior summaries (parameter names, mean, 2.5% and 97.5% quantiles) from the same tab
 
-### Camera array design
-
-- Use the **Camera array design** tab to upload a boundary and optional roads, trails, buildings, parking, or exclusion layers
-- The app can suggest candidate camera locations, keep a reduced well-spread subset if you enter a smaller camera count, and export camera coordinates
-- For easiest uploads, zipped spatial layers are usually the smoothest option
-- This design workflow is separate from the current model-fitting upload workflow, which still expects deployment and images CSVs
-
 ## File Structure
 
 ```
-deer_app_v2/
+DEER_App/
 ├── app.R                    # Main Shiny application
 ├── R/
 │   ├── sim_and_models.R     # Model functions (USCR, REM, TTE)
-│   ├── data_checks.R        # Data validation and summary functions
-│   └── camera_array_helpers.R # Camera-array design helpers
+│   └── data_checks.R        # Data validation and summary functions
 ├── www/
-│   ├── deer_app_logo.png    # Main app logo
-│   ├── wvu_logo.png         # WVU logo
-│   ├── nps_logo.png         # NPS logo
-│  
+│   ├── deer_app_banner.png  # Banner shown at the top of the app
+│   └── deer_app_logo.png    # Logo used in this README
 ├── README.md                # This file
 └── deer_app_v2.Rproj        # RStudio project file
 ```
@@ -194,7 +183,7 @@ Cross-year winter surveys (for example December to January) are supported; the a
 
 ## Model Details
 
-### USCR (Unmarked Spatial Capture–Recapture)
+### USCR (Unmarked Spatial Capture-Recapture)
 - Estimates density by modeling activity centers and detection probability as a function of distance
 
 ### REM (Random Encounter Model)
@@ -247,12 +236,12 @@ License to be determined.
 ## Acknowledgments
 
 ### Model Development
-The underlying models and code were created by **Dr. Amanda Van Buskirk** under the advisement of [**Dr. Christopher Rota**](https://www.davis.wvu.edu/faculty-staff/directory/christopher-rota) within the **Davis College of Agriculture and Natural Resources at West Virginia University**.
+The underlying models and code were created by **Dr. Amanda Van Buskirk** under the advisement of [**Dr. Christopher Rota**](https://www.davis.wvu.edu/faculty-staff/directory/christopher-rota) within the **School of Natural Resources and the Environment at West Virginia University**.
 
 Collaboration and feedback from **Dr. Laura C. Gigliotti** (U.S. Geological Survey, West Virginia Cooperative Fish and Wildlife Research Unit, West Virginia University) helped shape QC checks and model integration. Any **USGS logo** in the app must follow agency approval rules (see **USGS logo** above).
 
 ### Shiny App Development
-This Shiny application was developed by **PhD Candidate Kacie Ring** as part of the **SciComm in the Parks fellowship**.
+This Shiny application was primarily developed by **PhD Candidate Kacie Ring** as part of the **SciComm in the Parks fellowship**. **Dr. Christopher Rota** and **Dr. Amanda Van Buskirk** also contributed edits to the app.
 
 The **SciComm in the Parks fellowship** is a collaborative effort between the **Ecological Society of America (ESA)** and the **National Park Service (NPS)**. Learn more: [https://esa.org/programs/scip/](https://esa.org/programs/scip/)
 
@@ -276,4 +265,4 @@ GitHub: [@kcring](https://github.com/kcring)
 ---
 
 **DEER App** — Density Estimation from Encounter Rates  
-USCR · REM · TTE — unmarked camera methods, model‑averaged to animals/km².
+USCR · REM · TTE — unmarked camera methods, model-averaged to animals/km².

@@ -153,7 +153,7 @@ build_teaching_sim_grid <- function(n_side, spacing_m, detection_radius_m, days)
   coords <- coords[order(coords$y, coords$x), , drop = FALSE]
   coords$x <- coords$x - mean(range(coords$x))
   coords$y <- coords$y - mean(range(coords$y))
-  
+
   coords |>
     dplyr::mutate(
       `Site Name` = paste0("C", dplyr::row_number()),
@@ -178,23 +178,23 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
                                      seed = 1) {
   model <- match.arg(model)
   quiet_require("dplyr")
-  
+
   if (n_side < 1 || days < 1 || spacing_m <= 0 || detection_radius_m <= 0) {
     stop("Teaching simulator inputs must be positive.", call. = FALSE)
   }
   if (D_per_km2 < 0 || v_km_day <= 0 || sd_eps < 0) {
     stop("Density, movement speed, and heterogeneity inputs are out of range.", call. = FALSE)
   }
-  
+
   set.seed(seed)
-  
+
   out <- build_teaching_sim_grid(
     n_side = n_side,
     spacing_m = spacing_m,
     detection_radius_m = detection_radius_m,
     days = days
   )
-  
+
   J <- nrow(out)
   camera_days <- rep(as.numeric(days), J)
   r_km <- rep(detection_radius_m / 1000, J)
@@ -202,7 +202,7 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
   # the same seed gives the same data apart from the noise, mirroring the model.
   eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
   use_eps <- as.numeric(isTRUE(camera_noise))
-  
+
   if (identical(model, "REM")) {
     theta_rad <- theta_deg * pi / 180
     lambda <- ((2 + theta_rad) / pi) * v_km_day * r_km * D_per_km2 * camera_days * exp(use_eps * eps)
@@ -212,9 +212,9 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
     tte_units <- camera_days / time_unit
     lambda <- D_per_km2 * tte_units * area_km2 * exp(use_eps * eps)
   }
-  
+
   camera_counts <- stats::rpois(J, lambda = lambda)
-  
+
   list(
     model = model,
     out = out,
@@ -254,13 +254,13 @@ build_nps_model_inputs <- function(
   quiet_require("sf")
   quiet_require("lubridate")
   quiet_require("tibble")
-  
+
   # This assumes format_deployments() is defined in data_checks.R
   if (!exists("format_deployments")) {
     stop("format_deployments() not found. Source data_checks.R first.",
          call. = FALSE)
   }
-  
+
   deps <- format_deployments(deployments, max_days = max_days)
 
   # Timestamp is already parsed to POSIXct in check_images() before
@@ -294,7 +294,7 @@ build_nps_model_inputs <- function(
     sf::st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) |>
     sf::st_transform(crs = epsg_code) |>
     sf::st_coordinates()
-  
+
   deps <- deps |>
     dplyr::mutate(
       utm_e = (utm_coords[, "X"] -
@@ -302,7 +302,7 @@ build_nps_model_inputs <- function(
       utm_n = (utm_coords[, "Y"] -
                  mean(range(utm_coords[, "Y"], na.rm = TRUE))) / 1000
     )
-  
+
   # Grouping by Site Name and Cluster ID together (rather than Cluster ID
   # alone) means a Cluster ID that happens to appear at more than one site
   # (e.g. an event-numbering scheme that isn't actually unique per camera)
@@ -322,7 +322,7 @@ build_nps_model_inputs <- function(
     dplyr::mutate(
       cluster_length_days = as.numeric(difftime(end, start, units = "days"))
     )
-  
+
   # Parse Start/End Date into real Date columns, carried on deps from here
   # on (through the join into `out` below) so they only need to be parsed
   # once. A plain as.Date() with a fixed format is sufficient here: format_
@@ -362,7 +362,7 @@ build_nps_model_inputs <- function(
       camera_time_days = sum(cluster_length_days),
       .groups          = "drop"
     )
-  
+
   counts <- counts_time |>
     dplyr::select(-camera_time_days) |>
     tidyr::pivot_wider(
@@ -371,7 +371,7 @@ build_nps_model_inputs <- function(
       values_fill = 0,
       names_sort  = TRUE
     )
-  
+
   out <- counts |>
     dplyr::left_join(deps, by = "Site Name")
 
@@ -389,7 +389,7 @@ build_nps_model_inputs <- function(
     ) |>
     tibble::column_to_rownames("Site Name") |>
     as.matrix()
-  
+
   # Create Start Index and End Index columns
   # These map each camera's deployment dates to column indices in the detection matrix.
   # Derived directly from detection_matrix's own column names (rather than an
@@ -415,25 +415,25 @@ build_nps_model_inputs <- function(
     ) |>
     dplyr::ungroup() |>
     dplyr::select(-Start_Date_parsed, -End_Date_parsed)
-  
+
   camera_counts <- camera_days <- numeric(nrow(out))
-  
+
   for (i in seq_len(nrow(out))) {
     idx_start <- out$`Start Index`[i]
     idx_end   <- out$`End Index`[i]
-    
+
     if (idx_start > idx_end || idx_start < 1 || idx_end > ncol(detection_matrix)) {
       warning("Invalid indices for camera ", i, ": Start=", idx_start, ", End=", idx_end)
       camera_counts[i] <- 0
       camera_days[i]   <- 0
       next
     }
-    
+
     camera_counts[i] <- sum(detection_matrix[i, idx_start:idx_end])
     camera_days[i]   <- length(idx_start:idx_end) -
       sum(camera_time_matrix[i, idx_start:idx_end])
   }
-  
+
   list(
     out           = out,
     camera_counts = camera_counts,
@@ -772,9 +772,9 @@ run_REM <- function(y,
                     status_callback = NULL,
                     seed = NULL,
                     verbose = FALSE) {
-  
+
   quiet_require("nimble")
-  
+
   J <- length(y)
   if (length(r_km) != J || length(camera_days) != J) {
     stop("run_REM: y, r_km, and camera_days must have same length.", call. = FALSE)
@@ -787,36 +787,36 @@ run_REM <- function(y,
   } else if (length(theta_deg) != J) {
     stop("run_REM: theta_deg must have length 1 or the same length as y.", call. = FALSE)
   }
-  
+
   code <- nimble::nimbleCode({
-    
+
     # Priors
     p_D    ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
     D      <- D_max * p_D
     log_v  ~ dnorm(log_v_mean, sd = log_v_sd)
     sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
-    
+
     v     <- exp(log_v)
-    
+
     for (j in 1:J) {
-      
+
       eps[j] ~ dnorm(0, sd = sd_eps)
-      
+
       log(lambda[j]) <- log(2 + theta[j]) - log(pi_const) + log(v) +
         log(r[j]) + log(D) + log(camera_days[j]) + use_eps * eps[j]
-      
+
       y[j]     ~ dpois(lambda[j])
       y_sim[j] ~ dpois(lambda[j])
-      
+
       pearson_obs[j] <- (y[j]     - lambda[j])^2 / lambda[j]
       pearson_sim[j] <- (y_sim[j] - lambda[j])^2 / lambda[j]
     }
-    
+
     sum_obs <- sum(pearson_obs[1:J])
     sum_sim <- sum(pearson_sim[1:J])
     bp      <- step(sum_sim - sum_obs)
   })
-  
+
   Const <- list(
     J          = J,
     r          = as.numeric(r_km),
@@ -830,9 +830,9 @@ run_REM <- function(y,
     sd_eps_rate  = sd_eps_rate,
     use_eps    = as.numeric(isTRUE(camera_noise))
   )
-  
+
   Data <- list(y = as.numeric(y))
-  
+
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
   monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
                 "bp", "sum_obs", "sum_sim")
@@ -888,9 +888,9 @@ run_TTE <- function(y,
                     status_callback = NULL,
                     seed = NULL,
                     verbose = FALSE) {
-  
+
   quiet_require("nimble")
-  
+
   J <- length(y)
   if (length(r_km) != J || length(camera_days) != J) {
     stop("run_TTE: y, r_km, and camera_days must have same length.", call. = FALSE)
@@ -903,40 +903,40 @@ run_TTE <- function(y,
   } else if (length(theta_deg) != J) {
     stop("run_TTE: theta_deg must have length 1 or the same length as y.", call. = FALSE)
   }
-  
+
   code <- nimble::nimbleCode({
-    
+
     p_D    ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
     D      <- D_max * p_D
     log_v  ~ dnorm(log_v_mean, sd = log_v_sd)
     sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
-    
+
     v     <- exp(log_v)
-    
+
     for (j in 1:J) {
-      
+
       a[j] <- pi_const * r[j]^2 * theta[j] / 360
       mvw[j] <- angle_mult[j] * r[j]
       time_unit[j]  <- mvw[j] / v
       tte_units[j]  <- camera_days[j] / time_unit[j]
-      
+
       eps[j] ~ dnorm(0, sd = sd_eps)
-      
+
       log(lambda[j]) <- log(D) + log(tte_units[j]) + log(a[j]) + use_eps * eps[j]
-      
+
       y[j]     ~ dpois(lambda[j])
       y_sim[j] ~ dpois(lambda[j])
-      
+
       pearson_obs[j] <- (y[j]     - lambda[j])^2 / lambda[j]
       pearson_sim[j] <- (y_sim[j] - lambda[j])^2 / lambda[j]
     }
-    
+
     sum_obs <- sum(pearson_obs[1:J])
     sum_sim <- sum(pearson_sim[1:J])
-    
+
     bp <- step(sum_sim - sum_obs)
   })
-  
+
   Const <- list(
     J           = J,
     pi_const    = pi,
@@ -951,9 +951,9 @@ run_TTE <- function(y,
     theta       = as.numeric(theta_deg),
     angle_mult  = tte_detection_radius_multiplier(theta_deg)
   )
-  
+
   Data <- list(y = as.numeric(y))
-  
+
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
   monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
                 "bp", "sum_obs", "sum_sim")
@@ -1742,14 +1742,14 @@ ppc_summary <- function(fit, lower = 0.05, upper = 0.95) {
 # truth: named list, e.g. list(D_km2 = 25, sigma = 0.217, lam_0 = 0.2)
 summarize_vs_truth <- function(fit, truth) {
   if (is.null(fit) || is.null(fit$samples_all)) return(NULL)
-  
+
   rows <- lapply(names(truth), function(param_name) {
     true_val <- truth[[param_name]]
     if (is.null(true_val) || !is.finite(true_val)) return(NULL)
-    
+
     draws <- extract_param_draws(fit$samples_all, param_name)
     if (is.null(draws) || !length(draws)) return(NULL)
-    
+
     q <- stats::quantile(draws, c(0.025, 0.975), na.rm = TRUE)
     data.frame(
       Parameter    = param_name,
@@ -1762,7 +1762,7 @@ summarize_vs_truth <- function(fit, truth) {
       check.names  = FALSE
     )
   })
-  
+
   do.call(rbind, rows[!vapply(rows, is.null, logical(1))])
 }
 
