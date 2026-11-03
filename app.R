@@ -7,7 +7,7 @@
 
 needs <- c(
   "shiny", "bslib", "DT", "ggplot2", "dplyr", "tidyr",
-  "readr", "purrr", "stringr", "secr", "data.table",
+  "readr", "purrr", "stringr", "data.table",
   "leaflet", "leaflet.extras", "ggrepel", "shinyjs",
   "nimble", "parallel", "MCMCvis", "lubridate", "sf", "tibble"
 )
@@ -45,7 +45,6 @@ suppressPackageStartupMessages({
   library(readr)
   library(purrr)
   library(stringr)
-  library(secr)
   library(data.table)
   library(leaflet)
   library(ggrepel)
@@ -73,8 +72,7 @@ run_USCR_app <- uscr_model_env$run_USCR
 # Simulation helpers
 # -------------------------------------------------------------------
 # Simulation and model-input helpers now come directly from R/sim_and_models.R:
-#   simulate_camera_counts(), get_counts_matrix(), capthist_to_events(),
-#   sim_model_inputs(), build_nps_model_inputs()
+#   simulate_camera_counts(), sim_model_inputs(), build_nps_model_inputs()
 
 # -------------------------------------------------------------------
 # Generic helpers for summaries & WAIC-combo (like Rmd)
@@ -90,8 +88,7 @@ get_waic_value <- function(fit) {
 }
 
 summarize_method <- function(fit) {
-  D_mi2 <- fit$samples_all[, "D_mi2"]
-  D_km2 <- D_mi2 / 2.59
+  D_km2 <- fit$samples_all[, "D"]
   
   list(
     mean_km2  = mean(D_km2),
@@ -103,10 +100,10 @@ summarize_method <- function(fit) {
 }
 
 extract_density_draws_km2 <- function(fit) {
-  if (is.null(fit) || is.null(fit$samples_all) || !"D_mi2" %in% colnames(fit$samples_all)) {
+  if (is.null(fit) || is.null(fit$samples_all) || !"D" %in% colnames(fit$samples_all)) {
     return(numeric(0))
   }
-  x <- as.numeric(fit$samples_all[, "D_mi2"]) / 2.59
+  x <- as.numeric(fit$samples_all[, "D"])
   x[is.finite(x)]
 }
 
@@ -185,10 +182,10 @@ prepare_combo_density_data <- function(fits) {
   # Quantile-based averaging (below) assumes every model contributes the same
   # number of posterior draws, so that sorted position s means the same thing
   # (the same quantile) in each model. In practice this always holds because
-  # D_mi2 is a deterministic, bounded quantity for all three models (REM/TTE:
-  # a scaled dunif(0, D_max) draw; USCR: N / area_mi2, with N in [0, M] and
-  # area_mi2 a fixed constant), so it can't produce non-finite draws that get
-  # filtered out unevenly across models. If that assumption is ever violated,
+  # D is a bounded quantity for all three models (REM/TTE: a dunif(0, D_max)
+  # draw; USCR: N / area_km2, with N in [0, M] and area_km2 a fixed
+  # constant), so it can't produce non-finite draws that get filtered out
+  # unevenly across models. If that assumption is ever violated,
   # fail loudly rather than silently truncating every model down to the
   # shortest one, which would quietly drop the upper tail of the longer
   # model(s) instead of matching quantiles.
@@ -198,7 +195,7 @@ prepare_combo_density_data <- function(fits) {
       "posterior draws (",
       paste0(model_names, " = ", draw_lengths, collapse = ", "),
       "). Quantile-based model averaging assumes an equal number of draws ",
-      "per model; this most likely means D_mi2 contained non-finite values ",
+      "per model; this most likely means D contained non-finite values ",
       "in one model's samples that were filtered out. Investigate the ",
       "affected fit(s) instead of truncating to the shortest model.",
       call. = FALSE
@@ -414,17 +411,11 @@ posterior_summary_df <- function(fit) {
   if (is.null(fit) || is.null(fit$samples_all)) return(NULL)
   m <- as.data.frame(fit$samples_all)
   
-  # Density: REM/TTE monitor "D" directly in animals/km²; USCR only
-  # monitors "D_mi2" (from N / area_mi2). Normalize both to a single
-  # "D_km2" column instead of keeping "D" alongside a re-derived "D_km2"
-  # that would just be the same value computed two different ways.
+  # Density: all three models monitor "D" in animals/km² (USCR derives it
+  # as N / area_km2). Export it as "D_km2" so the units are explicit.
   if ("D" %in% names(m)) {
     m$D_km2 <- m$D
     m$D     <- NULL
-    m$D_mi2 <- NULL
-  } else if ("D_mi2" %in% names(m)) {
-    m$D_km2 <- m$D_mi2 / 2.59
-    m$D_mi2 <- NULL
   }
   
   # log_sigma/log_lam_0 (USCR) duplicate sigma/lam_0 on the log scale, and
@@ -448,7 +439,7 @@ posterior_summary_df <- function(fit) {
       "**Posterior summary column reference:**",
       "",
       "- `bp` — Bayesian p-value (posterior predictive check).",
-      "- `sd_eps` — standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model.",
+      "- `sd_eps` (σ<sub>ε</sub>) — standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model.",
       "- `v` — animal movement speed (km/day).",
       "- `D_km2` — density, in animals per km².",
       "- `N` — USCR only: abundance, the total number of animals estimated within the state space.",
@@ -1132,6 +1123,7 @@ ui <- page_fillable(
             "- **REM/TTE**: adaptive runs start from 6000 iterations, 1000 burn-in, and thin = 5",
             "- **USCR**: adaptive runs start from 6000 iterations, 1000 burn-in, thin = 5, and M = 100",
             "- **Convergence criteria**: R̂ < 1.1 for all monitored parameters",
+            "- **Maximum adaptive rounds**: 6 by default. Only the settings tied to a failed check change between rounds: iterations, burn-in, and thinning double if R̂ fails; for USCR, M doubles if it is too small and the state-space buffer grows if it is too small. If a model reaches this limit without passing every check, increase it under **Adaptive reruns** below and rerun.",
             "",
             "The app handles chain counts and reruns internally, so users do not need to manually edit iterations, thinning, or data-augmentation size in the interface.",
             "If convergence is still poor after a run, review the run-status panel and consider whether the priors need to better match your site or species.",
@@ -1174,6 +1166,21 @@ ui <- page_fillable(
           
           hr(),
           
+          h4("Adaptive reruns"),
+          fluidRow(
+            column(12,
+              numericInput("max_adapt_rounds", "Maximum adaptive rounds per model run",
+                           value = 6, min = 1, step = 1),
+              tags$p(
+                class = "small",
+                style = "color: var(--muted);",
+                "After each round, the app checks convergence (R\u0302 < 1.1) and, for USCR, whether M and the state-space buffer are large enough. Only the settings tied to a failed check change before the next round: iterations, burn-in, and thinning double if R\u0302 fails; M doubles if it is too small; and the buffer grows to fit the posterior \u03c3 if it is too small. If a model reaches this limit without passing every check, the run-status panel will say so. Increase this number and run the model again to keep going."
+              )
+            )
+          ),
+
+          hr(),
+
           radioButtons(
             "mode", "Settings mode",
             choices  = c("Simple (recommended)" = "Default", "Advanced" = "Advanced"),
@@ -1212,7 +1219,7 @@ ui <- page_fillable(
                 markdown(paste(
                   "- **D** ~ Uniform(0, D_max): Uniform prior for density. `D_max` should be well above the maximum value of the posterior draws from `D`.",
                   "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale). The current default corresponds to an average daily movement rate of `3.09 km/day` with an approximate 95% interval of `1.60` to `6.00 km/day` (Christensen et al. in prep).",
-                  "- **sd_eps** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model. The default `Gamma(1, 1)` prior has mean 1 and variance 1. These shared `sd_eps` controls are used by REM, TTE, and USCR.",
+                  "- **σ<sub>ε</sub>** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model. The default `Gamma(1, 1)` prior has mean 1 and variance 1. These shared σ<sub>ε</sub> controls are used by REM, TTE, and USCR.",
                   "",
                   "These defaults are not well calibrated for species other than white-tailed deer (*Odocoileus virginianus*). If you are working with another species, adjust the priors to match that species and study design. Model output is sensitive to choice of prior distribution.",
                   "",
@@ -1228,9 +1235,9 @@ ui <- page_fillable(
                                  value = 0.3372, min = 0.01, step = 0.05)
                   ),
                   column(6,
-                    numericInput("sd_eps_shape", "sd_eps gamma shape",
+                    numericInput("sd_eps_shape", HTML("σ<sub>ε</sub> gamma shape"),
                                  value = 1, min = 0.1, step = 0.1),
-                    numericInput("sd_eps_rate", "sd_eps gamma rate",
+                    numericInput("sd_eps_rate", HTML("σ<sub>ε</sub> gamma rate"),
                                  value = 1, min = 0.1, step = 0.1)
                   )
                 )
@@ -1243,7 +1250,7 @@ ui <- page_fillable(
                   "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale). The current default corresponds to an average 95% circular home-range size of `0.89 km²` with an approximate 95% interval of `0.48` to `1.62 km²` (Christensen et al. in prep).",
                   "- **log(λ₀)** ~ Normal(mean, SD): Prior on expected detections per day when an animal's activity center is at the camera. The default mean of `0` corresponds to about one expected detection per deployed day at the detector because `exp(0) = 1`.",
                   "- **State-space buffer**: Distance added around the camera array when defining the USCR state-space. Animals with home range centroids outside the buffer should not be able to be detected within the state space. The default is set from the log(σ) prior so it comfortably covers a 99% home range, and updates automatically if you change that prior; the app also checks it against the posterior sigma after fitting and grows it (and reruns) if needed.",
-                  "- **sd_eps** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect. USCR uses the same shared `sd_eps` gamma controls listed in the REM & TTE section above.",
+                  "- **σ<sub>ε</sub>** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level lognormal random effect. USCR uses the same shared σ<sub>ε</sub> gamma controls listed in the REM & TTE section above.",
                   "",
                   "These defaults are not well calibrated for species other than white-tailed deer (*Odocoileus virginianus*). If you are working with another species, adjust the priors to better match that species and study design. Model output is sensitive to choice of prior distribution.",
                   "",
@@ -1303,8 +1310,8 @@ ui <- page_fillable(
                 <p>Expected encounter rate from augmented individuals:</p>
                 <p>$$\\Lambda_j = \\sum_{i=1}^{M} z_i\\,\\lambda_0\\,\\exp\\!\\Big(-\\frac{d_{ij}^2}{2\\sigma^2}\\Big), \\qquad z_i \\sim \\mathrm{Bernoulli}(\\psi)$$</p>
                 <p>Activity centers and camera effects:</p>
-                <p>$$s_i \\sim \\mathrm{Uniform}(S), \\qquad \\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
-                <p>Here \\(S\\) is the buffered state-space. Density is obtained from \\(N = \\sum_i z_i\\) divided by the study-area size. With real coordinates, area comes from the buffered camera state-space; on the toy simulator, area comes from the rectangular simulated state-space. The state-space buffer can be adjusted in Model settings. The app currently reports \\(D_{\\mathrm{km}^2}\\).</p>
+                <p>$$s_i \\sim \\mathrm{Uniform}(S), \\qquad \\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)$$</p>
+                <p>Here \\(S\\) is the buffered state-space. Density is obtained from \\(N = \\sum_i z_i\\) divided by the study-area size. For both uploaded and simulated data, \\(S\\) is the union of circles, with radius equal to the buffer, around each camera, and its area is the area of that union. The state-space buffer can be adjusted in Model settings. The app currently reports \\(D_{\\mathrm{km}^2}\\).</p>
                 <h3>Variables</h3>
                 <ul>
                   <li>\\(y_j\\) — total independent animal detections at camera \\(j\\) across the deployment.</li>
@@ -1322,7 +1329,7 @@ ui <- page_fillable(
                   <li>\\(M = 100\\), the starting upper bound on total abundance used for data augmentation. If the posterior presses against \\(M\\), the app increases it and reruns the model.</li>
                   <li>\\(\\log \\sigma \\sim \\mathcal{N}(-1.5269,\\,0.1535)\\), which corresponds to an average 95% circular home-range size of about 0.89 km² (Christensen et al. in prep). The state-space buffer defaults to 1.05&times; the 99% home-range radius implied by this prior, and the app grows it to 1.01&times; the required radius (and reruns) if the posterior sigma would need a bigger buffer.</li>
                   <li>\\(\\log \\lambda_0 \\sim \\mathcal{N}(0,\\,1)\\), centered near one expected detection per deployed day when the activity center is at the camera.</li>
-                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1,1)\\), giving the camera-level random-effect standard deviation a prior mean of 1 and variance of 1.</li>
+                  <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(1,1)\\), giving the camera-level random-effect standard deviation a prior mean of 1 and variance of 1.</li>
                   <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
                 </ul>
               </div>
@@ -1383,7 +1390,7 @@ ui <- page_fillable(
                 <p>Per-camera Poisson model:</p>
                 <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j)$$</p>
                 <p>$$\\log \\lambda_j = \\log D + \\log(\\mathrm{days}_j) + \\log v + \\log r_j + \\log\\!\\Big(\\frac{2 + \\theta_{\\mathrm{rad},j}}{\\pi}\\Big) + \\epsilon_j$$</p>
-                <p>$$\\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
+                <p>$$\\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)$$</p>
                 <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
                 <h3>Variables</h3>
                 <ul>
@@ -1399,7 +1406,7 @@ ui <- page_fillable(
                 <ul>
                   <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density, with \\(D_{\\max} = 200\\) by default. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
                   <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day (Christensen et al. in prep).</li>
-                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
+                  <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
                   <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
                   <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
                 </ul>
@@ -1462,7 +1469,7 @@ ui <- page_fillable(
                 <p>Per-camera Poisson model:</p>
                 <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j), \\qquad \\log \\lambda_j \\;=\\; \\log D \\;+\\; \\log(\\mathrm{days}_j)\\;+\\;\\log(U_j)\\;+\\;\\log(A_j)\\;+\\;\\epsilon_j$$</p>
                 <p>Movement-based encounter multiplier, viewshed area, and camera effect:</p>
-                <p>$$U_j \\;=\\; \\frac{v}{f(\\theta_j)\\,r_j}, \\qquad A_j \\;=\\; \\pi r_j^2 \\frac{\\theta_{\\mathrm{deg},j}}{360}, \\qquad \\epsilon_j \\sim \\mathcal{N}(0, sd_\\epsilon)$$</p>
+                <p>$$U_j \\;=\\; \\frac{v}{f(\\theta_j)\\,r_j}, \\qquad A_j \\;=\\; \\pi r_j^2 \\frac{\\theta_{\\mathrm{deg},j}}{360}, \\qquad \\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)$$</p>
                 <p>with \\(f(\\theta_j) = 0.3324 + 0.005580\\,\\theta_j - 1.454\\times10^{-5}\\,\\theta_j^2\\), where \\(\\theta_j\\) is the full camera detection angle in degrees.</p>
                 <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
                 <h3>Variables</h3>
@@ -1480,7 +1487,7 @@ ui <- page_fillable(
                 <ul>
                   <li>\\(D \\sim \\mathcal{U}(0, D_{\\max})\\), a uniform prior for density, with \\(D_{\\max} = 200\\) by default. \\(D_{\\max}\\) should be well above the maximum value of the posterior draws from \\(D\\).</li>
                   <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to an average daily movement rate of about 3.09 km/day (Christensen et al. in prep).</li>
-                  <li>\\(sd_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
+                  <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect.</li>
                   <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
                   <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
                 </ul>
@@ -1582,7 +1589,8 @@ ui <- page_fillable(
         "",
         "**Interpreting results:** each click simulates one dataset, so a single miss or hit is not conclusive. Try several random seeds before drawing conclusions.",
         "Model priors for σ, λ₀, and movement speed are centered on the true values you set here, so results show how well a design can recover parameters when priors are well calibrated.",
-        "Priors for density, `sd_eps`, and MCMC settings come from the **Model settings** tab.",
+        "The prior SDs for these parameters are not set here: adjust them in the **Model settings** tab under **Advanced** (log(σ) SD and log(λ₀) SD in **Priors: USCR**; log(v) SD in **Priors: REM & TTE**).",
+        "Priors for density, σ<sub>ε</sub>, and MCMC settings come from the **Model settings** tab.",
         sep = "\n"
       )),
       h3("Shared design parameters"),
@@ -1595,18 +1603,20 @@ ui <- page_fillable(
                sliderInput("pshared_days", "Survey length (days)",
                            min = 7, max = 60, value = 21, step = 1),
                sliderInput("pshared_Dtrue", "True density (animals/km²)",
-                           min = 5, max = 80, value = 25, step = 1)
+                           min = 5, max = 80, value = 25, step = 1),
+               sliderInput("pshared_sd_eps", HTML("Camera-level heterogeneity (σ<sub>ε</sub>)"),
+                           min = 0, max = 1, value = 0.2, step = 0.05)
         ),
         column(4,
-               h4("USCR (SECR) inputs"),
+               h4("USCR inputs"),
                sliderInput("pshared_home_range_km2", "Mean 95% home-range size (km²)",
                            min = 0.10, max = 3.00, value = 0.89, step = 0.05),
                sliderInput("pshared_lambda0", "USCR detection rate λ₀ (expected detections/day at camera center)",
                            min = 0.05, max = 0.6, value = 0.20, step = 0.01),
                numericInput("pshared_buffer_m", "USCR State-space buffer around camera array (m)",
-                            value = 850, min = 50, step = 50),
+                            value = 700, min = 50, step = 50),
                p(class = "small", style = "color: var(--muted);",
-                 "This buffer controls the area available to simulated animal activity centers. Smaller animals may need a smaller buffer; larger-ranging animals may need a larger one.")
+                 "Simulated activity centers are placed within this distance of at least one camera. It defaults to 1.05 times the 99% home-range radius implied by the home-range size above (about 3.2 sigma), the same rule used for uploaded data, and updates when you change the home-range size. You can override it.")
         ),
         column(4,
                h4("REM / TTE (movement) inputs"),
@@ -1615,9 +1625,7 @@ ui <- page_fillable(
                sliderInput("pshared_theta", "Detection angle θ (degrees)",
                            min = 20, max = 80, value = 55, step = 1),
                sliderInput("pshared_r", "Detection radius (m)",
-                           min = 8, max = 25, value = 12, step = 1),
-               sliderInput("pshared_sd_eps", "Camera-level heterogeneity (sd_eps)",
-                           min = 0, max = 1, value = 0.2, step = 0.05)
+                           min = 8, max = 25, value = 12, step = 1)
         )
       ),
       fluidRow(
@@ -1670,7 +1678,7 @@ ui <- page_fillable(
         ),
         tags$p(
           tags$strong("State-space buffer"),
-          " is the distance added around the camera array when placing simulated activity centers. The same buffer is used when fitting USCR. It should be large enough to contain realistic space use for the species being simulated."
+          " is the maximum distance from the nearest camera at which simulated activity centers are placed, so the simulated state space is the union of circles of this radius around the cameras. The same buffer is used when fitting USCR. By default it follows the home-range size (1.05 times the 99% home-range radius), matching the rule used for uploaded data."
         ),
         tags$p(tags$strong("REM and TTE inputs")),
         tags$p(
@@ -1686,12 +1694,21 @@ ui <- page_fillable(
           " is the camera's detection angle in degrees. Manufacturer specifications typically list this value."
         ),
         tags$p(
-          tags$strong("Camera-level heterogeneity (sd_eps)"),
-          " is the standard deviation of camera-to-camera variation in counts that is not explained by deployment length, density, movement, or camera geometry. It is applied only when simulating REM and TTE data. The USCR simulation has no camera-level noise, although all three models estimate ", tags$code("sd_eps"), " when fit."
+          tags$strong(HTML("Camera-level heterogeneity (σ<sub>ε</sub>)")),
+          " is the standard deviation of camera-to-camera variation in counts (on the log scale) that is not explained by deployment length, density, movement, or camera geometry. It is applied when simulating data for all three models, and all three models estimate ", HTML("σ<sub>ε</sub>"), " when fit."
         )
       ),
       hr(),
       h3("Fit each model to the shared design"),
+      markdown(paste(
+        "**Reading the results tables:**",
+        "",
+        "- **Truth**: the value used to simulate the data.",
+        "- **Mean / Median**: posterior mean and median.",
+        "- **Lower 2.5% / Upper 97.5%**: bounds of the 95% credible interval.",
+        "- **Covered**: whether the 95% credible interval contains the true value. Across many simulated datasets, a well-calibrated model should cover the truth about 95% of the time, so a single \"No\" is not by itself a problem.",
+        sep = "\n"
+      )),
       
       # ---------------- USCR block ----------------
       tags$div(
@@ -1919,7 +1936,8 @@ ui <- page_fillable(
       lambda0 = input$pshared_lambda0,
       home_range_km2 = input$pshared_home_range_km2,
       buffer_m = input$pshared_buffer_m,
-      seed = input$pshared_seed
+      sd_eps = input$pshared_sd_eps,
+      seed = input$pshared_seed + 2  # offset so USCR, REM, and TTE use separate random streams
     )
     uscr_data <- sim_model_inputs(sim = uscr_sim, detection_radius_m = input$pshared_r)
     
@@ -1935,7 +1953,7 @@ ui <- page_fillable(
       n_side = input$pshared_n_side, spacing_m = input$pshared_spacing, days = input$pshared_days,
       D_per_km2 = input$pshared_Dtrue, detection_radius_m = input$pshared_r,
       theta_deg = input$pshared_theta, v_km_day = input$pshared_v, sd_eps = input$pshared_sd_eps,
-      seed = input$pshared_seed
+      seed = input$pshared_seed + 1  # offset so REM and TTE get independent camera noise
     )
     
     # Settings are saved with the simulated data so that the model fits
@@ -1954,31 +1972,44 @@ ui <- page_fillable(
            sd_eps   = input$pshared_sd_eps
          ))
   }, ignoreInit = TRUE)
+
+  # Keep the shared-design buffer default in sync with the home-range size,
+  # using the same rule as the uploaded-data buffer (1.05 x the 99%
+  # home-range radius implied by sigma). Users can still override it.
+  observe({
+    req(is.numeric(input$pshared_home_range_km2))
+    sigma_km <- home_range_km2_to_sigma_m(input$pshared_home_range_km2) / 1000
+    new_default <- uscr_buffer_from_sigma_km(sigma_km)
+    updateNumericInput(session, "pshared_buffer_m", value = ceiling(new_default / 50) * 50)
+  })
   
   output$pshared_uscr_grid_plot <- renderPlot({
     req(pshared_sim())
     s <- pshared_sim()$uscr$sim
-    traps_df <- as.data.frame(secr::traps(s$ch)) |> mutate(camera = row_number())
-    mask_df  <- as.data.frame(s$mask)
+    cams_df <- s$out |> mutate(camera = row_number())
     ggplot() +
-      geom_point(data = mask_df, aes(x = x, y = y), alpha = 0.1, color = redwood_colors[5]) +
-      geom_point(data = traps_df, aes(x = x, y = y), size = 3, color = redwood_colors[3]) +
-      geom_label(data = traps_df, aes(x = x, y = y, label = camera), nudge_y = 18, size = 3.8,
+      geom_path(data = s$state_space_outline, aes(x = x, y = y, group = group),
+                color = redwood_colors[5], linetype = "dashed") +
+      geom_point(data = s$activity_centers, aes(x = x, y = y),
+                 size = 1, alpha = 0.5, color = redwood_colors[2]) +
+      geom_point(data = cams_df, aes(x = x, y = y), size = 3, color = redwood_colors[3]) +
+      geom_label(data = cams_df, aes(x = x, y = y, label = camera), nudge_y = 18, size = 3.8,
                  color = redwood_colors[1], fill = "white", label.size = 0.2) +
       coord_equal() + theme_minimal() +
       labs(x = "m", y = "m", title = sprintf(
-        "%d cameras, spacing %dm (true density: %.1f animals/km²)",
-        s$truth$n_cams, s$truth$spacing_m, s$truth$D_per_km2
+        "%d cameras, spacing %dm, buffer %dm (true density: %.1f animals/km²)",
+        s$truth$n_cams, s$truth$spacing_m, round(s$truth$buffer_m), s$truth$D_per_km2
+      ), subtitle = sprintf(
+        "%d simulated activity centers in a %.2f km² state space (dashed outline)",
+        s$truth$N, s$truth$area_km2
       ))
   })
   
   output$pshared_uscr_camera_table <- renderDT({
     req(pshared_sim())
-    ch <- pshared_sim()$uscr$sim$ch
-    cams <- as.data.frame(secr::traps(ch)) |> mutate(camera_id = paste0("C", row_number()))
-    totcounts <- rowSums(get_counts_matrix(ch), na.rm = TRUE)
-    cams |>
-      mutate(total_counts = totcounts) |>
+    s <- pshared_sim()$uscr$sim
+    s$out |>
+      mutate(camera_id = `Site Name`, total_counts = s$camera_counts) |>
       select(camera_id, x, y, total_counts) |>
       datatable(options = list(pageLength = 8))
   })
@@ -2058,9 +2089,10 @@ ui <- page_fillable(
                        log_entry = "Shared-design USCR run requested.")
     showNotification("Running USCR on shared design...", type = "message", duration = NULL, id = "pshared_uscr_status")
     
-    state_extent_km <- (s$settings$n_side - 1) * s$settings$spacing / 1000
-    buffer_km <- s$settings$buffer_m / 1000
-    state_area_km2 <- (state_extent_km + 2 * buffer_km)^2
+    state_area_km2 <- uscr_buffered_area_km2(
+      cbind(d$out$utm_e, d$out$utm_n),
+      s$settings$buffer_m / 1000
+    )
     suggested_M <- max(50, ceiling(2 * s$D_true * state_area_km2 / 50) * 50)
     
     fit <- tryCatch(
@@ -2072,6 +2104,7 @@ ui <- page_fillable(
         log_lam0_mean = log(s$settings$lambda0), log_lam0_sd = input$log_lam0_sd,
         sd_eps_shape = input$sd_eps_shape, sd_eps_rate = input$sd_eps_rate,
         buffer_m = s$settings$buffer_m, adaptive = TRUE, compute_WAIC = FALSE,
+        max_adapt_rounds = app_max_adapt_rounds(),
         diagnostic_mode = FALSE, parallel_chains = isTRUE(app_n_chains() > 1),
         status_callback = make_model_status_callback(pshared_uscr_debug, "USCR", "pshared_uscr_status"),
         verbose = FALSE
@@ -2087,22 +2120,46 @@ ui <- page_fillable(
     pshared_uscr_fit(fit)
     if (!is.null(fit)) {
       update_model_debug(pshared_uscr_debug, status = "success", stage = "Complete", finished_at = Sys.time(),
-                         guidance = "Complete. Review the table above.")
+                         guidance = adaptive_limit_guidance(fit, "USCR", "Complete. Review the table above."))
+      notify_adaptive_limit(fit, "USCR (shared design)")
     }
   })
   
+  # Display version of a summarize_vs_truth() table: parameter symbols with
+  # units instead of internal names, and Yes/No for coverage. The internal
+  # names are still used to look up the posterior draws.
+  pshared_truth_datatable <- function(tbl) {
+    param_labels <- c(
+      D_km2  = "D (animals/km\u00b2)",
+      sigma  = "\u03c3 (km)",
+      lam_0  = "\u03bb\u2080 (detections/day)",
+      v      = "v (km/day)",
+      sd_eps = "σ<sub>ε</sub>"
+    )
+    tbl <- tbl |>
+      mutate(
+        Parameter = dplyr::coalesce(unname(param_labels[Parameter]), Parameter),
+        Covered = ifelse(Covered, "Yes", "No"),
+        across(where(is.numeric), ~round(.x, 3))
+      )
+    # escape = FALSE so the <sub> tag in the sigma_epsilon label renders.
+    datatable(tbl, options = list(dom = "t", paging = FALSE), rownames = FALSE, escape = FALSE)
+  }
+
   output$pshared_uscr_table <- renderDT({
     fit <- pshared_uscr_fit()
-    validate(need(!is.null(fit), "Simulate a design, then click 'Run USCR'."))
+    # req() rather than validate(): a validation message inside an empty
+    # DT widget has no height and overlaps the heading below it.
+    req(fit)
     s <- pshared_sim()
     sigma_km_true <- s$uscr$sim$truth$sigma_m / 1000
     tbl <- summarize_vs_truth(fit, list(
       D_km2 = s$D_true,
       sigma = sigma_km_true,
-      lam_0 = s$settings$lambda0
+      lam_0 = s$settings$lambda0,
+      sd_eps = s$settings$sd_eps
     ))
-    datatable(tbl |> mutate(across(where(is.numeric), ~round(.x, 3))),
-              options = list(dom = "t", paging = FALSE), rownames = FALSE)
+    pshared_truth_datatable(tbl)
   })
   
   # ---- REM ----
@@ -2128,6 +2185,7 @@ ui <- page_fillable(
         n_chains = app_n_chains(), D_max = input$D_max,
         log_v_mean = log(s$settings$v), log_v_sd = input$log_v_sd,
         sd_eps_shape = input$sd_eps_shape, sd_eps_rate = input$sd_eps_rate,
+        max_adapt_rounds = app_max_adapt_rounds(),
         status_callback = make_model_status_callback(pshared_rem_debug, "REM", "pshared_rem_status")
       ),
       error = function(e) {
@@ -2141,17 +2199,19 @@ ui <- page_fillable(
     pshared_rem_fit(fit)
     if (!is.null(fit)) {
       update_model_debug(pshared_rem_debug, status = "success", stage = "Complete", finished_at = Sys.time(),
-                         guidance = "Complete. Review the table above.")
+                         guidance = adaptive_limit_guidance(fit, "REM", "Complete. Review the table above."))
+      notify_adaptive_limit(fit, "REM (shared design)")
     }
   })
   
   output$pshared_rem_table <- renderDT({
     fit <- pshared_rem_fit()
-    validate(need(!is.null(fit), "Simulate a design, then click 'Run REM'."))
+    # req() rather than validate(): a validation message inside an empty
+    # DT widget has no height and overlaps the heading below it.
+    req(fit)
     s <- pshared_sim()
     tbl <- summarize_vs_truth(fit, list(D_km2 = s$D_true, v = s$settings$v, sd_eps = s$settings$sd_eps))
-    datatable(tbl |> mutate(across(where(is.numeric), ~round(.x, 3))),
-              options = list(dom = "t", paging = FALSE), rownames = FALSE)
+    pshared_truth_datatable(tbl)
   })
   
   # ---- TTE ----
@@ -2177,6 +2237,7 @@ ui <- page_fillable(
         n_chains = app_n_chains(), D_max = input$D_max,
         log_v_mean = log(s$settings$v), log_v_sd = input$log_v_sd,
         sd_eps_shape = input$sd_eps_shape, sd_eps_rate = input$sd_eps_rate,
+        max_adapt_rounds = app_max_adapt_rounds(),
         status_callback = make_model_status_callback(pshared_tte_debug, "TTE", "pshared_tte_status")
       ),
       error = function(e) {
@@ -2190,17 +2251,19 @@ ui <- page_fillable(
     pshared_tte_fit(fit)
     if (!is.null(fit)) {
       update_model_debug(pshared_tte_debug, status = "success", stage = "Complete", finished_at = Sys.time(),
-                         guidance = "Complete. Review the table above.")
+                         guidance = adaptive_limit_guidance(fit, "TTE", "Complete. Review the table above."))
+      notify_adaptive_limit(fit, "TTE (shared design)")
     }
   })
   
   output$pshared_tte_table <- renderDT({
     fit <- pshared_tte_fit()
-    validate(need(!is.null(fit), "Simulate a design, then click 'Run TTE'."))
+    # req() rather than validate(): a validation message inside an empty
+    # DT widget has no height and overlaps the heading below it.
+    req(fit)
     s <- pshared_sim()
     tbl <- summarize_vs_truth(fit, list(D_km2 = s$D_true, v = s$settings$v, sd_eps = s$settings$sd_eps))
-    datatable(tbl |> mutate(across(where(is.numeric), ~round(.x, 3))),
-              options = list(dom = "t", paging = FALSE), rownames = FALSE)
+    pshared_truth_datatable(tbl)
   })
   
   output$pshared_uscr_debug <- renderText({
@@ -3959,6 +4022,34 @@ ui <- page_fillable(
     max(2L, as.integer(input$n_chains))
   }
 
+  app_max_adapt_rounds <- function() {
+    x <- suppressWarnings(as.integer(input$max_adapt_rounds))
+    if (length(x) != 1L || is.na(x) || x < 1L) 6L else x
+  }
+
+  # Run-status guidance for a completed fit. Flags fits that stopped at the
+  # adaptive-round limit without passing every check.
+  adaptive_limit_guidance <- function(fit, model, default_guidance) {
+    if (!isTRUE(fit$hit_max_adapt_rounds)) return(default_guidance)
+    paste0(
+      model, " stopped after ", fit$settings$max_adapt_rounds,
+      " adaptive rounds without passing these checks: ",
+      paste(fit$unmet_checks, collapse = ", "),
+      ". The results shown are from the last round and may not be reliable. ",
+      "To keep going, increase 'Maximum adaptive rounds' in Model settings and run ",
+      model, " again."
+    )
+  }
+
+  notify_adaptive_limit <- function(fit, label) {
+    if (isTRUE(fit$hit_max_adapt_rounds)) {
+      showNotification(
+        paste0(label, " stopped at the adaptive-round limit without passing all checks. See the run-status panel."),
+        type = "warning", duration = NULL
+      )
+    }
+  }
+
   # Keep the USCR buffer default in sync with the log(sigma) prior: the
   # buffer should comfortably contain a 99% home range under that prior, so
   # if the prior mean/SD change, recompute and refresh the displayed default.
@@ -3985,6 +4076,7 @@ ui <- page_fillable(
       sd_eps_shape = input$sd_eps_shape,
       sd_eps_rate = input$sd_eps_rate,
       adaptive = TRUE,
+      max_adapt_rounds = app_max_adapt_rounds(),
       compute_WAIC = waic,
       diagnostic_mode = FALSE,
       parallel_chains = isTRUE(app_n_chains() > 1),
@@ -4092,10 +4184,11 @@ ui <- page_fillable(
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "Uploaded-data USCR completed successfully. Review the summary above and the run history below.",
+        guidance = adaptive_limit_guidance(fit, "USCR", "Uploaded-data USCR completed successfully. Review the summary above and the run history below."),
         log_entry = "Uploaded-data USCR run completed."
       )
       showNotification("USCR (uploaded data) complete!", type = "message")
+      notify_adaptive_limit(fit, "USCR (uploaded data)")
     }
   }
 
@@ -4163,6 +4256,7 @@ ui <- page_fillable(
           log_v_sd     = input$log_v_sd,
           sd_eps_shape = input$sd_eps_shape,
           sd_eps_rate  = input$sd_eps_rate,
+          max_adapt_rounds = app_max_adapt_rounds(),
           status_callback = status_callback
         )
       },
@@ -4196,10 +4290,11 @@ ui <- page_fillable(
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "REM completed successfully. Review the summary above and the run history below.",
+        guidance = adaptive_limit_guidance(fit, "REM", "REM completed successfully. Review the summary above and the run history below."),
         log_entry = "Uploaded-data REM run completed."
       )
       showNotification("REM (uploaded data) complete!", type = "message")
+      notify_adaptive_limit(fit, "REM (uploaded data)")
     }
   })
   
@@ -4259,6 +4354,7 @@ ui <- page_fillable(
           log_v_sd     = input$log_v_sd,
           sd_eps_shape = input$sd_eps_shape,
           sd_eps_rate  = input$sd_eps_rate,
+          max_adapt_rounds = app_max_adapt_rounds(),
           status_callback = status_callback
         )
       },
@@ -4292,10 +4388,11 @@ ui <- page_fillable(
         status = "success",
         stage = "Complete",
         finished_at = Sys.time(),
-        guidance = "TTE completed successfully. Review the summary above and the run history below.",
+        guidance = adaptive_limit_guidance(fit, "TTE", "TTE completed successfully. Review the summary above and the run history below."),
         log_entry = "Uploaded-data TTE run completed."
       )
       showNotification("TTE (uploaded data) complete!", type = "message")
+      notify_adaptive_limit(fit, "TTE (uploaded data)")
     }
   })
   

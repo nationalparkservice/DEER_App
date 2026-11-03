@@ -26,6 +26,19 @@ tte_detection_radius_multiplier <- function(theta_deg) {
   3.324e-01 + 5.580e-03 * theta_deg - 1.454e-05 * theta_deg^2
 }
 
+# Simulate USCR camera counts on a square camera grid. This mirrors the NIMBLE
+# model in build_uscr_code(), so the simulated data and the fitted model share
+# the same state space and observation process:
+#   - Cameras: the same centered square grid the REM/TTE teaching simulator
+#     uses (build_teaching_sim_grid()).
+#   - Activity centers: N_rect ~ Poisson(D * rectangle area) points drawn with
+#     runif() over the camera rectangle +/- buffer, keeping only those within
+#     `buffer` of at least one camera (the model's in_ss constraint). The kept
+#     points are a Poisson process with density D over exactly the model's
+#     state space (the union of circles of radius `buffer` around cameras).
+#   - Counts: y_j ~ Poisson(days_j * sum_i lambda0 * exp(-d_ij^2 / (2 sigma^2))
+#     * exp(eps_j)), with camera-level noise eps_j ~ Normal(0, sd_eps).
+# All distances are in km internally; buffer_m and sigma_m are in metres.
 simulate_camera_counts <- function(n_side   = 5,
                                    spacing_m = 300,
                                    days      = 21,
@@ -34,143 +47,95 @@ simulate_camera_counts <- function(n_side   = 5,
                                    home_range_km2 = 0.89,
                                    sigma_m   = NULL,
                                    buffer_m  = NULL,
+                                   sd_eps    = 0,
                                    seed      = 1) {
-  quiet_require("secr")
-  
+  if (n_side < 2 || days < 1 || spacing_m <= 0) {
+    stop("USCR simulator needs at least a 2 x 2 grid, positive spacing, and at least 1 day.",
+         call. = FALSE)
+  }
+  if (D_per_km2 < 0 || lambda0 <= 0 || sd_eps < 0) {
+    stop("USCR simulator density, detection rate, and heterogeneity inputs are out of range.",
+         call. = FALSE)
+  }
+
   set.seed(seed)
+
   if (is.null(sigma_m)) {
     sigma_m <- home_range_km2_to_sigma_m(home_range_km2)
   }
-  if (is.null(buffer_m)) {
-    buffer_m <- 4 * sigma_m
+  sigma_km <- sigma_m / 1000
+  if (is.null(buffer_m) || !is.finite(buffer_m) || buffer_m <= 0) {
+    buffer_m <- uscr_buffer_from_sigma_km(sigma_km)
   }
-  
-  traps_obj <- secr::make.grid(
-    nx       = n_side,
-    ny       = n_side,
-    spacing  = spacing_m,
-    detector = "count"
+  buffer_km <- buffer_m / 1000
+
+  # Cameras (detection radius is filled in later by sim_model_inputs()).
+  out <- build_teaching_sim_grid(
+    n_side = n_side,
+    spacing_m = spacing_m,
+    detection_radius_m = NA_real_,
+    days = days
   )
-  
-  mask_obj <- secr::make.mask(
-    traps   = traps_obj,
-    buffer  = buffer_m,
-    spacing = spacing_m / 3
+  cam <- cbind(out$utm_e, out$utm_n)
+  J <- nrow(cam)
+
+  # Activity centers: uniform over the rectangle, then keep those within the
+  # buffer of at least one camera.
+  xlim <- range(cam[, 1]) + c(-1, 1) * buffer_km
+  ylim <- range(cam[, 2]) + c(-1, 1) * buffer_km
+  N_rect <- stats::rpois(1, D_per_km2 * diff(xlim) * diff(ylim))
+  ac <- cbind(
+    stats::runif(N_rect, xlim[1], xlim[2]),
+    stats::runif(N_rect, ylim[1], ylim[2])
   )
-  
-  # secr uses animals/ha when coords are in metres
-  D_ha <- D_per_km2 / 100
-  
-  ch <- secr::sim.capthist(
-    traps      = traps_obj,
-    popn       = list(D = D_ha),
-    detectfn   = "HHN",
-    detectpar  = list(lambda0 = lambda0, sigma = sigma_m),
-    noccasions = days,
-    renumber   = FALSE
-  )
-  
+  dist2 <- outer(ac[, 1], cam[, 1], "-")^2 + outer(ac[, 2], cam[, 2], "-")^2
+  dist2 <- matrix(dist2, nrow = N_rect, ncol = J)
+  keep <- if (N_rect > 0) apply(dist2, 1, min) < buffer_km^2 else logical(0)
+  ac <- ac[keep, , drop = FALSE]
+  dist2 <- dist2[keep, , drop = FALSE]
+
+  # Counts.
+  camera_days <- rep(as.numeric(days), J)
+  Lambda <- colSums(lambda0 * exp(-dist2 / (2 * sigma_km^2)))  # per day, per camera
+  eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
+  mu <- camera_days * Lambda * exp(eps)
+  camera_counts <- stats::rpois(J, mu)
+
+  area_km2 <- uscr_buffered_area_km2(cam, buffer_km)
+
   list(
-    ch    = ch,
-    traps = traps_obj,
-    mask  = mask_obj,
+    out = out,
+    camera_counts = camera_counts,
+    camera_days = camera_days,
+    activity_centers = data.frame(x = ac[, 1] * 1000, y = ac[, 2] * 1000),  # metres
+    state_space_outline = uscr_buffered_outline(cam, buffer_km, scale = 1000),  # metres
     truth = list(
       D_per_km2 = D_per_km2,
+      N = nrow(ac),
+      area_km2 = area_km2,
+      realized_D_per_km2 = nrow(ac) / area_km2,
       lambda0   = lambda0,
       home_range_km2 = home_range_km2,
       sigma_m   = sigma_m,
       buffer_m  = buffer_m,
+      sd_eps    = sd_eps,
       days      = days,
       spacing_m = spacing_m,
-      n_cams    = nrow(traps_obj)
+      n_side    = n_side,
+      n_cams    = J
     )
   )
 }
 
-get_counts_matrix <- function(ch) {
-  ch_dims <- dim(ch)
-  if (length(ch_dims) == 3) {
-    # [animals, occasions, traps] -> [traps, occasions]
-    apply(ch, c(3, 2), sum, na.rm = TRUE)
-  } else {
-    as.matrix(ch)
-  }
-}
-
-capthist_to_events <- function(ch) {
-  quiet_require("dplyr")
-  
-  counts_mat <- get_counts_matrix(ch)
-  n_occ      <- ncol(counts_mat)
-  n_cams     <- nrow(counts_mat)
-  
-  events_list <- vector("list", length = sum(counts_mat > 0))
-  idx <- 1L
-  
-  for (day in seq_len(n_occ)) {
-    for (cam in seq_len(n_cams)) {
-      count <- counts_mat[cam, day]
-      if (count > 0) {
-        for (i in seq_len(count)) {
-          events_list[[idx]] <- data.frame(
-            camera_id  = paste0("C", cam),
-            day        = day,
-            group_size = 1L
-          )
-          idx <- idx + 1L
-        }
-      }
-    }
-  }
-  
-  if (idx == 1L) {
-    df <- data.frame(
-      camera_id  = character(),
-      day        = integer(),
-      group_size = integer(),
-      date_time  = as.POSIXct(character())
-    )
-  } else {
-    df <- dplyr::bind_rows(events_list)
-    origin <- as.POSIXct("2025-01-01 00:00:00", tz = "UTC")
-    df <- df |>
-      dplyr::mutate(
-        date_time = origin + (day - 1) * 24 * 3600 + 12 * 3600
-      )
-  }
-  
-  df
-}
-
 # For simulations: create "NPS-like" inputs for models
-sim_model_inputs <- function(sim,
-                             detection_radius_m,
-                             days_override = NULL) {
-  quiet_require("dplyr")
-  quiet_require("secr")
-  
-  ch       <- sim$ch
-  traps_df <- as.data.frame(secr::traps(ch))
-  counts   <- get_counts_matrix(ch)
-  
-  y <- rowSums(counts, na.rm = TRUE)
-  days_used <- if (is.null(days_override)) ncol(counts) else days_override
-  camera_days <- rep(days_used, length(y))
-  
-  out <- traps_df |>
-    dplyr::mutate(
-      `Site Name`       = paste0("C", dplyr::row_number()),
-      utm_e             = x / 1000,   # treat metres as km for consistency
-      utm_n             = y / 1000,
-      `Detection Distance` = detection_radius_m,
-      `Start Index`     = 1L,
-      `End Index`       = days_used
-    )
-  
+sim_model_inputs <- function(sim, detection_radius_m) {
+  out <- sim$out
+  out$`Detection Distance` <- detection_radius_m
+
   list(
     out           = out,
-    camera_counts = y,
-    camera_days   = camera_days
+    camera_counts = sim$camera_counts,
+    camera_days   = sim$camera_days
   )
 }
 
@@ -248,7 +213,6 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
     truth = list(
       model = model,
       D_per_km2 = D_per_km2,
-      D_per_mi2 = D_per_km2 * 2.59,
       detection_radius_m = detection_radius_m,
       theta_deg = theta_deg,
       v_km_day = v_km_day,
@@ -262,14 +226,6 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
       total_expected = sum(lambda),
       total_observed = sum(camera_counts)
     )
-  )
-}
-
-# Back-compatible alias used by older app code
-build_sim_data_for_nimble <- function(ch, detection_radius_m) {
-  sim_model_inputs(
-    sim = list(ch = ch),
-    detection_radius_m = detection_radius_m
   )
 }
 
@@ -593,7 +549,7 @@ run_encounter_rate_model <- function(method,
                                      adaptive = TRUE,
                                      compute_WAIC = TRUE,
                                      rhat_target = 1.1,
-                                     max_adapt_rounds = NULL,
+                                     max_adapt_rounds = 6,
                                      parallel_chains = TRUE,
                                      status_callback = NULL,
                                      seed = NULL,
@@ -621,6 +577,10 @@ run_encounter_rate_model <- function(method,
   round_i <- 0L
   current_rhat <- Inf
   adapt_log <- list()
+  hit_max_adapt_rounds <- FALSE
+  if (!is.null(max_adapt_rounds)) {
+    max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
+  }
   last_fit <- NULL
   prev_elapsed_min <- NULL
   prev_iter <- NULL
@@ -629,16 +589,6 @@ run_encounter_rate_model <- function(method,
     round_i <- round_i + 1L
 
     if (!isTRUE(adaptive) && round_i > 1L) {
-      break
-    }
-
-    if (!is.null(max_adapt_rounds) && round_i > as.integer(max_adapt_rounds)) {
-      warning(
-        method,
-        " adaptive tuning reached max_adapt_rounds = ",
-        max_adapt_rounds,
-        " before convergence. Proceeding with the latest fit."
-      )
       break
     }
 
@@ -696,6 +646,18 @@ run_encounter_rate_model <- function(method,
       break
     }
 
+    # Stop here (before doubling) so the reported settings match the last fit.
+    if (!is.null(max_adapt_rounds) && round_i >= max_adapt_rounds) {
+      hit_max_adapt_rounds <- TRUE
+      warning(
+        method,
+        " stopped after max_adapt_rounds = ",
+        max_adapt_rounds,
+        " without converging (Rhat). Proceeding with the latest fit."
+      )
+      break
+    }
+
     current_iter <- current_iter * 2L
     current_burnin <- current_burnin * 2L
     current_thin <- current_thin * 2L
@@ -712,6 +674,8 @@ run_encounter_rate_model <- function(method,
     fit_objects = last_fit,
     round_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
     final_rhat_max = current_rhat,
+    hit_max_adapt_rounds = hit_max_adapt_rounds,
+    unmet_checks = if (hit_max_adapt_rounds) "Rhat" else character(0),
     settings = list(
       iter = current_iter,
       burnin = current_burnin,
@@ -740,7 +704,7 @@ run_REM <- function(y,
                     adaptive = TRUE,
                     compute_WAIC = TRUE,
                     rhat_target = 1.1,
-                    max_adapt_rounds = NULL,
+                    max_adapt_rounds = 6,
                     parallel_chains = TRUE,
                     status_callback = NULL,
                     seed = NULL,
@@ -787,8 +751,6 @@ run_REM <- function(y,
     sum_obs <- sum(pearson_obs[1:J])
     sum_sim <- sum(pearson_sim[1:J])
     bp      <- step(sum_sim - sum_obs)
-    
-    D_mi2 <- D * 2.59
   })
   
   Const <- list(
@@ -807,7 +769,7 @@ run_REM <- function(y,
   Data <- list(y = as.numeric(y))
   
   monitors <- c("D", "v", "sd_eps",
-                "bp", "sum_obs", "sum_sim", "D_mi2")
+                "bp", "sum_obs", "sum_sim")
 
   run_encounter_rate_model(
     method = "REM",
@@ -849,7 +811,7 @@ run_TTE <- function(y,
                     adaptive = TRUE,
                     compute_WAIC = TRUE,
                     rhat_target = 1.1,
-                    max_adapt_rounds = NULL,
+                    max_adapt_rounds = 6,
                     parallel_chains = TRUE,
                     status_callback = NULL,
                     seed = NULL,
@@ -900,8 +862,6 @@ run_TTE <- function(y,
     sum_sim <- sum(pearson_sim[1:J])
     
     bp <- step(sum_sim - sum_obs)
-    
-    D_mi2 <- D * 2.59
   })
   
   Const <- list(
@@ -921,7 +881,7 @@ run_TTE <- function(y,
   Data <- list(y = as.numeric(y))
   
   monitors <- c("D", "v", "sd_eps",
-                "bp", "sum_obs", "sum_sim", "D_mi2")
+                "bp", "sum_obs", "sum_sim")
 
   run_encounter_rate_model(
     method = "TTE",
@@ -974,6 +934,34 @@ uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = 0.99, multip
 # Drop-in replacement for the USCR section in sim_and_models.R
 # -------------------------------------------------------------------
 
+# Union of circles of radius buffer_km around each camera (cam: J x 2 matrix
+# of planar coordinates in km). This is the USCR state space implied by the
+# in_ss constraint in build_uscr_code(). Planar sf geometry, no CRS needed.
+uscr_buffered_union <- function(cam, buffer_km) {
+  quiet_require("sf")
+  pts <- sf::st_as_sf(
+    data.frame(x = cam[, 1], y = cam[, 2]),
+    coords = c("x", "y")
+  )
+  sf::st_union(sf::st_buffer(pts, dist = buffer_km))
+}
+
+uscr_buffered_area_km2 <- function(cam, buffer_km) {
+  as.numeric(sf::st_area(uscr_buffered_union(cam, buffer_km)))
+}
+
+# Outline of the buffered state space as a data frame (x, y, group) for
+# plotting; `scale` converts km to the plot's units (1000 for metres).
+uscr_buffered_outline <- function(cam, buffer_km, scale = 1) {
+  xy <- sf::st_coordinates(uscr_buffered_union(cam, buffer_km))
+  grp_cols <- intersect(c("L1", "L2", "L3"), colnames(xy))
+  data.frame(
+    x = xy[, "X"] * scale,
+    y = xy[, "Y"] * scale,
+    group = interaction(as.data.frame(xy[, grp_cols, drop = FALSE]), drop = TRUE)
+  )
+}
+
 uscr_state_space_and_area <- function(out,
                                       buffer_m = NULL,
                                       log_sigma_mean = -1.5269,
@@ -1018,7 +1006,7 @@ uscr_state_space_and_area <- function(out,
       sf::st_buffer(buffer * 1000) |>
       sf::st_union()
 
-    area_mi2 <- as.numeric(sf::st_area(cam_buff)) / (2.59 * 1e6)
+    area_km2 <- as.numeric(sf::st_area(cam_buff)) / 1e6  # m^2 -> km^2
   } else {
     if (any(!is.finite(out$utm_e) | !is.finite(out$utm_n))) {
       bad <- which(!is.finite(out$utm_e) | !is.finite(out$utm_n))
@@ -1029,8 +1017,9 @@ uscr_state_space_and_area <- function(out,
         call. = FALSE
       )
     }
-    # Simulated UTM-only grids: preserve current script behavior
-    area_mi2 <- (xlim[2] - xlim[1]) * (ylim[2] - ylim[1]) / 2.59
+    # Simulated grids (planar km coordinates, no Longitude/Latitude): same
+    # union-of-circles state space as field data, computed in km directly.
+    area_km2 <- uscr_buffered_area_km2(cbind(out$utm_e, out$utm_n), buffer)
   }
 
   list(
@@ -1038,7 +1027,7 @@ uscr_state_space_and_area <- function(out,
     buffer_sq = buffer_sq,
     xlim = xlim,
     ylim = ylim,
-    area_mi2 = area_mi2
+    area_km2 = area_km2
   )
 }
 
@@ -1098,7 +1087,7 @@ build_uscr_code <- function() {
     bp <- step(sum_sim - sum_obs)
 
     N <- sum(z[1:M])
-    D_mi2 <- N / area_mi2
+    D <- N / area_km2  # animals per km^2
   })
 }
 
@@ -1129,7 +1118,7 @@ make_uscr_constants <- function(out,
     xlim = ss$xlim,
     ylim = ss$ylim,
     buffer_sq = ss$buffer_sq,
-    area_mi2 = ss$area_mi2,
+    area_km2 = ss$area_km2,
     cam = as.matrix(cbind(out$utm_e, out$utm_n)),
     log_sigma_mean = log_sigma_mean,
     log_sigma_sd = log_sigma_sd,
@@ -1328,12 +1317,11 @@ extract_waic_mean <- function(fits) {
 # -------------------------------------------------------------------
 
 # Pull posterior draws for a given parameter name, normalizing density to
-# D_km2 regardless of whether the fit monitors D (REM/TTE) or D_mi2 (USCR).
+# D_km2. All three models monitor density as "D", in animals per km^2.
 extract_param_draws <- function(samples_all, param_name) {
   cn <- colnames(samples_all)
   if (identical(param_name, "D_km2")) {
     if ("D" %in% cn) return(as.numeric(samples_all[, "D"]))
-    if ("D_mi2" %in% cn) return(as.numeric(samples_all[, "D_mi2"]) / 2.59)
     return(NULL)
   }
   if (param_name %in% cn) return(as.numeric(samples_all[, param_name]))
@@ -1357,6 +1345,7 @@ summarize_vs_truth <- function(fit, truth) {
       Parameter    = param_name,
       Truth        = true_val,
       Mean         = mean(draws, na.rm = TRUE),
+      Median       = stats::median(draws, na.rm = TRUE),
       `Lower 2.5%` = q[[1]],
       `Upper 97.5%`= q[[2]],
       Covered      = true_val >= q[[1]] && true_val <= q[[2]],
@@ -1396,9 +1385,7 @@ run_USCR <- function(out,
                      buffer_p = 0.99,
                      buffer_multiplier = 1.05,
                      buffer_safety_factor = 1.01,
-                     max_adapt_rounds = NULL,
-                     iter_cap = NULL,
-                     M_cap = NULL,
+                     max_adapt_rounds = 6,
                      parallel_chains = TRUE,
                      status_callback = NULL,
                      seed = NULL,
@@ -1430,7 +1417,7 @@ run_USCR <- function(out,
                                 settings_burnin,
                                 settings_thin,
                                 settings_buffer_m,
-                                area_mi2 = NA_real_) {
+                                area_km2 = NA_real_) {
     list(
       method = "USCR",
       samples_list = samples_list,
@@ -1444,8 +1431,6 @@ run_USCR <- function(out,
         iter = settings_iter,
         burnin = settings_burnin,
         thin = settings_thin,
-        iter_cap = iter_cap,
-        M_cap = M_cap,
         n_chains = n_chains,
         compute_WAIC = compute_WAIC,
         diagnostic_mode = diagnostic_mode,
@@ -1457,7 +1442,7 @@ run_USCR <- function(out,
         buffer_m = settings_buffer_m,
         buffer_p = buffer_p,
         buffer_multiplier = buffer_multiplier,
-        area_mi2 = area_mi2,
+        area_km2 = area_km2,
         log_sigma_mean = log_sigma_mean,
         log_sigma_sd = log_sigma_sd,
         log_lam0_mean = log_lam0_mean,
@@ -1489,18 +1474,10 @@ run_USCR <- function(out,
   thin <- as.integer(max(1, thin))
   n_chains <- as.integer(max(1, n_chains))
   M <- as.integer(max(1, M))
-  if (!is.null(iter_cap)) {
-    iter_cap <- as.integer(max(1, iter_cap))
-    iter <- min(iter, iter_cap)
-  }
-  if (!is.null(M_cap)) {
-    M_cap <- as.integer(max(1, M_cap))
-    M <- min(M, M_cap)
-  }
 
   base_monitors <- c(
     "log_sigma", "log_lam_0", "psi", "sd_eps",
-    "sigma", "lam_0", "N", "D_mi2",
+    "sigma", "lam_0", "N", "D",
     "sum_obs", "sum_sim", "bp"
   )
   latent_monitors <- c("z", "hrc", "eps")
@@ -1524,6 +1501,11 @@ run_USCR <- function(out,
   round_log <- list()
   current_rhat <- Inf
   round_i <- 0L
+  hit_max_adapt_rounds <- FALSE
+  unmet_checks <- character(0)
+  if (!is.null(max_adapt_rounds)) {
+    max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
+  }
   prev_elapsed_min <- NULL
   prev_iter <- NULL
   fit <- NULL
@@ -1535,15 +1517,6 @@ run_USCR <- function(out,
     round_i <- round_i + 1L
 
     if (!isTRUE(adaptive) && round_i > 1L) {
-      break
-    }
-
-    if (!is.null(max_adapt_rounds) && round_i > as.integer(max_adapt_rounds)) {
-      warning(
-        "USCR reached max_adapt_rounds = ",
-        max_adapt_rounds,
-        " before both the Rhat and M checks cleared. Proceeding with the latest fit."
-      )
       break
     }
 
@@ -1638,20 +1611,33 @@ run_USCR <- function(out,
       break
     }
 
+    # Stop here (before growing iter/M/buffer) so the reported settings match
+    # the last fit.
+    if (!is.null(max_adapt_rounds) && round_i >= max_adapt_rounds) {
+      hit_max_adapt_rounds <- TRUE
+      unmet_checks <- c(
+        if (!converged) "Rhat",
+        if (M_too_small) "M",
+        if (buffer_too_small) "state-space buffer"
+      )
+      warning(
+        "USCR stopped after max_adapt_rounds = ",
+        max_adapt_rounds,
+        " without passing these checks: ",
+        paste(unmet_checks, collapse = ", "),
+        ". Proceeding with the latest fit."
+      )
+      break
+    }
+
     if (!converged) {
       current_iter <- current_iter * 2L
       current_burnin <- current_burnin * 2L
       current_thin <- current_thin * 2L
-      if (!is.null(iter_cap)) {
-        current_iter <- min(current_iter, iter_cap)
-      }
     }
 
     if (M_too_small) {
       current_M <- current_M * 2L
-      if (!is.null(M_cap)) {
-        current_M <- min(current_M, M_cap)
-      }
     }
 
     if (buffer_too_small) {
@@ -1659,7 +1645,7 @@ run_USCR <- function(out,
     }
   }
 
-  build_uscr_result(
+  result <- build_uscr_result(
     fit_objects = fit,
     samples_list = samples_list,
     samples_all = samples_all,
@@ -1670,8 +1656,11 @@ run_USCR <- function(out,
     settings_burnin = current_burnin,
     settings_thin = current_thin,
     settings_buffer_m = current_buffer_m,
-    area_mi2 = const$area_mi2
+    area_km2 = const$area_km2
   )
+  result$hit_max_adapt_rounds <- hit_max_adapt_rounds
+  result$unmet_checks <- unmet_checks
+  result
 }
 
 # -------------------------------------------------------------------
