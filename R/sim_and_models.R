@@ -37,7 +37,10 @@ tte_detection_radius_multiplier <- function(theta_deg) {
 #     points are a Poisson process with density D over exactly the model's
 #     state space (the union of circles of radius `buffer` around cameras).
 #   - Counts: y_j ~ Poisson(days_j * sum_i lambda0 * exp(-d_ij^2 / (2 sigma^2))
-#     * exp(eps_j)), with camera-level noise eps_j ~ Normal(0, sd_eps).
+#     * exp(use_eps * eps_j)), with camera-level noise eps_j ~ Normal(0, sd_eps)
+#     and use_eps = 1 when camera_noise is on, 0 when off. eps is always
+#     drawn, so the same seed gives the same activity centers and counts
+#     (apart from the noise) with noise on or off, mirroring the model.
 # All distances are in km internally; buffer_m and sigma_m are in metres.
 simulate_camera_counts <- function(n_side   = 5,
                                    spacing_m = 300,
@@ -47,7 +50,8 @@ simulate_camera_counts <- function(n_side   = 5,
                                    home_range_km2 = 0.89,
                                    sigma_m   = NULL,
                                    buffer_m  = NULL,
-                                   sd_eps    = 0,
+                                   sd_eps    = 1,
+                                   camera_noise = FALSE,
                                    seed      = 1) {
   if (n_side < 2 || days < 1 || spacing_m <= 0) {
     stop("USCR simulator needs at least a 2 x 2 grid, positive spacing, and at least 1 day.",
@@ -98,7 +102,8 @@ simulate_camera_counts <- function(n_side   = 5,
   camera_days <- rep(as.numeric(days), J)
   Lambda <- colSums(lambda0 * exp(-dist2 / (2 * sigma_km^2)))  # per day, per camera
   eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
-  mu <- camera_days * Lambda * exp(eps)
+  use_eps <- as.numeric(isTRUE(camera_noise))
+  mu <- camera_days * Lambda * exp(use_eps * eps)
   camera_counts <- stats::rpois(J, mu)
 
   area_km2 <- uscr_buffered_area_km2(cam, buffer_km)
@@ -119,6 +124,7 @@ simulate_camera_counts <- function(n_side   = 5,
       sigma_m   = sigma_m,
       buffer_m  = buffer_m,
       sd_eps    = sd_eps,
+      camera_noise = isTRUE(camera_noise),
       days      = days,
       spacing_m = spacing_m,
       n_side    = n_side,
@@ -167,7 +173,8 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
                                      detection_radius_m = 12,
                                      theta_deg = 55,
                                      v_km_day = 4,
-                                     sd_eps = 0.2,
+                                     sd_eps = 1,
+                                     camera_noise = FALSE,
                                      seed = 1) {
   model <- match.arg(model)
   quiet_require("dplyr")
@@ -191,16 +198,19 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
   J <- nrow(out)
   camera_days <- rep(as.numeric(days), J)
   r_km <- rep(detection_radius_m / 1000, J)
+  # Camera-level noise is always drawn and multiplied by use_eps (0 or 1), so
+  # the same seed gives the same data apart from the noise, mirroring the model.
   eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
+  use_eps <- as.numeric(isTRUE(camera_noise))
   
   if (identical(model, "REM")) {
     theta_rad <- theta_deg * pi / 180
-    lambda <- ((2 + theta_rad) / pi) * v_km_day * r_km * D_per_km2 * camera_days * exp(eps)
+    lambda <- ((2 + theta_rad) / pi) * v_km_day * r_km * D_per_km2 * camera_days * exp(use_eps * eps)
   } else {
     area_km2 <- pi * r_km^2 * theta_deg / 360
     time_unit <- tte_detection_radius_multiplier(theta_deg) * r_km / v_km_day
     tte_units <- camera_days / time_unit
-    lambda <- D_per_km2 * tte_units * area_km2 * exp(eps)
+    lambda <- D_per_km2 * tte_units * area_km2 * exp(use_eps * eps)
   }
   
   camera_counts <- stats::rpois(J, lambda = lambda)
@@ -217,6 +227,7 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
       theta_deg = theta_deg,
       v_km_day = v_km_day,
       sd_eps = sd_eps,
+      camera_noise = isTRUE(camera_noise),
       seed = seed,
       n_cams = J,
       n_side = n_side,
@@ -756,6 +767,7 @@ run_REM <- function(y,
                     rhat_target = 1.1,
                     max_adapt_rounds = 6,
                     density_prior = NULL,
+                    camera_noise = FALSE,
                     parallel_chains = TRUE,
                     status_callback = NULL,
                     seed = NULL,
@@ -791,7 +803,7 @@ run_REM <- function(y,
       eps[j] ~ dnorm(0, sd = sd_eps)
       
       log(lambda[j]) <- log(2 + theta[j]) - log(pi_const) + log(v) +
-        log(r[j]) + log(D) + log(camera_days[j]) + eps[j]
+        log(r[j]) + log(D) + log(camera_days[j]) + use_eps * eps[j]
       
       y[j]     ~ dpois(lambda[j])
       y_sim[j] ~ dpois(lambda[j])
@@ -815,15 +827,17 @@ run_REM <- function(y,
     log_v_mean = log_v_mean,
     log_v_sd   = log_v_sd,
     sd_eps_shape = sd_eps_shape,
-    sd_eps_rate  = sd_eps_rate
+    sd_eps_rate  = sd_eps_rate,
+    use_eps    = as.numeric(isTRUE(camera_noise))
   )
   
   Data <- list(y = as.numeric(y))
   
-  monitors <- c("D", "v", "sd_eps",
+  # sd_eps is only meaningful (and only monitored) with camera-level noise on.
+  monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
                 "bp", "sum_obs", "sum_sim")
 
-  run_encounter_rate_model(
+  fit <- run_encounter_rate_model(
     method = "REM",
     code = code,
     constants = Const,
@@ -844,6 +858,8 @@ run_REM <- function(y,
     seed = seed,
     verbose = verbose
   )
+  fit$settings$camera_noise <- isTRUE(camera_noise)
+  fit
 }
 
 # -------------------------------------------------------------------
@@ -867,6 +883,7 @@ run_TTE <- function(y,
                     rhat_target = 1.1,
                     max_adapt_rounds = 6,
                     density_prior = NULL,
+                    camera_noise = FALSE,
                     parallel_chains = TRUE,
                     status_callback = NULL,
                     seed = NULL,
@@ -905,7 +922,7 @@ run_TTE <- function(y,
       
       eps[j] ~ dnorm(0, sd = sd_eps)
       
-      log(lambda[j]) <- log(D) + log(tte_units[j]) + log(a[j]) + eps[j]
+      log(lambda[j]) <- log(D) + log(tte_units[j]) + log(a[j]) + use_eps * eps[j]
       
       y[j]     ~ dpois(lambda[j])
       y_sim[j] ~ dpois(lambda[j])
@@ -930,16 +947,18 @@ run_TTE <- function(y,
     log_v_sd    = log_v_sd,
     sd_eps_shape = sd_eps_shape,
     sd_eps_rate  = sd_eps_rate,
+    use_eps     = as.numeric(isTRUE(camera_noise)),
     theta       = as.numeric(theta_deg),
     angle_mult  = tte_detection_radius_multiplier(theta_deg)
   )
   
   Data <- list(y = as.numeric(y))
   
-  monitors <- c("D", "v", "sd_eps",
+  # sd_eps is only meaningful (and only monitored) with camera-level noise on.
+  monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
                 "bp", "sum_obs", "sum_sim")
 
-  run_encounter_rate_model(
+  fit <- run_encounter_rate_model(
     method = "TTE",
     code = code,
     constants = Const,
@@ -960,6 +979,8 @@ run_TTE <- function(y,
     seed = seed,
     verbose = verbose
   )
+  fit$settings$camera_noise <- isTRUE(camera_noise)
+  fit
 }
 
 # -------------------------------------------------------------------
@@ -1439,7 +1460,10 @@ build_uscr_code <- function() {
     for (j in 1:J) {
       eps[j] ~ dnorm(0, sd = sd_eps)
       Lambda[j] <- sum(lambda[1:M, j])
-      log(mu[j]) <- log(Lambda[j]) + log(days_per_cam[j]) + eps[j]
+      # Camera-level noise (Poisson-lognormal) only when use_eps = 1. With
+      # use_eps = 0, eps and sd_eps are sampled from their priors but don't
+      # affect the data, and they are not monitored.
+      log(mu[j]) <- log(Lambda[j]) + log(days_per_cam[j]) + use_eps * eps[j]
 
       y[j] ~ dpois(mu[j])
       y_sim[j] ~ dpois(mu[j])
@@ -1472,7 +1496,8 @@ make_uscr_constants <- function(out,
                                 sd_eps_rate,
                                 buffer_m,
                                 psi_a = 1,
-                                psi_b = 1) {
+                                psi_b = 1,
+                                camera_noise = FALSE) {
   ss <- uscr_state_space_and_area(
     out,
     buffer_m = buffer_m,
@@ -1495,7 +1520,8 @@ make_uscr_constants <- function(out,
     sd_eps_shape = sd_eps_shape,
     sd_eps_rate = sd_eps_rate,
     psi_a = psi_a,
-    psi_b = psi_b
+    psi_b = psi_b,
+    use_eps = as.numeric(isTRUE(camera_noise))
   )
 
   const$days_per_cam <- as.numeric(camera_days)
@@ -1698,6 +1724,20 @@ extract_param_draws <- function(samples_all, param_name) {
   NULL
 }
 
+# Posterior predictive check. The Bayesian p-value is the posterior mean of
+# bp = step(sum_sim - sum_obs), comparing a Pearson discrepancy for the
+# observed counts with one for counts simulated from the fitted model. Values
+# near 0 mean the observed counts vary more than the model expects (e.g.
+# overdispersion); values near 1 mean they vary less. The check "fails" when
+# the p-value falls outside [lower, upper].
+ppc_summary <- function(fit, lower = 0.05, upper = 0.95) {
+  if (is.null(fit) || is.null(fit$samples_all) || !"bp" %in% colnames(fit$samples_all)) {
+    return(NULL)
+  }
+  p <- mean(fit$samples_all[, "bp"], na.rm = TRUE)
+  list(p = p, fail = is.finite(p) && (p < lower || p > upper), lower = lower, upper = upper)
+}
+
 # Build a truth-vs-estimate table for the power-analysis blocks.
 # truth: named list, e.g. list(D_km2 = 25, sigma = 0.217, lam_0 = 0.2)
 summarize_vs_truth <- function(fit, truth) {
@@ -1751,6 +1791,7 @@ run_USCR <- function(out,
                      diagnostic_mode = FALSE,
                      rhat_target = 1.1,
                      density_prior = NULL,
+                     camera_noise = FALSE,
                      M_check_fraction = 0.9,
                      M_check_prob = 0.01,
                      buffer_p = 0.99,
@@ -1855,12 +1896,14 @@ run_USCR <- function(out,
   }
   prior_design <- NULL
 
+  # sd_eps and eps are only meaningful (and only monitored) with camera-level
+  # noise on.
   base_monitors <- c(
-    "log_sigma", "log_lam_0", "psi", "sd_eps",
+    "log_sigma", "log_lam_0", "psi", if (isTRUE(camera_noise)) "sd_eps",
     "sigma", "lam_0", "N", "D",
     "sum_obs", "sum_sim", "bp"
   )
-  latent_monitors <- c("z", "hrc", "eps")
+  latent_monitors <- c("z", "hrc", if (isTRUE(camera_noise)) "eps")
   final_monitors <- if (isTRUE(diagnostic_mode)) {
     c(base_monitors, latent_monitors)
   } else {
@@ -1932,7 +1975,8 @@ run_USCR <- function(out,
       sd_eps_rate = sd_eps_rate,
       buffer_m = current_buffer_m,
       psi_a = prior_design$a,
-      psi_b = prior_design$b
+      psi_b = prior_design$b,
+      camera_noise = camera_noise
     )
 
     data_list <- list(
@@ -2066,6 +2110,7 @@ run_USCR <- function(out,
   result$hit_max_adapt_rounds <- hit_max_adapt_rounds
   result$unmet_checks <- unmet_checks
   result$density_prior <- prior_design  # the prior used in the final round
+  result$settings$camera_noise <- isTRUE(camera_noise)
   result
 }
 
