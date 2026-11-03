@@ -241,7 +241,7 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
 }
 
 # -------------------------------------------------------------------
-# 2. NPS inputs: format deployments + images as in the Rmd
+# 2. Uploaded data: per-camera counts and effort for the models
 # -------------------------------------------------------------------
 build_nps_model_inputs <- function(
     deployments,
@@ -250,26 +250,22 @@ build_nps_model_inputs <- function(
     max_days = NULL
     ) {
   quiet_require("dplyr")
-  quiet_require("tidyr")
   quiet_require("sf")
-  quiet_require("lubridate")
-  quiet_require("tibble")
 
-  # This assumes format_deployments() is defined in data_checks.R
-  if (!exists("format_deployments")) {
-    stop("format_deployments() not found. Source data_checks.R first.",
-         call. = FALSE)
-  }
+  # Each camera's analysis window (start/end date-times, optional trim) comes
+  # from analysis_windows() in R/data_checks.R; check_deployments() has
+  # already blocked any window with no time in it.
+  windows <- analysis_windows(deployments, max_days = max_days)
+  deps <- deployments |>
+    dplyr::mutate(
+      window_start = windows$window_start,
+      window_end   = windows$window_end,
+      window_days  = windows$days
+    )
 
-  deps <- format_deployments(deployments, max_days = max_days)
-
-  # Timestamp is already parsed to POSIXct in check_images() before
-  # images_checked() is ever set, so no re-parsing is needed here.
-
-  # Latitude/Longitude presence and validity are already enforced as a hard
-  # stop in check_deployments() at upload time, so all that's needed here is
-  # numeric coercion (deployment$Longitude/Latitude may still be character
-  # columns coming out of CSV import even though every value parses cleanly).
+  # check_images() has already parsed every Timestamp to POSIXct.
+  # Latitude/Longitude are validated in check_deployments(), but may still be
+  # character columns from the CSV import.
   deps <- deps |>
     dplyr::mutate(
       Longitude = as.numeric(Longitude),
@@ -303,141 +299,46 @@ build_nps_model_inputs <- function(
                  mean(range(utm_coords[, "Y"], na.rm = TRUE))) / 1000
     )
 
-  # Grouping by Site Name and Cluster ID together (rather than Cluster ID
-  # alone) means a Cluster ID that happens to appear at more than one site
-  # (e.g. an event-numbering scheme that isn't actually unique per camera)
-  # produces separate groups per site instead of silently merging their
-  # detections under one site. check_images() also flags this case directly
-  # at upload time.
-  seqs <- images |>
+  # One event per Site Name + Cluster ID (grouping by both keeps a Cluster ID
+  # reused at two sites from merging). An event counts if its first image falls
+  # inside the camera's analysis window; its count is the largest Sighting
+  # Count in the event, and the part of its duration inside the window is
+  # removed from the camera's effort.
+  events <- images |>
     dplyr::filter(Species == species_to_analyze) |>
     dplyr::group_by(`Site Name`, `Cluster ID`) |>
     dplyr::summarise(
-      detection_date = lubridate::date(min(Timestamp)),
-      species_count  = max(as.numeric(`Sighting Count`), na.rm = TRUE),
-      start          = min(Timestamp),
-      end            = max(Timestamp),
-      .groups        = "drop"
+      species_count = max(as.numeric(`Sighting Count`), na.rm = TRUE),
+      start         = min(Timestamp),
+      end           = max(Timestamp),
+      .groups       = "drop"
     ) |>
+    dplyr::inner_join(
+      dplyr::select(deps, `Site Name`, window_start, window_end),
+      by = "Site Name"
+    ) |>
+    dplyr::filter(start >= window_start, start <= window_end) |>
     dplyr::mutate(
-      cluster_length_days = as.numeric(difftime(end, start, units = "days"))
-    )
-
-  # Parse Start/End Date into real Date columns, carried on deps from here
-  # on (through the join into `out` below) so they only need to be parsed
-  # once. A plain as.Date() with a fixed format is sufficient here: format_
-  # deployments() always re-normalizes End Date to mm/dd/yyyy, and
-  # check_deployments() now hard-stops any Start Date/End Date that isn't
-  # already in that format, so nothing reaches this function needing a
-  # more permissive multi-format parser.
-  deps <- deps |>
-    dplyr::mutate(
-      Start_Date_parsed = as.Date(`Start Date`, format = "%m/%d/%Y"),
-      End_Date_parsed   = as.Date(`End Date`,   format = "%m/%d/%Y")
-    )
-
-
-  min_start <- min(deps$Start_Date_parsed, na.rm = TRUE)
-  max_end   <- max(deps$End_Date_parsed, na.rm = TRUE)
-
-  # Zero-count rows across all sites × all days in deployment window
-  zero_counts <- expand.grid(
-    `Site Name` = unique(deps$`Site Name`),
-    detection_date = seq(
-      from = min_start,
-      to   = max_end,
-      by   = "day"
-    )
-  ) |>
-    dplyr::mutate(
-      species_count       = 0,
-      cluster_length_days = 0
-    )
-
-  counts_time <- seqs |>
-    dplyr::bind_rows(zero_counts) |>
-    dplyr::group_by(`Site Name`, detection_date) |>
+      event_days = as.numeric(difftime(pmin(end, window_end), start, units = "days"))
+    ) |>
+    dplyr::group_by(`Site Name`) |>
     dplyr::summarise(
-      detections       = sum(species_count),
-      camera_time_days = sum(cluster_length_days),
-      .groups          = "drop"
+      events_count = sum(species_count),
+      event_days   = sum(event_days),
+      .groups      = "drop"
     )
 
-  counts <- counts_time |>
-    dplyr::select(-camera_time_days) |>
-    tidyr::pivot_wider(
-      names_from  = detection_date,
-      values_from = detections,
-      values_fill = 0,
-      names_sort  = TRUE
-    )
-
-  out <- counts |>
-    dplyr::left_join(deps, by = "Site Name")
-
-  detection_matrix <- counts |>
-    tibble::column_to_rownames("Site Name") |>
-    as.matrix()
-
-  camera_time_matrix <- counts_time |>
-    dplyr::select(-detections) |>
-    tidyr::pivot_wider(
-      names_from  = detection_date,
-      values_from = camera_time_days,
-      values_fill = 0,
-      names_sort  = TRUE
-    ) |>
-    tibble::column_to_rownames("Site Name") |>
-    as.matrix()
-
-  # Create Start Index and End Index columns
-  # These map each camera's deployment dates to column indices in the detection matrix.
-  # Derived directly from detection_matrix's own column names (rather than an
-  # independently-sorted copy of counts_time$detection_date) so all_dates[k]
-  # is guaranteed to be the date of column k by construction, not by relying
-  # on pivot_wider's string-based names_sort happening to agree with a
-  # separate chronological Date sort.
-  all_dates <- as.Date(colnames(detection_matrix))
-
-  # Start_Date_parsed/End_Date_parsed already arrived on `out` via the
-  # left_join(deps, ...) above, so no re-parsing is needed here.
-  out <- out |>
-    dplyr::rowwise() |>
+  out <- deps |>
+    dplyr::left_join(events, by = "Site Name") |>
     dplyr::mutate(
-      `Start Index` = {
-        idx <- which(all_dates == Start_Date_parsed)
-        if (length(idx) > 0) idx[1] else 1L
-      },
-      `End Index` = {
-        idx <- which(all_dates == End_Date_parsed)
-        if (length(idx) > 0) idx[1] else length(all_dates)
-      }
-    ) |>
-    dplyr::ungroup() |>
-    dplyr::select(-Start_Date_parsed, -End_Date_parsed)
-
-  camera_counts <- camera_days <- numeric(nrow(out))
-
-  for (i in seq_len(nrow(out))) {
-    idx_start <- out$`Start Index`[i]
-    idx_end   <- out$`End Index`[i]
-
-    if (idx_start > idx_end || idx_start < 1 || idx_end > ncol(detection_matrix)) {
-      warning("Invalid indices for camera ", i, ": Start=", idx_start, ", End=", idx_end)
-      camera_counts[i] <- 0
-      camera_days[i]   <- 0
-      next
-    }
-
-    camera_counts[i] <- sum(detection_matrix[i, idx_start:idx_end])
-    camera_days[i]   <- length(idx_start:idx_end) -
-      sum(camera_time_matrix[i, idx_start:idx_end])
-  }
+      events_count = dplyr::coalesce(events_count, 0),
+      event_days   = dplyr::coalesce(event_days, 0)
+    )
 
   list(
-    out           = out,
-    camera_counts = camera_counts,
-    camera_days   = camera_days
+    out           = dplyr::select(out, -events_count, -event_days),
+    camera_counts = out$events_count,
+    camera_days   = out$window_days - out$event_days
   )
 }
 

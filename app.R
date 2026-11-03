@@ -494,6 +494,38 @@ ui <- page_fillable(
     fg = redwood_colors[1]         # #303018 - dark brown/green
   ),
   tags$head(
+    # Shiny hides each file input's real <input> 99,999 px off the top of the
+    # page. When a file dialog closes, Safari focuses that input and scrolls
+    # to it, jumping to the top of the tab. Keeping the hidden input in place
+    # (invisible) next to its Browse button avoids the jump. The custom
+    # message clears a file input's display (used when an upload is reset).
+    tags$script(HTML("
+      function deerPinFileInputs() {
+        document.querySelectorAll('input[type=\"file\"]').forEach(function (el) {
+          ['top', 'left'].forEach(function (p) { el.style.setProperty(p, '0', 'important'); });
+          el.style.setProperty('width', '1px', 'important');
+          el.style.setProperty('height', '1px', 'important');
+          el.style.setProperty('opacity', '0', 'important');
+          el.style.setProperty('pointer-events', 'none', 'important');
+        });
+      }
+      document.addEventListener('DOMContentLoaded', deerPinFileInputs);
+      $(document).on('shiny:connected', function () {
+        deerPinFileInputs();
+        Shiny.addCustomMessageHandler('reset_file_input', function (id) {
+          var el = document.getElementById(id);
+          if (!el) return;
+          el.value = '';
+          var group = el.closest('.input-group');
+          if (group) {
+            var text = group.querySelector('input[type=\"text\"]');
+            if (text) text.value = '';
+          }
+          var bar = document.getElementById(id + '_progress');
+          if (bar) bar.style.visibility = 'hidden';
+        });
+      });
+    ")),
     tags$script(src = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"),
     tags$script(HTML("
       window.MathJax = {
@@ -1035,105 +1067,119 @@ ui <- page_fillable(
       "Add your data",
       markdown(paste(
         "Upload a **deployment CSV** (where and when cameras were set and recording) and an **images CSV** (timestamps, species, counts, and Cluster IDs).",
-        "The current upload checker expects the exact column names listed below.",
-        "",
+        "The upload checker expects the exact column names listed below.",
         sep = "\n"
       )),
       h3("The app will:"),
       markdown(paste(
-        "1. Check required columns and data types;",
-        "2. Flag image timestamps that fall outside the deployment window;",
-        "3. Optionally trim each camera deployment length to meet study design criteria.",
-        "4. Generate downloadable CSVs of data with any corrections.",
+        "1. Check required columns and data types.",
+        "2. Flag image timestamps that fall outside each camera's deployment dates.",
+        "3. Set each camera's analysis window from its deployment dates and times, optionally trimmed to a set number of days.",
+        "4. Provide downloadable CSVs of the data with any corrections.",
         "",
-        "Once data are uploaded and checked, click on the",
-        "**Model settings** tab to select the species for analysis and",
-        "configure MCMC and priors. Once you are satisfied with model",
-        "settings, you run models in the **USCR model**, **REM model**, and **TTE model** tabs.",
+        "After the data are uploaded and checked, review them in the **Data summary** tab.",
+        "Then choose the species to analyze, and any non-default priors, in the **Model settings** tab,",
+        "and run the models in the **USCR model**, **REM model**, and **TTE model** tabs.",
         "",
         "---",
         "",
         "## Required data columns",
         "",
-        "### Deployment file columns (**bold = required**, others optional for quality control):",
+        "### Deployment file columns (**bold = required**, others optional for quality control)",
         "",
-        "- **`Site Name`** — Camera site identifier. Must be unique across all rows in the deployment file.",
-        "- `Site` — Optional broader site identifier",
-        "- `Camera ID` — Optional camera identifier",
-        "- `SD Card ID` — Optional SD card identifier",
-        "- **`Start Date`** — Deployment start date (`MM/DD/YYYY`)",
-        "- **`Start Time`** — Deployment start time (`HH:MM` or `HH:MM:SS`, 24h)",
-        "- **`End Date`** — Deployment end date (`MM/DD/YYYY`)",
-        "- **`End Time`** — Deployment end time (`HH:MM` or `HH:MM:SS`, 24h)",
-        "- **`Latitude`** — Camera latitude (decimal degrees, WGS84 / GPS coordinates — the standard datum used by GPS devices and phones worldwide). The app auto-corrects the sign to match the hemisphere selected in **Model settings** (under Default camera geometry).",
-        "- **`Longitude`** — Camera longitude (decimal degrees, WGS84). The app auto-corrects the sign to match the hemisphere selected in **Model settings** (under Default camera geometry).",
-        "- `Camera Model` — Optional camera make/model field for recordkeeping (for example `Browning Strike Force Pro`)",
-        "- `Camera Detection Angle` — Optional full detection angle in degrees for that camera. If left blank, the app uses the default angle from Model settings.",
-        "- `Camera Height` — Optional camera height (meters)",
-        "- `Camera Orientation` — Optional cardinal direction (for example `N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, `NW`) or 0-359 degrees",
-        "- **`Camera Functioning`** — Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted",
-        "- **`Camera Malfunction Date`** — Keep this value blank for cameras that did not malfunction. If the camera failed (stopped working, or was knocked out of position but kept taking pictures), set Camera Functioning to `No` and enter the **first date whose data should be discarded** (`MM/DD/YYYY`). The day before this date becomes the camera's last day in the analysis, and images from this date onward are excluded.",
-        "- **`Detection Distance`** — Effective detection radius in meters",
+        "- **`Site Name`**: Camera site identifier. Must be unique across all rows in the deployment file.",
+        "- `Site`: Optional broader site identifier.",
+        "- `Camera ID`: Optional camera identifier.",
+        "- `SD Card ID`: Optional SD card identifier.",
+        "- **`Start Date`**: Deployment start date (`MM/DD/YYYY`).",
+        "- **`Start Time`**: Deployment start time (`HH:MM` or `HH:MM:SS`, 24-hour). If blank or unreadable, the camera's analysis window starts at midnight at the end of Start Date, so no time before the camera was set is counted.",
+        "- **`End Date`**: Deployment end date (`MM/DD/YYYY`).",
+        "- **`End Time`**: Deployment end time (`HH:MM` or `HH:MM:SS`, 24-hour). If blank or unreadable, the analysis window ends at midnight at the start of End Date, so no time after the camera was picked up is counted.",
+        "- **`Latitude`**: Camera latitude (decimal degrees, WGS84, the standard datum used by GPS devices and phones). The app corrects the sign to match the hemisphere selected in **Model settings** (under Default camera geometry).",
+        "- **`Longitude`**: Camera longitude (decimal degrees, WGS84). The app corrects the sign to match the hemisphere selected in **Model settings** (under Default camera geometry).",
+        "- `Camera Model`: Optional camera make and model, for recordkeeping (for example, `Browning Strike Force Pro`).",
+        "- `Camera Detection Angle`: Optional full detection angle in degrees for that camera (greater than 0 and at most 360). If left blank, the app uses the default angle from **Model settings**.",
+        "- `Camera Height`: Optional camera height (meters).",
+        "- `Camera Orientation`: Optional cardinal direction (`N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, or `NW`) or 0-359 degrees.",
+        "- **`Camera Functioning`**: Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted.",
+        "- **`Camera Malfunction Date`**: Leave blank for cameras that did not malfunction. If the camera failed (stopped working, or was knocked out of position but kept taking pictures), set Camera Functioning to `No` and enter the **first date whose data should be discarded** (`MM/DD/YYYY`). The camera's analysis window ends at midnight at the start of this date, so images from this date onward are excluded.",
+        "- **`Detection Distance`**: Effective detection radius in meters.",
         "",
-        "### **Images file** required columns:",
+        "### Images file columns (all required unless marked optional)",
         "",
-        "- **`Site Name`** — Camera site identifier. These identifiers must match identifiers in the deployment file.",
-        "- **`Timestamp`** — Image timestamp. Preferred format: `MM/DD/YYYY HH:MM:SS`.",
-        "- **`Species`** — Species identifier. Pipe-delimited values such as `deer|squirrel` are allowed for multi-species rows, and the order must match `Sighting Count`.",
-        "- **`Cluster ID`** — Identifier for an independent detection event (a \"cluster\"). Any format is accepted (text or numeric). Multiple rows can share the same Cluster ID when they belong to the same event — for example burst photos, or a multi-species image split into one row per species.",
-        "- **`Sighting Count`** — Number of individuals in the image; pipe-delimited values such as `1|3` are allowed for multi-species rows and should follow the same order as `Species`.",
-        "- `Image URL` — Optional image reference/link column. If included, store it as plain text in a single column, one value per row.",
+        "- **`Site Name`**: Camera site identifier. Must exactly match a Site Name in the deployment file.",
+        "- **`Timestamp`**: Image date and time, written as month/day/year or year-month-day, with an optional 24-hour time (for example, `MM/DD/YYYY HH:MM:SS`, `YYYY-MM-DD HH:MM`, or `2/3/25 14:05`). Two-digit years are accepted.",
+        "- **`Species`**: Species identifier. Pipe-delimited values such as `deer|squirrel` are allowed for multi-species rows; their order must match `Sighting Count`. A blank Species (for example, a trigger with no animal) is allowed, but that row isn't counted for any species.",
+        "- **`Cluster ID`**: Identifier for an independent detection event (a \"cluster\"). Any format is accepted (text or numeric). Required on every row with a Species. Multiple rows can share a Cluster ID when they belong to the same event, for example burst photos, or a multi-species image split into one row per species.",
+        "- **`Sighting Count`**: Number of individuals in the image. Pipe-delimited values such as `1|3` are allowed for multi-species rows, in the same order as `Species`. Required on every row with a Species.",
+        "- `Image URL`: Optional image reference or link, stored as plain text, one value per row.",
         "",
-        "**Notes:**",
+        "### Notes",
         "",
-        "- Deployment QC expects date-only fields in `MM/DD/YYYY`.",
-        "- Image timestamps are parsed more flexibly if needed, including 2-digit years (for example `2/3/25`).",
-        "- **Upload is blocked** if any deployment row is missing Site Name, Start Date, End Date, Latitude, or Longitude; if Start Date or End Date isn't in `MM/DD/YYYY` format, or End Date is before Start Date; if Latitude or Longitude is zero; if any Site Name is duplicated across rows; or if Camera Functioning is `No` and Camera Malfunction Date is missing, not in `MM/DD/YYYY` format, on or before Start Date, or after End Date. This is because these fields set each camera's deployment window and location, which every model depends on.",
-        "- **Upload of the images file is also blocked** if any image's Site Name doesn't exactly match a Site Name in the deployment file, or if Sighting Count has a non-numeric value; these would otherwise silently drop that camera's deployment metadata, or silently corrupt detection counts, instead of failing clearly.",
-        "- Other required (bold) fields — such as Camera Functioning and Detection Distance — are flagged in the check log as warnings but won't block the upload.",
+        "- In the check logs, ❌ marks a problem that blocks the upload, ⚠️ marks a warning to review that doesn't block it, and ℹ️ marks a note about data the models will leave out.",
+        "- **The deployment upload is blocked** if any of the following is true. These fields set each camera's analysis window and location, which every model depends on.",
+        "  - A required column is missing.",
+        "  - A Site Name is duplicated, or a row has deployment data but no Site Name.",
+        "  - Start Date or End Date is missing or not in `MM/DD/YYYY` format, or End Date is before Start Date.",
+        "  - A camera's analysis window (below) has no time in it.",
+        "  - Latitude or Longitude is missing, non-numeric, or zero.",
+        "  - Camera Functioning is `No` and Camera Malfunction Date is missing, not in `MM/DD/YYYY` format, on or before Start Date, or after End Date.",
+        "- **The images upload is blocked** if any of the following is true.",
+        "  - No deployment file has been uploaded and checked.",
+        "  - A required column is missing.",
+        "  - A Site Name is blank or doesn't exactly match a Site Name in the deployment file.",
+        "  - A Timestamp is missing or can't be read.",
+        "  - A row with a Species has a missing or non-numeric Sighting Count, or a missing Cluster ID.",
+        "  - A row's Species and Sighting Count have different numbers of pipe-delimited values.",
+        "- Other problems, such as a missing Camera Functioning or Detection Distance value, or image dates outside a camera's deployment dates, are reported as warnings.",
+        "- **Analysis window:** each camera contributes the time from its Start Date and Start Time to its End Date and End Time (or to midnight at the start of its Camera Malfunction Date), shortened by the trim if it's on. A detection event counts only if its first image is inside the window; the images check log lists events left out this way (other than by the trim), since they can point to a wrong Start or End Time. Camera effort is the length of the window in days, minus the time spent within detection events (from first to last image of each event).",
+        "- Uploading a new deployment file clears the images file; upload the images file again afterward.",
+        "- Anything that changes the data the models are fit to (uploading a file, the hemisphere settings, the species to analyze, or the deployment trim) clears existing model results on uploaded data, so results from different data are never compared or combined. Changing priors or other model settings doesn't.",
+        "- Changing the hemisphere settings in **Model settings** re-runs the checks on the uploaded files.",
+        "- Latitude/Longitude sign correction only fixes the sign; a value of `0` is still blocked, since it can't be a real coordinate.",
+        "- A Latitude/Longitude pair shared by different Site Names is flagged as a warning: two different sites shouldn't normally share the exact same coordinates.",
+        "- A `Cluster ID` that appears at more than one `Site Name` is flagged as a warning: it usually means Cluster IDs aren't unique across cameras in your export.",
+        "- Cross-year winter surveys (for example, `12/2025` to `01/2026`) are supported; the app uses the actual deployment dates and image timestamps, so no separate survey-year field is needed.",
         "- The app expects the exact column names listed above. Files from other tagging workflows can usually be renamed to match.",
-        "- Cross-year winter surveys (for example `12/2025` to `01/2026`) are supported; the app uses the actual deployment dates/times and image timestamps, so no separate `Survey Year` field is required.",
-        "- Latitude/Longitude sign auto-correction only fixes the sign to match the selected hemisphere — a value of `0` is still blocked regardless of hemisphere, since it can't be a real coordinate.",
-        "- A duplicate Latitude/Longitude pair shared across different Site Names is flagged as a warning (not blocked) in the deployment check log — worth checking, since two different sites shouldn't normally share the exact same coordinates.",
-        "- A `Cluster ID` that appears at more than one `Site Name` is flagged as a warning (not blocked) in the images check log — worth investigating since it usually means Cluster IDs aren't globally unique in your export.",
         sep = "\n"
       )),
 
       h3("Step 1: Deployment file"),
       fileInput("deployment_csv", "Upload deployment CSV", accept = ".csv"),
+      checkboxInput(
+        "apply_trim",
+        "Trim each camera's analysis window to a set number of days (24-hour periods) from its start date and time.",
+        value = TRUE
+      ),
+      conditionalPanel(
+        "input.apply_trim",
+        numericInput("trim_days", "Number of days to keep", value = 56, min = 1, step = 1)
+      ),
       h4("Deployment check log"),
       verbatimTextOutput("deployment_check_log"),
       h4("Preview of cleaned deployment data"),
       DTOutput("deployment_preview"),
       downloadButton("download_deployment_checked", "Download cleaned deployment CSV"),
+      h4("Analysis window for each camera"),
+      tags$p(
+        class = "small",
+        "The start and end date-times used in the analysis, after any missing-time, Camera Malfunction Date, and trimming adjustments. Days is the length of the window, before time spent within detection events is removed."
+      ),
+      DTOutput("deployment_windows"),
 
       hr(),
 
       h3("Step 2: Images file"),
       fileInput("images_csv", "Upload images CSV", accept = ".csv"),
-      checkboxInput(
-        "apply_56day_trim",
-        "After validation, trim each camera deployment length to a user-set number of days (counted from each camera's Start Date).",
-        value = TRUE
-      ),
-      conditionalPanel(
-        "input.apply_56day_trim",
-        numericInput(
-          "trim_days",
-          "Deployment length to keep (days)",
-          value = 56,
-          min = 1,
-          step = 1
-        )
-      ),
       h4("Images check log"),
       verbatimTextOutput("images_check_log"),
-      h4("Preview of processed images data"),
+      h4("Preview of cleaned images data"),
       DTOutput("images_preview"),
       downloadButton("download_images_checked", "Download cleaned images CSV"),
 
       hr()
     ),
+
 
     # ---------------------- DATA SUMMARY --------------------------
     nav_panel(
@@ -2370,110 +2416,157 @@ ui <- page_fillable(
   })
 
   # ================================================================
-  # NPS QC: deployment + images
+  # UPLOADED DATA: deployment + images QC (Add your data tab)
   # ================================================================
 
-  deployment_checked <- reactiveVal(NULL)
-  deployment_issues  <- reactiveVal(NULL)
-
-  observeEvent(input$deployment_csv, {
-    req(input$deployment_csv)
-
-    deployment_raw <- readr::read_csv(
-      input$deployment_csv$datapath,
-      show_col_types = FALSE
-    )
-
-    deployment_raw <- clean_deployment_import(deployment_raw)
-
-    msgs  <- character()
+  # Run a QC step, collecting its messages and warnings for the check log.
+  # Returns list(value, messages, warnings); value is NULL if the step stopped
+  # with an error, and the error text is added to the warnings.
+  run_qc_step <- function(expr) {
+    msgs <- character()
     warns <- character()
-
-    res <- tryCatch(
-      {
-        withCallingHandlers(
-          {
-            check_deployments(deployment_raw, hemisphere = input$hemisphere, lat_hemisphere = input$lat_hemisphere)
-          },
-          message = function(m) {
-            msgs  <<- c(msgs, m$message)
-            invokeRestart("muffleMessage")
-          },
-          warning = function(w) {
-            warns <<- c(warns, w$message)
-            invokeRestart("muffleWarning")
-          }
-        )
-      },
+    value <- tryCatch(
+      withCallingHandlers(
+        expr,
+        message = function(m) {
+          msgs <<- c(msgs, conditionMessage(m))
+          invokeRestart("muffleMessage")
+        },
+        warning = function(w) {
+          warns <<- c(warns, conditionMessage(w))
+          invokeRestart("muffleWarning")
+        }
+      ),
       error = function(e) {
-        deployment_checked(NULL)
-        deployment_issues(list(
-          messages = msgs,
-          warnings = c(warns, paste0("ERROR: ", e$message))
-        ))
-        return(NULL)
+        warns <<- c(warns, paste0("ERROR: ", conditionMessage(e)))
+        NULL
       }
     )
+    list(value = value, messages = msgs, warnings = warns)
+  }
 
-    if (!is.null(res)) {
-      deployment_checked(res)
-      deployment_issues(list(
-        messages = msgs,
-        warnings = warns
-      ))
-    }
-  })
-
-  output$deployment_check_log <- renderText({
-    issues <- deployment_issues()
-    req(issues)
-
-    lines <- c()
+  # Text for a check log from list(messages, warnings).
+  format_check_log <- function(issues) {
+    lines <- character()
     if (length(issues$messages)) {
-      lines <- c(lines, "Messages:",
-                 paste0("  - ", trimws(issues$messages)), "")
+      lines <- c(lines, "Messages:", paste0("  - ", trimws(issues$messages)), "")
     }
     if (length(issues$warnings)) {
-      lines <- c(lines, "Warnings / issues:",
-                 paste0("  - ", trimws(issues$warnings)))
+      lines <- c(lines, "Warnings / issues:", paste0("  - ", trimws(issues$warnings)))
     }
     if (!length(lines)) lines <- "No issues reported."
     paste(lines, collapse = "\n")
-  })
+  }
 
-  output$deployment_preview <- DT::renderDT({
-    req(deployment_checked())
-    DT::datatable(deployment_checked(), options = list(pageLength = 10))
-  })
+  # Deployment-length trim (days), or NULL when trimming is off.
+  app_trim_days <- function() {
+    if (!isTRUE(input$apply_trim)) return(NULL)
+    trim_days <- suppressWarnings(as.integer(input$trim_days))
+    if (length(trim_days) != 1 || is.na(trim_days)) trim_days <- 56L
+    max(1L, trim_days)
+  }
 
-  output$download_deployment_checked <- downloadHandler(
-    filename = function() {
-      base <- tools::file_path_sans_ext(input$deployment_csv$name)
-      paste0(base, "_CHECKED.csv")
-    },
-    content = function(file) {
-      req(deployment_checked())
-      readr::write_csv(deployment_checked(), file)
-    }
-  )
+  # Cleaned (pre-QC) uploads are kept so the checks can be re-run when the
+  # hemisphere settings change.
+  deployment_raw <- reactiveVal(NULL)
+  images_raw <- reactiveVal(NULL)
 
-  # ---- Images QC ----
-
+  deployment_checked <- reactiveVal(NULL)
+  deployment_issues <- reactiveVal(NULL)
   images_checked <- reactiveVal(NULL)
-  images_issues  <- reactiveVal(NULL)
+  images_issues <- reactiveVal(NULL)
+
+  run_deployment_check <- function() {
+    req(deployment_raw())
+    res <- run_qc_step(
+      check_deployments(
+        deployment_raw(),
+        hemisphere = input$hemisphere,
+        lat_hemisphere = input$lat_hemisphere
+      )
+    )
+    deployment_checked(res$value)
+    deployment_issues(res[c("messages", "warnings")])
+  }
+
+  run_images_check <- function() {
+    req(images_raw())
+    if (is.null(deployment_checked())) {
+      images_checked(NULL)
+      images_issues(list(
+        messages = character(),
+        warnings = "ERROR: ❌ Upload and check a deployment file before the images file."
+      ))
+      return(invisible(NULL))
+    }
+    res <- run_qc_step(check_images(images = images_raw(), deployments = deployment_checked()))
+    images_checked(res$value)
+    images_issues(res[c("messages", "warnings")])
+  }
+
+  # Model results on uploaded data are cleared whenever the data the models
+  # were fit to change (uploads, hemisphere settings, species, or trim), so
+  # the Compare & combine tab never mixes results from different data. A
+  # pop-up explains what happened. Prior and other model settings don't
+  # change the data, so they don't clear results.
+  clear_uploaded_fits <- function(reason) {
+    fits <- list(USCR = uscr_nps_fit(), REM = rem_nps_fit(), TTE = tte_nps_fit())
+    cleared <- names(fits)[!vapply(fits, is.null, logical(1))]
+    if (!length(cleared)) return(invisible(NULL))
+    uscr_nps_fit(NULL)
+    rem_nps_fit(NULL)
+    tte_nps_fit(NULL)
+    uscr_nps_debug(initial_nps_debug("USCR"))
+    rem_nps_debug(initial_nps_debug("REM"))
+    tte_nps_debug(initial_nps_debug("TTE"))
+    showModal(modalDialog(
+      title = "Model results cleared",
+      tags$p(
+        "You ", reason, ". The ", paste(cleared, collapse = ", "),
+        if (length(cleared) == 1) " result was" else " results were",
+        " fit to the previous data, so ",
+        if (length(cleared) == 1) "it was" else "they were",
+        " cleared. This keeps results from different data from being compared or combined on the ",
+        tags$strong("Compare & combine"), " tab."
+      ),
+      tags$p(
+        "Run the models again to get results for the current data. Changing priors or other model settings doesn't clear results; only changes to the data do (uploading files, the hemisphere settings, the species to analyze, or the deployment trim)."
+      ),
+      easyClose = TRUE,
+      footer = modalButton("OK")
+    ))
+  }
+
+  # A new deployment file clears the images, which were checked against the
+  # previous deployment file.
+  observeEvent(input$deployment_csv, {
+    req(input$deployment_csv)
+    raw <- readr::read_csv(input$deployment_csv$datapath, show_col_types = FALSE)
+    deployment_raw(clean_deployment_import(raw))
+    run_deployment_check()
+    clear_uploaded_fits("uploaded a new deployment file")
+
+    if (!is.null(images_raw()) || !is.null(images_checked())) {
+      images_raw(NULL)
+      images_checked(NULL)
+      images_issues(list(
+        messages = "A new deployment file was uploaded, so the images file was cleared. Upload the images file again.",
+        warnings = character()
+      ))
+      session$sendCustomMessage("reset_file_input", "images_csv")
+    }
+  })
 
   observeEvent(input$images_csv, {
     req(input$images_csv)
-
     if (is.null(deployment_checked())) {
       showNotification(
-        "Please upload and check a deployment CSV before checking images.",
+        "Please upload and check a deployment CSV before the images CSV.",
         type = "error"
       )
-      return(NULL)
+      return(invisible(NULL))
     }
-
-    images_raw <- readr::read_csv(
+    raw <- readr::read_csv(
       input$images_csv$datapath,
       show_col_types = FALSE,
       col_types = readr::cols(
@@ -2481,128 +2574,84 @@ ui <- page_fillable(
         Species = readr::col_character()
       )
     )
-
-    images_raw <- tryCatch(
-      clean_images_import(images_raw),
-      error = function(e) {
-        showNotification(
-          paste("Images file could not be processed:", e$message),
-          type = "error"
-        )
-        images_checked(NULL)
-        images_issues(list(
-          messages = character(),
-          warnings = paste0("ERROR: ", e$message)
-        ))
-        NULL
-      }
-    )
-    if (is.null(images_raw)) return(NULL)
-
-    # Re-run deployment QC with images (malfunction date rules use site overlap)
-    dep_msgs  <- character()
-    dep_warns <- character()
-    dep_res <- tryCatch(
-      {
-        withCallingHandlers(
-          {
-            check_deployments(deployment_checked(), images_raw, hemisphere = input$hemisphere, lat_hemisphere = input$lat_hemisphere)
-          },
-          message = function(m) {
-            dep_msgs <<- c(dep_msgs, m$message)
-            invokeRestart("muffleMessage")
-          },
-          warning = function(w) {
-            dep_warns <<- c(dep_warns, w$message)
-            invokeRestart("muffleWarning")
-          }
-        )
-      },
-      error = function(e) {
-        showNotification(
-          paste("Deployment re-check failed:", e$message),
-          type = "error"
-        )
-        images_checked(NULL)
-        images_issues(list(
-          messages = dep_msgs,
-          warnings = c(dep_warns, paste0("ERROR: ", e$message))
-        ))
-        return(NULL)
-      }
-    )
-
-    if (is.null(dep_res)) return(NULL)
-
-    deployment_checked(dep_res)
-    deployment_issues(list(messages = dep_msgs, warnings = dep_warns))
-
-    msgs  <- dep_msgs
-    warns <- dep_warns
-
-    checked <- NULL
-
-    res <- tryCatch(
-      {
-        withCallingHandlers(
-          {
-            checked <- check_images(
-              images         = images_raw,
-              deployments    = dep_res,
-              hemisphere     = input$hemisphere,
-              lat_hemisphere = input$lat_hemisphere
-            )
-          },
-          message = function(m) {
-            msgs  <<- c(msgs, m$message)
-            invokeRestart("muffleMessage")
-          },
-          warning = function(w) {
-            warns <<- c(warns, w$message)
-            invokeRestart("muffleWarning")
-          }
-        )
-        checked
-      },
-      error = function(e) {
-        images_checked(NULL)
-        images_issues(list(
-          messages = msgs,
-          warnings = c(warns, paste0("ERROR: ", e$message))
-        ))
-        return(NULL)
-      }
-    )
-
-    if (is.null(res)) return(NULL)
-
-    # The deployment-length trim (if enabled) is applied once, anchored on
-    # each camera's Start Date, inside build_nps_model_inputs() via
-    # format_deployments(). Images are stored here unfiltered; the trim
-    # takes effect through the per-camera Start/End Index window rather than
-    # by removing image rows at upload time.
-    images_checked(res)
-    images_issues(list(
-      messages = msgs,
-      warnings = warns
-    ))
+    cleaned <- run_qc_step(clean_images_import(raw))
+    if (is.null(cleaned$value)) {
+      images_raw(NULL)
+      images_checked(NULL)
+      images_issues(cleaned[c("messages", "warnings")])
+      return(invisible(NULL))
+    }
+    images_raw(cleaned$value)
+    run_images_check()
+    clear_uploaded_fits("uploaded a new images file")
   })
 
-  output$images_check_log <- renderText({
-    issues <- images_issues()
-    req(issues)
+  # Changing a hemisphere setting changes the Latitude/Longitude sign
+  # corrections, so re-run the checks on the uploaded data.
+  observeEvent(list(input$hemisphere, input$lat_hemisphere), {
+    if (is.null(deployment_raw())) return(invisible(NULL))
+    run_deployment_check()
+    if (!is.null(images_raw())) run_images_check()
+    clear_uploaded_fits("changed a hemisphere setting, which changes the camera coordinates")
+  }, ignoreInit = TRUE)
 
-    lines <- c()
-    if (length(issues$messages)) {
-      lines <- c(lines, "Messages:",
-                 paste0("  - ", trimws(issues$messages)), "")
+  # Species and trim changes alter the counts and camera-days the models use.
+  # The trim is debounced so typing a number of days clears results once.
+  observeEvent(input$species_to_analyze, {
+    clear_uploaded_fits("changed the species to analyze")
+  }, ignoreInit = TRUE)
+
+  trim_setting <- debounce(reactive(list(input$apply_trim, input$trim_days)), 1000)
+  observeEvent(trim_setting(), {
+    clear_uploaded_fits("changed the deployment trim")
+  }, ignoreInit = TRUE)
+
+  output$deployment_check_log <- renderText({
+    req(deployment_issues())
+    format_check_log(deployment_issues())
+  })
+
+  output$deployment_preview <- DT::renderDT({
+    req(deployment_checked())
+    DT::datatable(deployment_checked(), options = list(pageLength = 10))
+  })
+
+  # The analysis window each camera contributes (see analysis_windows()).
+  output$deployment_windows <- DT::renderDT({
+    req(deployment_checked())
+    win <- analysis_windows(deployment_checked(), max_days = app_trim_days())
+    # What set each window's start and end; a trim overrides the end.
+    flags <- cbind(
+      "Start Time missing" = win$start_time_missing,
+      "End Time missing" = win$end_time_missing & !win$trimmed,
+      "Camera malfunction" = win$malfunction & !win$trimmed,
+      "Trimmed" = win$trimmed
+    )
+    notes <- apply(flags, 1, function(f) paste(colnames(flags)[f], collapse = "; "))
+    tbl <- data.frame(
+      `Site Name` = win$`Site Name`,
+      `Window start` = format(win$window_start, "%m/%d/%Y %H:%M"),
+      `Window end` = format(win$window_end, "%m/%d/%Y %H:%M"),
+      Days = round(win$days, 2),
+      Notes = notes,
+      check.names = FALSE
+    )
+    DT::datatable(tbl, options = list(pageLength = 10), rownames = FALSE)
+  })
+
+  output$download_deployment_checked <- downloadHandler(
+    filename = function() {
+      paste0(tools::file_path_sans_ext(input$deployment_csv$name), "_CHECKED.csv")
+    },
+    content = function(file) {
+      req(deployment_checked())
+      readr::write_csv(deployment_checked(), file)
     }
-    if (length(issues$warnings)) {
-      lines <- c(lines, "Warnings / issues:",
-                 paste0("  - ", trimws(issues$warnings)))
-    }
-    if (!length(lines)) lines <- "No issues reported."
-    paste(lines, collapse = "\n")
+  )
+
+  output$images_check_log <- renderText({
+    req(images_issues())
+    format_check_log(images_issues())
   })
 
   output$images_preview <- DT::renderDT({
@@ -2612,8 +2661,7 @@ ui <- page_fillable(
 
   output$download_images_checked <- downloadHandler(
     filename = function() {
-      base <- tools::file_path_sans_ext(input$images_csv$name)
-      paste0(base, "_CHECKED.csv")
+      paste0(tools::file_path_sans_ext(input$images_csv$name), "_CHECKED.csv")
     },
     content = function(file) {
       req(images_checked())
@@ -3243,15 +3291,27 @@ ui <- page_fillable(
     if (is.null(x)) y else x
   }
 
-  uscr_nps_debug <- reactiveVal(
-    make_model_debug("USCR", "Uploaded field data", "Uploaded field data; simulated grid", "Total animal events per camera, camera-days, and buffered state space.")
-  )
-  rem_nps_debug <- reactiveVal(
-    make_model_debug("REM", "Uploaded field data", "Uploaded field data only", "REM uses total animal events per camera and camera-days.")
-  )
-  tte_nps_debug <- reactiveVal(
-    make_model_debug("TTE", "Uploaded field data", "Uploaded field data only", "TTE uses total animal events per camera and camera-days.")
-  )
+  # Starting run-status panel for each model on uploaded data.
+  initial_nps_debug <- function(model) {
+    switch(
+      model,
+      USCR = make_model_debug(
+        "USCR", "Uploaded field data", "Uploaded field data; simulated grid",
+        "Total animal events per camera, camera-days, and buffered state space."
+      ),
+      REM = make_model_debug(
+        "REM", "Uploaded field data", "Uploaded field data only",
+        "REM uses total animal events per camera and camera-days."
+      ),
+      TTE = make_model_debug(
+        "TTE", "Uploaded field data", "Uploaded field data only",
+        "TTE uses total animal events per camera and camera-days."
+      )
+    )
+  }
+  uscr_nps_debug <- reactiveVal(initial_nps_debug("USCR"))
+  rem_nps_debug <- reactiveVal(initial_nps_debug("REM"))
+  tte_nps_debug <- reactiveVal(initial_nps_debug("TTE"))
 
   # Status tracking for model runs
   uscr_nps_running <- reactiveVal(FALSE)
@@ -3259,22 +3319,12 @@ ui <- page_fillable(
   tte_nps_running <- reactiveVal(FALSE)
 
   nps_model_inputs <- reactive({
-    req(
-      deployment_checked(),
-        images_checked(),
-      !is.null(input$species_to_analyze)
-      )
-    trim_days <- NULL
-    if (isTRUE(input$apply_56day_trim)) {
-      trim_days <- input$trim_days
-      if (is.null(trim_days) || is.na(trim_days)) trim_days <- 56L
-      trim_days <- max(1L, as.integer(trim_days))
-    }
+    req(deployment_checked(), images_checked(), !is.null(input$species_to_analyze))
     build_nps_model_inputs(
       deployment_checked(),
       images_checked(),
       input$species_to_analyze,
-      max_days = trim_days
+      max_days = app_trim_days()
     )
   })
 
