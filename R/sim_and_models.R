@@ -1032,6 +1032,205 @@ uscr_state_space_and_area <- function(out,
 }
 
 # -------------------------------------------------------------------
+# USCR: density prior via psi ~ Beta(a, b)
+# -------------------------------------------------------------------
+# With data augmentation, N = sum(z[1:M]) and z[i] | psi ~ Bernoulli(psi), so
+# psi ~ Beta(a, b) gives N ~ Beta-Binomial(M, a, b), and density is
+# D = N / area_km2. a = b = 1 (psi ~ Uniform(0, 1)) is the default: a uniform
+# prior on N over 0..M.
+#
+# An informative prior is specified as a 95% interval for density
+# (animals/km^2). Beta(a, b) has two parameters, so both bounds can usually be
+# matched exactly; the prior's mean and median follow from the interval and
+# are reported back. Because M and the
+# state-space area can change between adaptive rounds, run_USCR() re-solves
+# the prior every round so the prior on density stays the same.
+#
+# Adapted from dbbinom(), bb_summary() and design_psi_prior() in the
+# Poisson_Lognormal_USCR_Simulation project, with these changes: the target is
+# the 95% interval only (the original pinned the mean and matched the interval
+# approximately); quantiles are interpolated between integer N values, so the
+# search is smooth (exact integer quantiles are piecewise constant); and misses
+# are measured as fractions of the interval's width.
+
+# Beta-Binomial(M, a, b) probability mass function
+dbbinom <- function(k, M, a, b) {
+  exp(lchoose(M, k) + lbeta(k + a, M - k + b) - lbeta(a, b))
+}
+
+# Mean, median, SD and (interpolated) 95% interval of Beta-Binomial(M, a, b)
+bb_summary <- function(M, a, b) {
+  k <- 0:M
+  p <- dbbinom(k, M, a, b)
+  p <- p / sum(p)
+  cdf <- cumsum(p)
+  q <- function(prob) {
+    stats::approx(cdf, k, xout = prob, ties = min, rule = 2)$y
+  }
+  mean_N <- sum(k * p)
+  list(
+    mean   = mean_N,
+    median = q(0.5),
+    sd     = sqrt(sum((k - mean_N)^2 * p)),
+    ci     = c(lo = q(0.025), hi = q(0.975))
+  )
+}
+
+# Check user-supplied density prior bounds. Returns NULL if valid, otherwise a
+# message suitable for showing to app users.
+uscr_check_density_prior <- function(lo, hi) {
+  vals <- suppressWarnings(as.numeric(c(lo, hi)))
+  if (length(vals) != 2L || any(!is.finite(vals))) {
+    return("Enter a lower 2.5% bound and an upper 97.5% bound for density (animals/km²).")
+  }
+  if (vals[1] < 0) {
+    return("Density prior bounds can't be negative.")
+  }
+  if (!(vals[1] < vals[2])) {
+    return("The lower 2.5% bound must be less than the upper 97.5% bound.")
+  }
+  NULL
+}
+
+# Starting M needed for an informative density prior: about 2x the prior's
+# upper (97.5%) abundance, rounded up to a multiple of 50.
+uscr_prior_start_M <- function(D_hi, area_km2) {
+  as.integer(ceiling(2 * D_hi * area_km2 / 50) * 50)
+}
+
+# Uniform prior (psi ~ Beta(1, 1)) in the same format as the informative one.
+uscr_uniform_density_prior <- function(M, area_km2) {
+  list(uniform = TRUE, a = 1, b = 1, M = as.integer(M), area_km2 = area_km2)
+}
+
+# Solve for psi ~ Beta(a, b) so that D = N / area_km2 has the requested 95%
+# prior interval, for a given M. With two Beta parameters and two targets, both
+# bounds can usually be matched exactly; the prior's mean and median then
+# follow from the interval (for strongly skewed intervals they may not be
+# where a user expects, so they are reported back).
+design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M,
+                                      miss_tolerance = 0.10) {
+  msg <- uscr_check_density_prior(D_lo, D_hi)
+  if (!is.null(msg)) stop(msg, call. = FALSE)
+  M <- as.integer(M)
+
+  N_lo <- D_lo * area_km2
+  N_hi <- D_hi * area_km2
+
+  # N can never exceed M, so the upper bound must sit below M.
+  if (N_hi >= M) {
+    stop(sprintf(paste0(
+      "The density prior's upper bound (%.3g animals/km² over a %.2f km² ",
+      "state space, about %.0f animals) needs M above %d. Increase M or lower ",
+      "the upper bound."), D_hi, area_km2, N_hi, M), call. = FALSE)
+  }
+
+  # Misses are measured as fractions of the interval's width, matching the
+  # off-target check below.
+  width <- N_hi - N_lo
+  miss_fn <- function(s) {
+    ((s$ci[["lo"]] - N_lo) / width)^2 + ((s$ci[["hi"]] - N_hi) / width)^2
+  }
+
+  # Parameterize by the Beta mean (logit scale) and concentration a + b (log
+  # scale). Start from the interval midpoint with the best concentration for
+  # that mean, then search both together.
+  p_start <- min(max(((N_lo + N_hi) / 2) / M, 1e-6), 1 - 1e-6)
+  k_start <- exp(stats::optimize(function(lk) {
+    miss_fn(bb_summary(M, p_start * exp(lk), (1 - p_start) * exp(lk)))
+  }, interval = log(c(0.01, 1e6)))$minimum)
+  obj <- function(par) {
+    p <- stats::plogis(par[1])
+    k <- exp(par[2])
+    miss_fn(bb_summary(M, p * k, (1 - p) * k))
+  }
+  opt <- stats::optim(c(stats::qlogis(p_start), log(k_start)), obj,
+                      method = "Nelder-Mead",
+                      control = list(maxit = 2000, reltol = 1e-12))
+  p <- stats::plogis(opt$par[1])
+  k <- exp(opt$par[2])
+  a <- p * k
+  b <- (1 - p) * k
+
+  s <- bb_summary(M, a, b)
+  achieved <- c(
+    lo     = s$ci[["lo"]] / area_km2,
+    hi     = s$ci[["hi"]] / area_km2,
+    mean   = s$mean / area_km2,
+    median = s$median / area_km2
+  )
+  # How far each bound moved, as a fraction of the requested interval's width
+  # (so asking for 24-26 and getting 22-28 counts as a large miss).
+  miss <- c(
+    lo = abs(achieved[["lo"]] - D_lo) / (D_hi - D_lo),
+    hi = abs(achieved[["hi"]] - D_hi) / (D_hi - D_lo)
+  )
+
+  list(
+    uniform = FALSE,
+    a = a,
+    b = b,
+    M = M,
+    area_km2 = area_km2,
+    target = c(lo = D_lo, hi = D_hi),
+    achieved = achieved,
+    miss = miss,
+    off_target = any(miss > miss_tolerance),
+    miss_tolerance = miss_tolerance
+  )
+}
+
+# One-line description of a density prior, for run-status panels.
+describe_uscr_density_prior <- function(design) {
+  if (is.null(design)) return(NULL)
+  if (isTRUE(design$uniform)) {
+    return(sprintf("Uniform (psi ~ Beta(1, 1); N uniform on 0 to M = %d)", design$M))
+  }
+  sprintf(paste0(
+    "Informative. Target 95%% interval %.3g to %.3g animals/km²; achieved ",
+    "%.3g to %.3g (mean %.3g, median %.3g) with psi ~ Beta(%.3g, %.3g), M = %d, ",
+    "state-space area %.2f km²"),
+    design$target[["lo"]], design$target[["hi"]],
+    design$achieved[["lo"]], design$achieved[["hi"]],
+    design$achieved[["mean"]], design$achieved[["median"]],
+    design$a, design$b, design$M, design$area_km2)
+}
+
+# Plot the prior on density implied by a design from design_uscr_density_prior()
+# (exact Beta-Binomial probabilities, rescaled from N to animals/km^2), with the
+# target 95% bounds (dashed) and the prior's mean (solid).
+plot_D_prior_predictive <- function(design, caption = NULL) {
+  quiet_require("ggplot2")
+  k <- 0:design$M
+  p <- dbbinom(k, design$M, design$a, design$b)
+  p <- p / sum(p)
+  cdf <- cumsum(p)
+  # Trim the far tails so the plot shows the bulk of the prior.
+  keep <- cdf >= 0.0005 & c(0, cdf[-length(cdf)]) <= 0.9995
+  df <- data.frame(D = k[keep] / design$area_km2, prob = p[keep])
+
+  fig <- ggplot2::ggplot(df, ggplot2::aes(x = D, y = prob)) +
+    ggplot2::geom_col(width = 1.02 / design$area_km2, fill = "#609048", alpha = 0.75,
+                      position = "identity")  # slight overlap avoids hairline gaps +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      x = "Density (animals/km²)",
+      y = "Prior probability",
+      title = "Prior on density implied by your inputs",
+      subtitle = "Dashed lines: your 95% interval. Solid line: the prior's mean.",
+      caption = caption
+    )
+
+  if (!is.null(design$target)) {
+    fig <- fig +
+      ggplot2::geom_vline(xintercept = design$achieved[["mean"]], color = "#303018") +
+      ggplot2::geom_vline(xintercept = design$target[c("lo", "hi")],
+                          color = "firebrick", linetype = "dashed")
+  }
+  fig
+}
+
+# -------------------------------------------------------------------
 # USCR model code builder
 # -------------------------------------------------------------------
 
@@ -1046,7 +1245,7 @@ build_uscr_code <- function() {
   nimble::nimbleCode({
     log_sigma ~ dnorm(log_sigma_mean, sd = log_sigma_sd)
     log_lam_0 ~ dnorm(log_lam0_mean, sd = log_lam0_sd)
-    psi ~ dunif(0, 1)
+    psi ~ dbeta(psi_a, psi_b)  # prior on N (and density); Beta(1, 1) = uniform
     sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
 
     sigma <- exp(log_sigma)
@@ -1104,7 +1303,9 @@ make_uscr_constants <- function(out,
                                 log_lam0_sd,
                                 sd_eps_shape,
                                 sd_eps_rate,
-                                buffer_m) {
+                                buffer_m,
+                                psi_a = 1,
+                                psi_b = 1) {
   ss <- uscr_state_space_and_area(
     out,
     buffer_m = buffer_m,
@@ -1125,7 +1326,9 @@ make_uscr_constants <- function(out,
     log_lam0_mean = log_lam0_mean,
     log_lam0_sd = log_lam0_sd,
     sd_eps_shape = sd_eps_shape,
-    sd_eps_rate = sd_eps_rate
+    sd_eps_rate = sd_eps_rate,
+    psi_a = psi_a,
+    psi_b = psi_b
   )
 
   const$days_per_cam <- as.numeric(camera_days)
@@ -1380,8 +1583,9 @@ run_USCR <- function(out,
                      compute_WAIC = TRUE,
                      diagnostic_mode = FALSE,
                      rhat_target = 1.1,
-                     psi_threshold = 0.9,
-                     psi_prob_cutoff = 0.01,
+                     density_prior = NULL,
+                     M_check_fraction = 0.9,
+                     M_check_prob = 0.01,
                      buffer_p = 0.99,
                      buffer_multiplier = 1.05,
                      buffer_safety_factor = 1.01,
@@ -1437,8 +1641,8 @@ run_USCR <- function(out,
         adaptive = adaptive,
         max_adapt_rounds = max_adapt_rounds,
         rhat_target = rhat_target,
-        psi_threshold = psi_threshold,
-        psi_prob_cutoff = psi_prob_cutoff,
+        M_check_fraction = M_check_fraction,
+        M_check_prob = M_check_prob,
         buffer_m = settings_buffer_m,
         buffer_p = buffer_p,
         buffer_multiplier = buffer_multiplier,
@@ -1474,6 +1678,15 @@ run_USCR <- function(out,
   thin <- as.integer(max(1, thin))
   n_chains <- as.integer(max(1, n_chains))
   M <- as.integer(max(1, M))
+
+  # density_prior: NULL or list(uniform = TRUE) for the default uniform prior,
+  # or list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2.
+  informative_prior <- !is.null(density_prior) && identical(density_prior$uniform, FALSE)
+  if (informative_prior) {
+    prior_msg <- uscr_check_density_prior(density_prior$lo, density_prior$hi)
+    if (!is.null(prior_msg)) stop(prior_msg, call. = FALSE)
+  }
+  prior_design <- NULL
 
   base_monitors <- c(
     "log_sigma", "log_lam_0", "psi", "sd_eps",
@@ -1520,6 +1733,26 @@ run_USCR <- function(out,
       break
     }
 
+    # Re-solve the density prior for this round's state-space area and M, so
+    # the prior on density stays fixed as the buffer and M change.
+    round_area_km2 <- uscr_state_space_and_area(
+      out,
+      buffer_m = current_buffer_m,
+      log_sigma_mean = log_sigma_mean,
+      log_sigma_sd = log_sigma_sd
+    )$area_km2
+    if (informative_prior) {
+      current_M <- max(current_M, uscr_prior_start_M(density_prior$hi, round_area_km2))
+      prior_design <- design_uscr_density_prior(
+        D_lo = density_prior$lo,
+        D_hi = density_prior$hi,
+        area_km2 = round_area_km2,
+        M = current_M
+      )
+    } else {
+      prior_design <- uscr_uniform_density_prior(current_M, round_area_km2)
+    }
+
     const <- make_uscr_constants(
       out = out,
       camera_days = camera_days,
@@ -1530,7 +1763,9 @@ run_USCR <- function(out,
       log_lam0_sd = log_lam0_sd,
       sd_eps_shape = sd_eps_shape,
       sd_eps_rate = sd_eps_rate,
-      buffer_m = current_buffer_m
+      buffer_m = current_buffer_m,
+      psi_a = prior_design$a,
+      psi_b = prior_design$b
     )
 
     data_list <- list(
@@ -1576,11 +1811,12 @@ run_USCR <- function(out,
 
     samples_list <- lapply(fit, `[[`, "samples")
     samples_all <- do.call(rbind, samples_list)
-    psi_post <- samples_all[, "psi"]
+    N_post <- samples_all[, "N"]
     sigma_post_max <- max(samples_all[, "sigma"], na.rm = TRUE)
 
     current_rhat <- safe_rhat_max(samples_list)
-    M_too_small <- mean(psi_post > psi_threshold, na.rm = TRUE) > psi_prob_cutoff
+    # M is too small if the posterior for N presses against it.
+    M_too_small <- mean(N_post > M_check_fraction * const$M, na.rm = TRUE) > M_check_prob
     converged <- is.na(current_rhat) || current_rhat <= rhat_target
 
     required_buffer_m <- uscr_buffer_from_sigma_km(sigma_post_max, p = buffer_p, multiplier = buffer_multiplier)
@@ -1590,6 +1826,8 @@ run_USCR <- function(out,
       round = round_i,
       M = const$M,
       buffer_m = current_buffer_m,
+      psi_a = prior_design$a,
+      psi_b = prior_design$b,
       niter = current_iter,
       nburnin = current_burnin,
       thin = current_thin,
@@ -1660,6 +1898,7 @@ run_USCR <- function(out,
   )
   result$hit_max_adapt_rounds <- hit_max_adapt_rounds
   result$unmet_checks <- unmet_checks
+  result$density_prior <- prior_design  # the prior used in the final round
   result
 }
 
