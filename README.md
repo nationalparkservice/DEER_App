@@ -45,7 +45,7 @@ The app checks required packages on startup and can install missing ones automat
 ```r
 install.packages(c(
   "shiny", "bslib", "shinyjs", "DT", "ggplot2", "dplyr", "tidyr",
-  "readr", "purrr", "stringr", "secr", "data.table",
+  "readr", "purrr", "stringr", "data.table",
   "leaflet", "ggrepel",
   "nimble", "MCMCvis", "lubridate"
 ))
