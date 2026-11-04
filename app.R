@@ -1163,7 +1163,7 @@ ui <- page_fillable(
       h4("Analysis window for each camera"),
       tags$p(
         class = "small",
-        "The start and end date-times used in the analysis, after any missing-time, Camera Malfunction Date, and trimming adjustments. Days is the length of the window, before time spent within detection events is removed."
+        "Each camera's analysis window runs from Start Date and Start Time to End Date and End Time. It's shortened by a missing Start Time or End Time, a Camera Malfunction Date, or the trim. Days is the length of the window, before time spent within detection events is removed."
       ),
       DTOutput("deployment_windows"),
 
@@ -1192,22 +1192,32 @@ ui <- page_fillable(
         " tab."
       ),
       h4("Site deployment summary"),
+      tags$p(
+        class = "small",
+        "Days come from each camera's analysis window (see the ",
+        tags$strong("Add your data", .noWS = "after"),
+        " tab), which runs from Start Date and Start Time to End Date and End Time. It's shortened by a missing Start Time or End Time, a Camera Malfunction Date, or the trim."
+      ),
       DTOutput("deploy_summary_table"),
       leafletOutput("camera_map", height = "300px"),
       hr(),
-      h4("Uploaded detections by species"),
+      h4("Detections by species"),
+      tags$p(
+        class = "small",
+        "Images is the number of rows for that species in the images file. Detection Events is the number of independent detections: one per Cluster ID at a camera, counted only if its first image is inside the camera's analysis window. Animals Counted adds up the animals in those detection events, taking each event's largest Sighting Count; this is the count the models use. For example, a burst of 5 photos showing 2 deer is 5 Images, 1 Detection Event, and 2 Animals Counted. Cameras with Events is the number of cameras with at least one Detection Event."
+      ),
       DTOutput("image_summary_table"),
       plotOutput("species_bar_plot", height = "300px"),
       hr(),
-      h4("Selected species detections by site"),
+      h4("Selected species by site"),
       selectInput(
         "summary_species",
         "Species to summarize",
         choices = character(0)
       ),
-      DTOutput("deer_summary_table"),
-      plotOutput("deer_bubble_plot", height = "300px"),
-      plotOutput("deer_daily_plot", height = "300px")
+      DTOutput("species_site_table"),
+      plotOutput("species_site_map", height = "300px"),
+      plotOutput("species_daily_plot", height = "300px")
     ),
 
     # ---------------------- MODEL SETTINGS -------------------------
@@ -2675,59 +2685,76 @@ ui <- page_fillable(
 
   deploy_summary <- reactive({
     req(deployment_checked())
-    summarize_deployments(deployment_checked())
+    summarize_deployments(deployment_checked(), max_days = app_trim_days())
+  })
+
+  # Legend breaks for whole-number counts: pretty() can return halves (for
+  # example 1, 1.5, 2), which don't occur in count data.
+  integer_breaks <- function(limits) {
+    breaks <- pretty(limits)
+    breaks[breaks == round(breaks)]
+  }
+
+  # Detection events in the uploaded images, counted the way the models count
+  # them (see detection_events()).
+  uploaded_events <- reactive({
+    req(deployment_checked(), images_checked())
+    detection_events(images_checked(), deployment_checked(), max_days = app_trim_days())
   })
 
   image_summary <- reactive({
-    summarize_images_by_species(images_checked())
-  })
-
-  available_species <- reactive({
     req(images_checked())
-    species <- sort(unique(images_checked()$Species))
-    species <- species[!is.na(species) & nzchar(species)]
-    species
+    summarize_species(images_checked(), uploaded_events())
   })
 
+  # Species in the uploaded images; empty when no images are loaded (for
+  # example, after a new deployment file clears them).
+  available_species <- reactive({
+    images <- images_checked()
+    if (is.null(images)) return(character(0))
+    species <- sort(unique(images$Species))
+    species[!is.na(species) & nzchar(species)]
+  })
+
+  # Refill both species dropdowns, keeping each one's current choice when
+  # that species is still in the list.
   observe({
     species <- available_species()
-    current <- isolate(input$summary_species)
-    current_analysis <- isolate(input$species_to_analyze)
-
+    keep_or_first <- function(current) {
+      if (length(current) == 1 && current %in% species) current else species[1]
+    }
     updateSelectInput(
       session,
       "summary_species",
       choices = species,
-      selected = species[1]
+      selected = keep_or_first(isolate(input$summary_species))
     )
     updateSelectInput(
       session,
       "species_to_analyze",
-      choices = species
+      choices = species,
+      selected = keep_or_first(isolate(input$species_to_analyze))
     )
   })
 
   species_objects <- reactive({
-    req(images_checked(), input$summary_species)
-
+    species_name <- req(input$summary_species)
     list(
-      species_summary = species_summary_per_site(images_checked(), input$summary_species),
-      species_counts  = species_counts_per_camera(
-        images_checked(),
-        input$summary_species,
-        deployments = deployment_checked()
+      by_camera = species_by_camera(
+        images_checked(), uploaded_events(), deployment_checked(), species_name
       ),
-      daily_species   = species_daily_detections(images_checked(), input$summary_species)
+      by_day = species_by_day(uploaded_events(), species_name)
     )
   })
 
   output$deploy_summary_table <- DT::renderDT({
     req(deploy_summary())
     summary_df <- deploy_summary() |>
+      dplyr::mutate(dplyr::across(c(mean_days, total_camera_days), \(x) round(x, 1))) |>
       dplyr::rename(
         `Number of Cameras` = n_cameras,
-        `Mean Number of Days Deployed` = mean_days,
-        `Total Number of Days Deployed` = total_camera_days
+        `Mean Days per Camera` = mean_days,
+        `Total Camera-Days` = total_camera_days
       )
     DT::datatable(
       summary_df,
@@ -2738,24 +2765,17 @@ ui <- page_fillable(
 
   output$camera_map <- leaflet::renderLeaflet({
     req(deployment_checked())
-    dep <- deployment_checked()
-
-    validate(
-      need(all(c("Longitude", "Latitude", "Site Name") %in% names(dep)),
-           "Deployment file must contain Longitude, Latitude, and Site Name.")
-    )
-
-    icon.fa <- leaflet::makeAwesomeIcon(
+    camera_icon <- leaflet::makeAwesomeIcon(
       icon = "camera", markerColor = "green",
       library = "fa", iconColor = "black"
     )
 
-    leaflet::leaflet(dep) %>%
-      leaflet::addTiles() %>%
+    leaflet::leaflet(deployment_checked()) |>
+      leaflet::addTiles() |>
       leaflet::addAwesomeMarkers(
         lng   = ~Longitude,
         lat   = ~Latitude,
-        icon  = icon.fa,
+        icon  = camera_icon,
         popup = ~as.character(`Site Name`),
         label = ~as.character(`Site Name`)
       )
@@ -2765,9 +2785,10 @@ ui <- page_fillable(
     req(image_summary())
     summary_df <- image_summary() |>
       dplyr::rename(
-        `Total Images` = total_images,
-        `Total Detections` = total_detections,
-        `Cameras with Detections` = cameras_detected
+        Images = n_images,
+        `Detection Events` = n_events,
+        `Animals Counted` = animals,
+        `Cameras with Events` = cameras
       )
     DT::datatable(
       summary_df,
@@ -2782,25 +2803,20 @@ ui <- page_fillable(
       need(nrow(df) > 0, "No images available to summarize.")
     )
 
-    ggplot(df, aes(x = reorder(Species, -total_detections),
-                   y = total_detections)) +
-      geom_bar(stat = "identity", fill = redwood_colors[3]) +
-      labs(x = "Species", y = "Total detections") +
+    ggplot(df, aes(x = reorder(Species, -animals), y = animals)) +
+      geom_col(fill = redwood_colors[3]) +
+      labs(x = "Species", y = "Animals counted") +
       theme_minimal() +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
   })
 
-  output$deer_summary_table <- DT::renderDT({
-    species_name <- req(input$summary_species)
-    species_df <- species_objects()$species_summary
-    validate(
-      need(nrow(species_df) > 0, paste0("No '", species_name, "' images found in dataset."))
-    )
-    species_df <- species_df |>
+  output$species_site_table <- DT::renderDT({
+    species_df <- species_objects()$by_camera |>
+      dplyr::select(`Site Name`, n_images, n_events, animals) |>
       dplyr::rename(
-        `Site Name` = `Site Name`,
-        `Number of Images` = images,
-        `Number of Detections` = detections
+        Images = n_images,
+        `Detection Events` = n_events,
+        `Animals Counted` = animals
       )
     DT::datatable(
       species_df,
@@ -2809,26 +2825,12 @@ ui <- page_fillable(
     )
   })
 
-  output$deer_bubble_plot <- renderPlot({
+  output$species_site_map <- renderPlot({
     species_name <- req(input$summary_species)
-    dc <- species_objects()$species_counts
-    validate(
-      need(nrow(dc) > 0, paste0("No '", species_name, "' images found in dataset."))
-    )
+    dc <- species_objects()$by_camera
 
-    validate(
-      need(
-        nrow(dc) > 0,
-        paste0(
-          "No valid site coordinates are available for the selected species. ",
-          "Check the deployment file Latitude/Longitude columns."
-        )
-      )
-    )
-
-    td_max <- max(dc$total_detections, na.rm = TRUE)
     ggplot(dc, aes(x = Longitude, y = Latitude)) +
-      geom_point(aes(size = total_detections),
+      geom_point(aes(size = animals),
                  color = redwood_colors[3], alpha = 0.7) +
       ggrepel::geom_text_repel(
         aes(label = `Site Name`),
@@ -2836,14 +2838,14 @@ ui <- page_fillable(
         max.overlaps = Inf
       ) +
       scale_size_continuous(
-        name   = paste("Total", species_name),
+        name   = "Animals counted",
         range  = c(2, 14),
         limits = c(0, NA),
-        breaks = pretty(c(0, max(1, td_max)))
+        breaks = integer_breaks
       ) +
-      coord_fixed() +
+      coord_quickmap() +
       labs(
-        title = paste("Total", species_name, "detections by site"),
+        title = paste(species_name, "counted by site"),
         x = "Longitude",
         y = "Latitude"
       ) +
@@ -2851,21 +2853,21 @@ ui <- page_fillable(
       theme(legend.position = "right")
   })
 
-  output$deer_daily_plot <- renderPlot({
+  output$species_daily_plot <- renderPlot({
     species_name <- req(input$summary_species)
-    dd <- species_objects()$daily_species
+    dd <- species_objects()$by_day
     validate(
-      need(nrow(dd) > 0, paste0("No '", species_name, "' images found in dataset."))
+      need(
+        nrow(dd) > 0,
+        paste0("No '", species_name, "' detection events inside the analysis windows.")
+      )
     )
 
-    ggplot(dd, aes(x = Date, y = `Site Name`, size = detections)) +
-      geom_point(
-        color = redwood_colors[3], alpha = 0.7,
-        position = position_jitter(width = 0, height = 0.1)
-      ) +
-      scale_size_continuous(name = paste(species_name, "count"), range = c(2, 8)) +
+    ggplot(dd, aes(x = Date, y = `Site Name`, size = animals)) +
+      geom_point(color = redwood_colors[3], alpha = 0.7) +
+      scale_size_continuous(name = "Animals counted", range = c(2, 8), breaks = integer_breaks) +
       labs(
-        title = paste("Daily", species_name, "detections by site"),
+        title = paste(species_name, "counted per day by site"),
         x = "Date",
         y = "Site name"
       ) +
@@ -2985,7 +2987,7 @@ ui <- page_fillable(
 
     lines <- c(
       paste("Cameras:", nrow(d$out)),
-      paste("Total animal events:", sum(d$camera_counts, na.rm = TRUE)),
+      paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
       paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
       paste("Detection distance range:", det_dist),
       paste(
@@ -3016,7 +3018,7 @@ ui <- page_fillable(
   summarize_rem_context <- function(d) {
     c(
       paste("Cameras:", nrow(d$out)),
-      paste("Total animal events:", sum(d$camera_counts, na.rm = TRUE)),
+      paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
       paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
       paste(
         "Detection distance range:",
@@ -3047,7 +3049,7 @@ ui <- page_fillable(
   summarize_tte_context <- function(d) {
     c(
       paste("Cameras:", nrow(d$out)),
-      paste("Total animal events passed to TTE:", sum(d$camera_counts, na.rm = TRUE)),
+      paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
       paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
       paste(
         "Detection distance range:",
@@ -3297,7 +3299,7 @@ ui <- page_fillable(
       model,
       USCR = make_model_debug(
         "USCR", "Uploaded field data", "Uploaded field data; simulated grid",
-        "Total animal events per camera, camera-days, and buffered state space."
+        "Animals counted per camera, camera-days, and buffered state space."
       ),
       REM = make_model_debug(
         "REM", "Uploaded field data", "Uploaded field data only",
@@ -3751,7 +3753,7 @@ ui <- page_fillable(
       "USCR",
       "Uploaded field data",
       "Uploaded field data; simulated grid",
-      "Total animal events per camera, camera-days, and buffered state space."
+      "Animals counted per camera, camera-days, and buffered state space."
     ))
     update_model_debug(
       uscr_nps_debug,
@@ -4309,7 +4311,7 @@ ui <- page_fillable(
 
   output$species_count_summary <- renderTable({
     tibble(
-      category = c("Total detections", "Camera trap days"),
+      category = c("Animals counted", "Camera-days"),
       result = c(
         sum(nps_model_inputs()$camera_counts),
         sum(nps_model_inputs()$camera_days)

@@ -870,80 +870,109 @@ analysis_windows <- function(deployments, max_days = NULL) {
   )
 }
 
+# One row per detection event (Site Name + Cluster ID + Species), the unit the
+# models count. Grouping by Site Name keeps a Cluster ID reused at two sites
+# from merging. An event is in the camera's analysis window if its first image
+# is; `count` is the largest Sighting Count among its images, and
+# `days_in_window` is the part of its duration (first to last image) inside
+# the window, which the models remove from the camera's effort. Rows without a
+# Species aren't events.
+detection_events <- function(images, deployments, max_days = NULL) {
+  windows <- analysis_windows(deployments, max_days = max_days) |>
+    dplyr::select(`Site Name`, window_start, window_end)
+
+  images |>
+    dplyr::filter(!is.na(Species), Species != "") |>
+    dplyr::group_by(`Site Name`, `Cluster ID`, Species) |>
+    dplyr::summarise(
+      n_images = dplyr::n(),
+      count    = max(`Sighting Count`),
+      start    = min(Timestamp),
+      end      = max(Timestamp),
+      .groups  = "drop"
+    ) |>
+    dplyr::inner_join(windows, by = "Site Name") |>
+    dplyr::mutate(
+      in_window = start >= window_start & start <= window_end,
+      days_in_window = dplyr::if_else(
+        in_window,
+        as.numeric(difftime(pmin(end, window_end), start, units = "days")),
+        0
+      )
+    )
+}
+
 # -------------------------------------------------------------------
 # Summary helpers (Data summary tab)
 # -------------------------------------------------------------------
 
-summarize_deployments <- function(deployments) {
-  deployments |>
-    dplyr::mutate(
-      Start_Date = parse_mdY_strict(`Start Date`),
-      End_Date   = parse_mdY_strict(`End Date`),
-      operational_days = as.numeric(difftime(End_Date, Start_Date,
-                                             units = "days"))
-    ) |>
+# Camera-days from each camera's analysis window (see analysis_windows()), so
+# they match the windows the models use, including the optional trim. Time
+# spent within detection events, which the models also remove, isn't
+# subtracted here.
+summarize_deployments <- function(deployments, max_days = NULL) {
+  analysis_windows(deployments, max_days = max_days) |>
     dplyr::summarise(
       n_cameras         = dplyr::n(),
-      mean_days         = mean(operational_days, na.rm = TRUE),
-      total_camera_days = sum(operational_days, na.rm = TRUE),
-      .groups = "drop"
+      mean_days         = mean(days),
+      total_camera_days = sum(days)
     )
 }
 
-summarize_images_by_species <- function(images) {
-  images |>
+# Per species: images in the file, plus detection events, animals counted
+# (sum of event counts), and cameras with events inside the analysis windows,
+# all as the models count them.
+summarize_species <- function(images, events) {
+  image_counts <- images |>
+    dplyr::filter(!is.na(Species), Species != "") |>
+    dplyr::count(Species, name = "n_images")
+
+  event_counts <- events |>
+    dplyr::filter(in_window) |>
     dplyr::group_by(Species) |>
     dplyr::summarise(
-      total_images     = dplyr::n(),
-      total_detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
-      cameras_detected = dplyr::n_distinct(`Site Name`),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(dplyr::desc(total_detections))
-}
-
-filter_species_rows <- function(images, species_name) {
-  species_name <- trimws(as.character(species_name)[1])
-  images |>
-    dplyr::filter(
-      !is.na(Species),
-      tolower(trimws(Species)) == tolower(species_name)
+      n_events = dplyr::n(),
+      animals  = sum(count),
+      cameras  = dplyr::n_distinct(`Site Name`),
+      .groups  = "drop"
     )
+
+  image_counts |>
+    dplyr::left_join(event_counts, by = "Species") |>
+    dplyr::mutate(dplyr::across(c(n_events, animals, cameras), \(x) dplyr::coalesce(x, 0))) |>
+    dplyr::arrange(dplyr::desc(animals), Species)
 }
 
-species_summary_per_site <- function(images, species_name) {
-  species_images <- filter_species_rows(images, species_name)
+# Per camera, for one species: images in the file, plus detection events and
+# animals counted inside the camera's analysis window. Every camera is listed,
+# with zeros where the species wasn't detected.
+species_by_camera <- function(images, events, deployments, species_name) {
+  image_counts <- images |>
+    dplyr::filter(Species == species_name) |>
+    dplyr::count(`Site Name`, name = "n_images")
 
-  species_images |>
+  event_counts <- events |>
+    dplyr::filter(Species == species_name, in_window) |>
     dplyr::group_by(`Site Name`) |>
-    dplyr::summarise(
-      images = dplyr::n(),
-      detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
-      .groups = "drop"
-    )
-}
+    dplyr::summarise(n_events = dplyr::n(), animals = sum(count), .groups = "drop")
 
-species_counts_per_camera <- function(images, species_name, deployments) {
-  counts <- deployments |>
-    dplyr::left_join(
-      filter_species_rows(images, species_name) |>
-        dplyr::group_by(`Site Name`) |>
-        dplyr::summarise(
-          total_detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
-          .groups = "drop"
-        ),
-      by = "Site Name"
+  deployments |>
+    dplyr::transmute(
+      `Site Name`,
+      Latitude  = as.numeric(Latitude),
+      Longitude = as.numeric(Longitude)
     ) |>
-    tidyr::replace_na(list(total_detections = 0))
-  counts
+    dplyr::left_join(image_counts, by = "Site Name") |>
+    dplyr::left_join(event_counts, by = "Site Name") |>
+    dplyr::mutate(dplyr::across(c(n_images, n_events, animals), \(x) dplyr::coalesce(x, 0)))
 }
 
-species_daily_detections <- function(images, species_name) {
-  filter_species_rows(images, species_name) |>
-    dplyr::mutate(Date = as.Date(Timestamp)) |>
+# Animals counted per camera per day, for one species, by the date of each
+# event's first image (events inside the analysis windows only).
+species_by_day <- function(events, species_name) {
+  events |>
+    dplyr::filter(Species == species_name, in_window) |>
+    dplyr::mutate(Date = as.Date(format(start, "%Y-%m-%d"))) |>
     dplyr::group_by(`Site Name`, Date) |>
-    dplyr::summarise(
-      detections = sum(as.numeric(`Sighting Count`), na.rm = TRUE),
-      .groups = "drop"
-    )
+    dplyr::summarise(animals = sum(count), .groups = "drop")
 }

@@ -299,32 +299,15 @@ build_nps_model_inputs <- function(
                  mean(range(utm_coords[, "Y"], na.rm = TRUE))) / 1000
     )
 
-  # One event per Site Name + Cluster ID (grouping by both keeps a Cluster ID
-  # reused at two sites from merging). An event counts if its first image falls
-  # inside the camera's analysis window; its count is the largest Sighting
-  # Count in the event, and the part of its duration inside the window is
-  # removed from the camera's effort.
-  events <- images |>
-    dplyr::filter(Species == species_to_analyze) |>
-    dplyr::group_by(`Site Name`, `Cluster ID`) |>
-    dplyr::summarise(
-      species_count = max(as.numeric(`Sighting Count`), na.rm = TRUE),
-      start         = min(Timestamp),
-      end           = max(Timestamp),
-      .groups       = "drop"
-    ) |>
-    dplyr::inner_join(
-      dplyr::select(deps, `Site Name`, window_start, window_end),
-      by = "Site Name"
-    ) |>
-    dplyr::filter(start >= window_start, start <= window_end) |>
-    dplyr::mutate(
-      event_days = as.numeric(difftime(pmin(end, window_end), start, units = "days"))
-    ) |>
+  # Detection events (see detection_events() in R/data_checks.R): an event
+  # counts if its first image is inside the camera's analysis window, and the
+  # part of its duration inside the window is removed from the camera's effort.
+  events <- detection_events(images, deployments, max_days = max_days) |>
+    dplyr::filter(Species == species_to_analyze, in_window) |>
     dplyr::group_by(`Site Name`) |>
     dplyr::summarise(
-      events_count = sum(species_count),
-      event_days   = sum(event_days),
+      events_count = sum(count),
+      event_days   = sum(days_in_window),
       .groups      = "drop"
     )
 
