@@ -67,8 +67,23 @@ sys.source("R/sim_and_models.R", envir = uscr_model_env)
 run_USCR_app <- uscr_model_env$run_USCR
 
 # -------------------------------------------------------------------
+# Default MCMC settings (not user-facing)
+# -------------------------------------------------------------------
+# Starting values for every model run. Adaptive reruns double iterations,
+# burn-in, and thinning if R-hat fails and double M if the posterior for N
+# presses against it; users can change only the maximum number of rounds.
+mcmc_defaults <- list(
+  n_chains         = 2L,
+  iter             = 6000L,
+  burnin           = 1000L,
+  thin             = 5L,
+  M_uscr           = 100L,
+  max_adapt_rounds = 6L
+)
+
+# -------------------------------------------------------------------
 # Default priors (used for the Advanced inputs' starting values, and always
-# used in Simple mode)
+# used in Default mode)
 # -------------------------------------------------------------------
 # REM/TTE upper limit on density under the uniform prior (animals/km^2). Not
 # user-facing: the app doubles it if the posterior for D presses against it.
@@ -84,6 +99,15 @@ advanced_prior_defaults <- list(
   log_lam0_mean  = 0,
   log_lam0_sd    = 1
 )
+
+# Round a USCR state-space buffer (m) up to the nearest 50 m.
+round_buffer_m <- function(buffer_m) ceiling(buffer_m / 50) * 50
+
+# Default USCR buffer (m) under the default log(sigma) prior.
+default_uscr_buffer_m <- round_buffer_m(uscr_default_buffer_m(
+  advanced_prior_defaults$log_sigma_mean,
+  advanced_prior_defaults$log_sigma_sd
+))
 
 # -------------------------------------------------------------------
 # Simulation helpers
@@ -1095,8 +1119,8 @@ ui <- page_fillable(
         "- **`Start Time`**: Deployment start time (`HH:MM` or `HH:MM:SS`, 24-hour). If blank or unreadable, the camera's analysis window starts at midnight at the end of Start Date, so no time before the camera was set is counted.",
         "- **`End Date`**: Deployment end date (`MM/DD/YYYY`).",
         "- **`End Time`**: Deployment end time (`HH:MM` or `HH:MM:SS`, 24-hour). If blank or unreadable, the analysis window ends at midnight at the start of End Date, so no time after the camera was picked up is counted.",
-        "- **`Latitude`**: Camera latitude (decimal degrees, WGS84, the standard datum used by GPS devices and phones). The app corrects the sign to match the hemisphere selected in **Model settings** (under Default camera geometry).",
-        "- **`Longitude`**: Camera longitude (decimal degrees, WGS84). The app corrects the sign to match the hemisphere selected in **Model settings** (under Default camera geometry).",
+        "- **`Latitude`**: Camera latitude (decimal degrees, WGS84, the standard datum used by GPS devices and phones). The app corrects the sign to match the hemisphere selected in **Model settings** (under Camera geometry and coordinates).",
+        "- **`Longitude`**: Camera longitude (decimal degrees, WGS84). The app corrects the sign to match the hemisphere selected in **Model settings** (under Camera geometry and coordinates).",
         "- `Camera Model`: Optional camera make and model, for recordkeeping (for example, `Browning Strike Force Pro`).",
         "- `Camera Detection Angle`: Optional full detection angle in degrees for that camera (greater than 0 and at most 360). If left blank, the app uses the default angle from **Model settings**.",
         "- `Camera Height`: Optional camera height (meters).",
@@ -1225,7 +1249,10 @@ ui <- page_fillable(
       "Model settings",
 
       h4("Species to analyze"),
-      "First, you must select the species to analyze.",
+      tags$p(
+        class = "small",
+        "Choose the species to estimate density for. The table shows the animals counted and camera-days the models will use."
+      ),
       selectInput(
         inputId = "species_to_analyze",
         label = "Select species to analyze",
@@ -1234,78 +1261,65 @@ ui <- page_fillable(
       tableOutput("species_count_summary"),
       hr(),
 
+      h4("Camera geometry and coordinates"),
       markdown(paste(
-        "### Run defaults",
-        "",
-        "**Current app defaults**:",
-        "",
-        "- **Number of chains**: 2 by default; the app enforces a minimum of 2 chains for model runs",
-        "- **REM/TTE**: adaptive runs start from 6000 iterations, 1000 burn-in, and thin = 5",
-        "- **USCR**: adaptive runs start from 6000 iterations, 1000 burn-in, thin = 5, and M = 100",
-        "- **Convergence criteria**: R̂ < 1.1 for all monitored parameters",
-        "- **Maximum adaptive rounds**: 6 by default. Only the settings tied to a failed check change between rounds: iterations, burn-in, and thinning double if R̂ fails; D_max (REM, TTE) or M (USCR) doubles if the posterior presses against it; and for USCR the state-space buffer grows if it is too small. If a model reaches this limit without passing every check, increase it under **Adaptive reruns** below and rerun.",
-        "",
-        "The app handles chain counts and reruns internally, so users do not need to manually edit iterations, thinning, or data-augmentation size in the interface.",
-        "If convergence is still poor after a run, review the run-status panel and consider whether the priors need to better match your site or species.",
-        "",
-        "### Prior distributions",
-        "",
-        "The priors below are grouped by model type.",
-        "The current defaults are calibrated for white-tailed deer using home-range size and daily movement information from the literature.",
-        "These defaults may not be well calibrated for other species or field conditions.",
-        "Model output can be sensitive to prior choice, so users working on other species should adjust the priors to better match their system.",
-        "",
-        "### Default camera geometry",
-        "",
         "Default detection angle is 55° (based on Browning-style camera specifications). This value is used for uploaded cameras that do not include a `Camera Detection Angle` value. The **Simulate data** tab has its own detection angle setting.",
         "",
         "Longitude and Latitude sign are auto-corrected to match the selected hemispheres below during upload QC (for example, a positive Longitude gets flipped negative for Western sites, and a positive Latitude gets flipped negative for Southern sites).",
-        "",
         sep = "\n"
       )),
-
-      h4("Default camera geometry"),
-      fluidRow(
-        column(12,
-          sliderInput("theta", "Default detection angle θ (degrees)",
-                      min = 20, max = 80, value = 55, step = 1),
-          radioButtons(
-            "hemisphere", "Hemisphere (for Longitude sign auto-correction)",
-            choices  = c("Western" = "Western", "Eastern" = "Eastern"),
-            selected = "Western",
-            inline   = TRUE
-          ),
-          radioButtons(
-            "lat_hemisphere", "Hemisphere (for Latitude sign auto-correction)",
-            choices  = c("Northern" = "Northern", "Southern" = "Southern"),
-            selected = "Northern",
-            inline   = TRUE
-          )
-        )
+      sliderInput(
+        "theta", "Default detection angle θ (degrees)",
+        min = 20, max = 80, value = 55, step = 1
       ),
-
+      radioButtons(
+        "hemisphere", "Hemisphere (for Longitude sign auto-correction)",
+        choices = c("Western", "Eastern"),
+        selected = "Western",
+        inline = TRUE
+      ),
+      radioButtons(
+        "lat_hemisphere", "Hemisphere (for Latitude sign auto-correction)",
+        choices = c("Northern", "Southern"),
+        selected = "Northern",
+        inline = TRUE
+      ),
       hr(),
 
-      h4("Adaptive reruns"),
-      fluidRow(
-        column(12,
-          numericInput("max_adapt_rounds", "Maximum adaptive rounds per model run",
-                       value = 6, min = 1, step = 1),
-          tags$p(
-            class = "small",
-            style = "color: var(--muted);",
-            "After each round, the app checks convergence (R\u0302 < 1.1), whether the upper limit on density or abundance is large enough (D_max for REM and TTE; M for USCR), and, for USCR, whether the state-space buffer is large enough. Only the settings tied to a failed check change before the next round: iterations, burn-in, and thinning double if R\u0302 fails; D_max or M doubles if it is too small; and the buffer grows to fit the posterior \u03c3 if it is too small. If a model reaches this limit without passing every check, the run-status panel will say so. Increase this number and run the model again to keep going."
-          )
-        )
+      h4("Run defaults"),
+      markdown(paste(
+        paste0("- **Number of chains**: ", mcmc_defaults$n_chains),
+        paste0(
+          "- **All models**: adaptive runs start from ", mcmc_defaults$iter,
+          " iterations, ", mcmc_defaults$burnin, " burn-in, and thin = ",
+          mcmc_defaults$thin
+        ),
+        "- **Convergence criteria**: R̂ ≤ 1.1 for all monitored parameters",
+        paste0(
+          "- **Maximum adaptive rounds**: ", mcmc_defaults$max_adapt_rounds,
+          " by default. Only the settings tied to a failed check change between rounds: iterations, burn-in, and thinning double if R̂ fails; D<sub>max</sub> (REM, TTE) or M (USCR) doubles if the posterior presses against it; and for USCR the state-space buffer grows if it is too small. If a model reaches this limit without passing every check, increase it below."
+        ),
+        sep = "\n"
+      )),
+      numericInput(
+        "max_adapt_rounds", "Maximum adaptive rounds per model run",
+        value = mcmc_defaults$max_adapt_rounds, min = 1, step = 1
       ),
-
       hr(),
 
+      h4("Prior distributions"),
+      markdown(paste(
+        "Switch to **Advanced** to see and change the priors, grouped by model type.",
+        "The current defaults are calibrated for white-tailed deer (*Odocoileus virginianus*) using home-range size and daily movement rates derived from the literature.",
+        "These defaults may not be well calibrated for other species or field conditions.",
+        "Model output can be sensitive to prior choice, so users working on other species should adjust the priors to better match their system.",
+        sep = "\n"
+      )),
       radioButtons(
         "mode", "Settings mode",
-        choices  = c("Simple (recommended)" = "Default", "Advanced" = "Advanced"),
+        choices = c("Default", "Advanced"),
         selected = "Default",
-        inline   = TRUE
+        inline = TRUE
       ),
 
       conditionalPanel(
@@ -1314,14 +1328,15 @@ ui <- page_fillable(
           class = "about-card",
           tags$p(
             tags$strong("Using the app defaults."),
-            " These settings are meant to be a practical starting point for most users."
+            " The models use the default priors described under Advanced, a uniform prior on density, and no camera-level noise."
           ),
           tags$ul(
-            tags$li("2 chains are used for all model runs."),
-            tags$li("REM and TTE start from 6000 iterations, 1000 burn-in, and thin = 5."),
-            tags$li("USCR starts from 6000 iterations, 1000 burn-in, thin = 5, and M = 100."),
-            tags$li("The app checks convergence internally and can rerun models when needed."),
-            tags$li("Most users only need to change the default camera angle above or switch to Advanced for species- or site-specific priors.")
+            tags$li(paste(mcmc_defaults$n_chains, "chains are used for all model runs.")),
+            tags$li(paste0(
+              "All models start from ", mcmc_defaults$iter, " iterations, ",
+              mcmc_defaults$burnin, " burn-in, and thin = ", mcmc_defaults$thin, "."
+            )),
+            tags$li("The app checks convergence internally and can rerun models when needed.")
           )
         )
       ),
@@ -1332,7 +1347,7 @@ ui <- page_fillable(
           tags$p(
             class = "small",
             style = "color: var(--muted);",
-            "Most users can leave these advanced controls alone. The app manages chain counts and reruns internally, so the advanced controls focus on priors rather than MCMC tuning."
+            "The advanced controls focus on priors. This is where you can tune the models for your species and study site."
           ),
           tags$details(
             class = "prior-details",
@@ -1342,8 +1357,16 @@ ui <- page_fillable(
               "",
               "**Default (uniform) priors.** Each model's default prior is flat, but the models put it on different quantities, with different upper limits:",
               "",
-              "- **REM and TTE** put it directly on density: D ~ Uniform(0, D<sub>max</sub>). D<sub>max</sub> starts at 200 animals/km², and the app doubles it and reruns if the posterior for density presses against it.",
-              "- **USCR** puts it on abundance (N, the number of animals in the state space): N is uniform from 0 to M, and density is N divided by the state-space area. M starts at 100 (higher for shared-design simulations) and doubles if the posterior for N presses against it.",
+              paste0(
+                "- **REM and TTE** put it directly on density: D ~ Uniform(0, D<sub>max</sub>). D<sub>max</sub> starts at ",
+                rem_tte_start_D_max,
+                " animals/km², and the app doubles it and reruns if the posterior for density presses against it."
+              ),
+              paste0(
+                "- **USCR** puts it on abundance (N, the number of animals in the state space): N is uniform from 0 to M, and density is N divided by the state-space area. M starts at ",
+                mcmc_defaults$M_uscr,
+                " for uploaded data (for simulations, it is sized from the true density) and doubles if the posterior for N presses against it."
+              ),
               "",
               "So the default priors are all flat, but they are not the same prior.",
               "",
@@ -1374,18 +1397,23 @@ ui <- page_fillable(
             checkboxInput("camera_noise", "Include camera-level noise (Poisson-lognormal counts)", value = FALSE),
             conditionalPanel(
               "input.camera_noise",
-              markdown(paste(
-                "- **σ<sub>ε</sub>** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level random effect. The default `Gamma(1, 1)` prior has mean 1 and variance 1.",
-                sep = "\n"
-              )),
+              markdown(
+                "- **σ<sub>ε</sub>** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level random effect. The default `Gamma(1, 1)` prior has mean 1 and variance 1."
+              ),
               fluidRow(
-                column(6,
-                  numericInput("sd_eps_shape", HTML("σ<sub>ε</sub> gamma shape"),
-                               value = advanced_prior_defaults$sd_eps_shape, min = 0.1, step = 0.1)
+                column(
+                  6,
+                  numericInput(
+                    "sd_eps_shape", HTML("σ<sub>ε</sub> gamma shape"),
+                    value = advanced_prior_defaults$sd_eps_shape, min = 0.1, step = 0.1
+                  )
                 ),
-                column(6,
-                  numericInput("sd_eps_rate", HTML("σ<sub>ε</sub> gamma rate"),
-                               value = advanced_prior_defaults$sd_eps_rate, min = 0.1, step = 0.1)
+                column(
+                  6,
+                  numericInput(
+                    "sd_eps_rate", HTML("σ<sub>ε</sub> gamma rate"),
+                    value = advanced_prior_defaults$sd_eps_rate, min = 0.1, step = 0.1
+                  )
                 )
               )
             )
@@ -1394,21 +1422,23 @@ ui <- page_fillable(
           tags$details(
             class = "prior-details",
             tags$summary(tags$strong("Priors: REM & TTE")),
-            markdown(paste(
-              "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale). The current default corresponds to an average daily movement rate of `3.09 km/day` with an approximate 95% interval of `1.60` to `6.00 km/day` (Christensen et al. in prep).",
-              "",
-              "These defaults are not well calibrated for species other than white-tailed deer (*Odocoileus virginianus*). If you are working with another species, adjust the priors to match that species and study design. Model output is sensitive to choice of prior distribution.",
-              "",
-              sep = "\n"
-            )),
+            markdown(
+              "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale, v in km/day). The current default corresponds to an average daily movement rate of `3.09 km/day` with an approximate 95% interval of `1.60` to `6.00 km/day` (Christensen et al. in prep)."
+            ),
             fluidRow(
-              column(6,
-                numericInput("log_v_mean", "log(v) mean (km/day)",
-                             value = advanced_prior_defaults$log_v_mean, step = 0.1)
+              column(
+                6,
+                numericInput(
+                  "log_v_mean", "log(v) mean (v in km/day)",
+                  value = advanced_prior_defaults$log_v_mean, step = 0.1
+                )
               ),
-              column(6,
-                numericInput("log_v_sd", "log(v) SD",
-                             value = advanced_prior_defaults$log_v_sd, min = 0.01, step = 0.05)
+              column(
+                6,
+                numericInput(
+                  "log_v_sd", "log(v) SD",
+                  value = advanced_prior_defaults$log_v_sd, min = 0.01, step = 0.05
+                )
               )
             )
           ),
@@ -1417,48 +1447,48 @@ ui <- page_fillable(
             class = "prior-details",
             tags$summary(tags$strong("Priors: USCR")),
             markdown(paste(
-              "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale). The current default corresponds to an average 95% circular home-range size of `0.89 km²` with an approximate 95% interval of `0.48` to `1.62 km²` (Christensen et al. in prep).",
-              "- **log(λ₀)** ~ Normal(mean, SD): Prior on expected detections per day when an animal's activity center is at the camera. The default mean of `0` corresponds to about one expected detection per deployed day at the detector because `exp(0) = 1`.",
-              "- **State-space buffer**: Distance added around the camera array when defining the USCR state space. Animals with home range centroids outside the buffer should not be able to be detected within the state space. The default is set from the log(σ) prior so it comfortably covers a 99% home range, and updates automatically if you change that prior; the app also checks it against the posterior sigma after fitting and grows it (and reruns) if needed.",
-              "",
-              "These defaults are not well calibrated for species other than white-tailed deer (*Odocoileus virginianus*). If you are working with another species, adjust the priors to better match that species and study design. Model output is sensitive to choice of prior distribution.",
-              "",
+              "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale, σ in km). The current default corresponds to an average 95% circular home-range size of `0.89 km²` with an approximate 95% interval of `0.48` to `1.62 km²` (Christensen et al. in prep).",
+              "- **log(λ₀)** ~ Normal(mean, SD): Prior on expected detections per day when an animal's activity center is at the camera. The default mean of `0` corresponds to about one expected detection per deployed day at the camera because `exp(0) = 1`.",
+              "- **State-space buffer**: Distance added around the camera array when defining the USCR state space. The buffer is set wide enough that animals with activity centers outside it contribute almost nothing to the counts (under 1% even at the high end of the σ prior). The default is set from the log(σ) prior so it comfortably covers a 99% home range, and updates automatically if you change that prior; the app also checks it against the posterior σ after fitting and grows it (and reruns) if needed.",
               sep = "\n"
             )),
             fluidRow(
-              column(6,
-                numericInput("log_sigma_mean", "log(σ) mean",
-                             value = advanced_prior_defaults$log_sigma_mean, step = 0.1),
-                numericInput("log_sigma_sd", "log(σ) SD",
-                             value = advanced_prior_defaults$log_sigma_sd, min = 0.01, step = 0.05),
-                numericInput("log_lam0_mean", "log(λ₀) mean",
-                             value = advanced_prior_defaults$log_lam0_mean, step = 0.1)
+              column(
+                6,
+                numericInput(
+                  "log_sigma_mean", "log(σ) mean (σ in km)",
+                  value = advanced_prior_defaults$log_sigma_mean, step = 0.1
+                )
               ),
-              column(6,
-                numericInput("uscr_buffer_m", "USCR state-space buffer (m)",
-                             value = 1000, min = 50, step = 50),
-                numericInput("log_lam0_sd", "log(λ₀) SD",
-                             value = advanced_prior_defaults$log_lam0_sd, min = 0.1, step = 0.1)
+              column(
+                6,
+                numericInput(
+                  "log_sigma_sd", "log(σ) SD",
+                  value = advanced_prior_defaults$log_sigma_sd, min = 0.01, step = 0.05
+                )
               )
+            ),
+            fluidRow(
+              column(
+                6,
+                numericInput(
+                  "log_lam0_mean", "log(λ₀) mean",
+                  value = advanced_prior_defaults$log_lam0_mean, step = 0.1
+                )
+              ),
+              column(
+                6,
+                numericInput(
+                  "log_lam0_sd", "log(λ₀) SD",
+                  value = advanced_prior_defaults$log_lam0_sd, min = 0.1, step = 0.1
+                )
+              )
+            ),
+            numericInput(
+              "uscr_buffer_m", "USCR state-space buffer (m)",
+              value = default_uscr_buffer_m, min = 50, step = 50
             )
           )
-        )
-      ),
-
-      # Hidden run settings that aren't exposed in either Simple or
-      # Advanced mode (chain count and MCMC iteration/burn-in/thin/M
-      # starting points are managed automatically by the app).
-      tags$div(
-        style = "display:none;",
-        tags$div(
-          numericInput("n_chains", NULL, value = 2),
-          numericInput("iter_rem_tte", NULL, value = 6000),
-          numericInput("burnin_rem_tte", NULL, value = 1000),
-          numericInput("thin_rem_tte", NULL, value = 5),
-          numericInput("iter_uscr", NULL, value = 6000),
-          numericInput("burnin_uscr", NULL, value = 1000),
-          numericInput("thin_uscr", NULL, value = 5),
-          numericInput("M_uscr", NULL, value = 100)
         )
       )
     ),
@@ -1497,7 +1527,7 @@ ui <- page_fillable(
             <ul>
               <li>\\(M\\), the upper bound on total abundance used for data augmentation. It starts at 100 (or about twice the upper bound on abundance implied by an informative density prior). If the posterior for \\(N\\) presses against \\(M\\), the app doubles it and reruns the model.</li>
               <li>\\(\\psi \\sim \\mathrm{Beta}(a, b)\\). The default \\(a = b = 1\\) (\\(\\psi \\sim \\mathrm{Uniform}(0, 1)\\)) gives a uniform prior on \\(N\\) from 0 to \\(M\\). An informative density prior (<strong>Model settings &gt; Advanced &gt; Priors: Density (all models)</strong>) chooses \\(a\\) and \\(b\\) so that density \\(N / \\mathrm{area}\\) has the requested 95% prior interval.</li>
-              <li>\\(\\log \\sigma \\sim \\mathcal{N}(-1.5269,\\,0.1535)\\), which corresponds to an average 95% circular home-range size of about 0.89 km² (Christensen et al. in prep). The state-space buffer defaults to 1.05&times; the 99% home-range radius implied by this prior, and the app grows it to 1.01&times; the required radius (and reruns) if the posterior sigma would need a bigger buffer.</li>
+              <li>\\(\\log \\sigma \\sim \\mathcal{N}(-1.5269,\\,0.1535)\\), which corresponds to an average 95% circular home-range size of about 0.89 km² (Christensen et al. in prep). The state-space buffer defaults to 1.05&times; the 99% home-range radius implied by this prior, and the app grows it to 1.01&times; the required radius (and reruns) if the posterior \\(\\sigma\\) would need a bigger buffer.</li>
               <li>\\(\\log \\lambda_0 \\sim \\mathcal{N}(0,\\,1)\\), centered near one expected detection per deployed day when the activity center is at the camera.</li>
               <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(1,1)\\), giving the camera-level random-effect standard deviation a prior mean of 1 and variance of 1. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
               <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
@@ -1753,7 +1783,7 @@ ui <- page_fillable(
       "Simulate data",
       markdown(paste(
         "Use this tab as a **power analysis** to see how study design affects the precision and accuracy of density estimates.",
-        "Choose a study design (camera grid, spacing, survey length, true density) and model-specific parameter values, then click **Simulate shared design**.",
+        "Choose a study design (camera grid, spacing, survey length, true density) and model-specific parameter values, then click **Simulate data**.",
         "Each model block below simulates its own dataset under that model's assumptions: USCR from a spatial capture-recapture process, and REM and TTE from a movement and encounter process.",
         "The three datasets therefore differ, even though they share the same design and true density.",
         "",
@@ -1766,7 +1796,7 @@ ui <- page_fillable(
         "Priors for density, σ<sub>ε</sub>, and MCMC settings come from the **Model settings** tab (the density prior for all three models is under **Advanced** → **Priors: Density (all models)**).",
         sep = "\n"
       )),
-      h3("Shared design parameters"),
+      h3("Simulation parameters"),
       tags$p(
         class = "small",
         style = "color: var(--muted);",
@@ -1821,7 +1851,7 @@ ui <- page_fillable(
       ),
       fluidRow(
         column(4, numericInput("pshared_seed", "Random seed", value = 1, min = 1)),
-        column(8, br(), actionButton("pshared_run_sim", "Simulate shared design", class = "btn-primary"))
+        column(8, br(), actionButton("pshared_run_sim", "Simulate data", class = "btn-primary"))
       ),
       tags$p(
         class = "small", style = "color: var(--muted);",
@@ -1837,7 +1867,7 @@ ui <- page_fillable(
           "Simulation parameter guide"
         ),
         tags$div(style = "margin-top: 0.85rem;"),
-        tags$p(tags$strong("Shared design (all models)")),
+        tags$p(tags$strong("Simulation (all models)")),
         tags$p(
           tags$strong("Grid dimension"),
           " sets the number of cameras along one side of the square grid. A 5 x 5 grid gives 25 cameras."
@@ -1890,7 +1920,7 @@ ui <- page_fillable(
         )
       ),
       hr(),
-      h3("Fit each model to the shared design"),
+      h3("Fit each model to the simulated data"),
       markdown(paste(
         "**Reading the results tables:**",
         "",
@@ -1983,7 +2013,7 @@ ui <- page_fillable(
     }
 
   # ================================================================
-  # POWER ANALYSIS: shared design comparison (USCR + REM + TTE)
+  # POWER ANALYSIS: simulation comparison (USCR + REM + TTE)
   # ================================================================
 
   pshared_sim <- eventReactive(input$pshared_run_sim, {
@@ -2021,7 +2051,7 @@ ui <- page_fillable(
     # Settings are saved with the simulated data so that the model fits
     # (priors, state-space buffer) and the truth-vs-estimate tables use the
     # values the data were simulated with, even if a slider is moved
-    # afterwards without clicking 'Simulate shared design' again.
+    # afterwards without clicking 'Simulate data' again.
     list(uscr = list(sim = uscr_sim, data = uscr_data), rem = rem_sim, tte = tte_sim,
          D_true = input$pshared_Dtrue,
          settings = list(
@@ -2035,16 +2065,16 @@ ui <- page_fillable(
            camera_noise = app_camera_noise(),
            # the automatic buffer at simulation time, to tell whether the
            # buffer used was a user override
-           buffer_default_m = ceiling(uscr_default_buffer_m(
+           buffer_default_m = round_buffer_m(uscr_default_buffer_m(
              log(home_range_km2_to_sigma_m(input$pshared_home_range_km2) / 1000),
              prior_input("log_sigma_sd")
-           ) / 50) * 50
+           ))
          ))
   }, ignoreInit = TRUE)
 
-  # Keep the shared-design buffer default in sync with the home-range size,
+  # Keep the simulation buffer default in sync with the home-range size,
   # using the same rule as the uploaded-data buffer: the 99th percentile of
-  # the log(sigma) prior the shared-design fit uses (centered on the true
+  # the log(sigma) prior the simulation fit uses (centered on the true
   # sigma, with the log(sigma) SD from Model settings). Users can override it.
   observe({
     req(is.numeric(input$pshared_home_range_km2))
@@ -2052,7 +2082,7 @@ ui <- page_fillable(
     log_sigma_sd <- prior_input("log_sigma_sd")
     req(is.numeric(log_sigma_sd), is.finite(log_sigma_sd))
     new_default <- uscr_default_buffer_m(log(sigma_km), log_sigma_sd)
-    updateNumericInput(session, "pshared_buffer_m", value = ceiling(new_default / 50) * 50)
+    updateNumericInput(session, "pshared_buffer_m", value = round_buffer_m(new_default))
   })
 
   # Which noise setting the current simulated design (and so its fits) uses.
@@ -2069,7 +2099,7 @@ ui <- page_fillable(
         "All three fits below use this setting. To change it, change the camera-level noise setting in ",
         tags$strong("Model settings > Advanced > Priors: Camera-level noise"),
         " and click ",
-        tags$strong("Simulate shared design"),
+        tags$strong("Simulate data"),
         " again."
       ),
       if (sim_noise != toggle_noise) {
@@ -2162,9 +2192,9 @@ ui <- page_fillable(
   pshared_uscr_fit <- reactiveVal(NULL)
   pshared_rem_fit  <- reactiveVal(NULL)
   pshared_tte_fit  <- reactiveVal(NULL)
-  pshared_uscr_debug <- reactiveVal(make_model_debug("USCR", "Shared design", "Shared design comparison", ""))
-  pshared_rem_debug  <- reactiveVal(make_model_debug("REM",  "Shared design", "Shared design comparison", ""))
-  pshared_tte_debug  <- reactiveVal(make_model_debug("TTE",  "Shared design", "Shared design comparison", ""))
+  pshared_uscr_debug <- reactiveVal(make_model_debug("USCR", "Simulated data", "Simulation comparison", ""))
+  pshared_rem_debug  <- reactiveVal(make_model_debug("REM",  "Simulated data", "Simulation comparison", ""))
+  pshared_tte_debug  <- reactiveVal(make_model_debug("TTE",  "Simulated data", "Simulation comparison", ""))
 
   observeEvent(input$pshared_run_sim, {
     pshared_uscr_fit(NULL); pshared_rem_fit(NULL); pshared_tte_fit(NULL)
@@ -2183,7 +2213,7 @@ ui <- page_fillable(
     sigma_km_true <- s$uscr$sim$truth$sigma_m / 1000
 
     update_model_debug(pshared_uscr_debug, status = "running", stage = "Running",
-                       started_at = Sys.time(), guidance = "Fitting USCR on the shared design.",
+                       started_at = Sys.time(), guidance = "Fitting USCR to the simulated data.",
                        context = c(
                          paste("Cameras:", nrow(d$out)),
                          paste("True density:", s$D_true, "animals/km^2"),
@@ -2192,16 +2222,16 @@ ui <- page_fillable(
                          paste("Density prior:", describe_density_prior_spec(density_prior_spec())),
                          paste("Camera-level noise:", noise_label(s$settings$camera_noise))
                        ),
-                       log_entry = "Shared-design USCR run requested.")
-    showNotification("Running USCR on shared design...", type = "message", duration = NULL, id = "pshared_uscr_status")
+                       log_entry = "USCR run on simulated data requested.")
+    showNotification("Running USCR on simulated data...", type = "message", duration = NULL, id = "pshared_uscr_status")
 
     suggested_M <- pshared_suggested_M(s)
 
     fit <- tryCatch(
       run_USCR_app(
         out = d$out, camera_counts = d$camera_counts, camera_days = d$camera_days,
-        iter = input$iter_uscr, burnin = input$burnin_uscr, thin = input$thin_uscr,
-        n_chains = app_n_chains(), M = suggested_M,
+        iter = mcmc_defaults$iter, burnin = mcmc_defaults$burnin, thin = mcmc_defaults$thin,
+        n_chains = mcmc_defaults$n_chains, M = suggested_M,
         log_sigma_mean = log(sigma_km_true), log_sigma_sd = prior_input("log_sigma_sd"),
         log_lam0_mean = log(s$settings$lambda0), log_lam0_sd = prior_input("log_lam0_sd"),
         sd_eps_shape = prior_input("sd_eps_shape"), sd_eps_rate = prior_input("sd_eps_rate"),
@@ -2209,13 +2239,13 @@ ui <- page_fillable(
         max_adapt_rounds = app_max_adapt_rounds(),
         density_prior = density_prior_spec(),
         camera_noise = s$settings$camera_noise,
-        diagnostic_mode = FALSE, parallel_chains = isTRUE(app_n_chains() > 1),
+        diagnostic_mode = FALSE, parallel_chains = TRUE,
         status_callback = make_model_status_callback(pshared_uscr_debug, "USCR", "pshared_uscr_status"),
         verbose = FALSE
       ),
       error = function(e) {
         update_model_debug(pshared_uscr_debug, status = "error", stage = "Failed", finished_at = Sys.time(),
-                           raw_error = e$message, guidance = friendly_model_error("USCR", "shared design", e$message))
+                           raw_error = e$message, guidance = friendly_model_error("USCR", "simulated data", e$message))
         showNotification(paste("USCR failed:", e$message), type = "error", duration = NULL)
         NULL
       },
@@ -2225,8 +2255,8 @@ ui <- page_fillable(
     if (!is.null(fit)) {
       update_model_debug(pshared_uscr_debug, status = "success", stage = "Complete", finished_at = Sys.time(),
                          guidance = adaptive_limit_guidance(fit, "USCR", "Complete. Review the table above."))
-      notify_adaptive_limit(fit, "USCR (shared design)")
-      notify_ppc(fit, "USCR (shared design)")
+      notify_adaptive_limit(fit, "USCR (simulated data)")
+      notify_ppc(fit, "USCR (simulated data)")
     }
   })
 
@@ -2288,7 +2318,7 @@ ui <- page_fillable(
     s <- pshared_sim()
 
     update_model_debug(pshared_rem_debug, status = "running", stage = "Running",
-                       started_at = Sys.time(), guidance = "Fitting REM on the shared design.",
+                       started_at = Sys.time(), guidance = "Fitting REM to the simulated data.",
                        context = c(
                          paste("Cameras:", nrow(s$rem$out)),
                          paste("True density:", s$D_true, "animals/km^2"),
@@ -2296,15 +2326,15 @@ ui <- page_fillable(
                          paste("Density prior:", describe_density_prior_spec(density_prior_spec())),
                          paste("Camera-level noise:", noise_label(s$settings$camera_noise))
                        ),
-                       log_entry = "Shared-design REM run requested.")
-    showNotification("Running REM on shared design...", type = "message", duration = NULL, id = "pshared_rem_status")
+                       log_entry = "REM run on simulated data requested.")
+    showNotification("Running REM on simulated data...", type = "message", duration = NULL, id = "pshared_rem_status")
 
     fit <- tryCatch(
       run_REM(
         y = s$rem$camera_counts, r_km = s$rem$out$`Detection Distance` / 1000,
         camera_days = s$rem$camera_days, theta_deg = s$settings$theta,
-        iter = input$iter_rem_tte, burnin = input$burnin_rem_tte, thin = input$thin_rem_tte,
-        n_chains = app_n_chains(), D_max = rem_tte_start_D_max,
+        iter = mcmc_defaults$iter, burnin = mcmc_defaults$burnin, thin = mcmc_defaults$thin,
+        n_chains = mcmc_defaults$n_chains, D_max = rem_tte_start_D_max,
         log_v_mean = log(s$settings$v), log_v_sd = prior_input("log_v_sd"),
         sd_eps_shape = prior_input("sd_eps_shape"), sd_eps_rate = prior_input("sd_eps_rate"),
         max_adapt_rounds = app_max_adapt_rounds(),
@@ -2314,7 +2344,7 @@ ui <- page_fillable(
       ),
       error = function(e) {
         update_model_debug(pshared_rem_debug, status = "error", stage = "Failed", finished_at = Sys.time(),
-                           raw_error = e$message, guidance = friendly_model_error("REM", "shared design", e$message))
+                           raw_error = e$message, guidance = friendly_model_error("REM", "simulated data", e$message))
         showNotification(paste("REM failed:", e$message), type = "error", duration = NULL)
         NULL
       },
@@ -2324,8 +2354,8 @@ ui <- page_fillable(
     if (!is.null(fit)) {
       update_model_debug(pshared_rem_debug, status = "success", stage = "Complete", finished_at = Sys.time(),
                          guidance = adaptive_limit_guidance(fit, "REM", "Complete. Review the table above."))
-      notify_adaptive_limit(fit, "REM (shared design)")
-      notify_ppc(fit, "REM (shared design)")
+      notify_adaptive_limit(fit, "REM (simulated data)")
+      notify_ppc(fit, "REM (simulated data)")
     }
   })
 
@@ -2353,7 +2383,7 @@ ui <- page_fillable(
     s <- pshared_sim()
 
     update_model_debug(pshared_tte_debug, status = "running", stage = "Running",
-                       started_at = Sys.time(), guidance = "Fitting TTE on the shared design.",
+                       started_at = Sys.time(), guidance = "Fitting TTE to the simulated data.",
                        context = c(
                          paste("Cameras:", nrow(s$tte$out)),
                          paste("True density:", s$D_true, "animals/km^2"),
@@ -2361,15 +2391,15 @@ ui <- page_fillable(
                          paste("Density prior:", describe_density_prior_spec(density_prior_spec())),
                          paste("Camera-level noise:", noise_label(s$settings$camera_noise))
                        ),
-                       log_entry = "Shared-design TTE run requested.")
-    showNotification("Running TTE on shared design...", type = "message", duration = NULL, id = "pshared_tte_status")
+                       log_entry = "TTE run on simulated data requested.")
+    showNotification("Running TTE on simulated data...", type = "message", duration = NULL, id = "pshared_tte_status")
 
     fit <- tryCatch(
       run_TTE(
         y = s$tte$camera_counts, r_km = s$tte$out$`Detection Distance` / 1000,
         camera_days = s$tte$camera_days, theta_deg = s$settings$theta,
-        iter = input$iter_rem_tte, burnin = input$burnin_rem_tte, thin = input$thin_rem_tte,
-        n_chains = app_n_chains(), D_max = rem_tte_start_D_max,
+        iter = mcmc_defaults$iter, burnin = mcmc_defaults$burnin, thin = mcmc_defaults$thin,
+        n_chains = mcmc_defaults$n_chains, D_max = rem_tte_start_D_max,
         log_v_mean = log(s$settings$v), log_v_sd = prior_input("log_v_sd"),
         sd_eps_shape = prior_input("sd_eps_shape"), sd_eps_rate = prior_input("sd_eps_rate"),
         max_adapt_rounds = app_max_adapt_rounds(),
@@ -2379,7 +2409,7 @@ ui <- page_fillable(
       ),
       error = function(e) {
         update_model_debug(pshared_tte_debug, status = "error", stage = "Failed", finished_at = Sys.time(),
-                           raw_error = e$message, guidance = friendly_model_error("TTE", "shared design", e$message))
+                           raw_error = e$message, guidance = friendly_model_error("TTE", "simulated data", e$message))
         showNotification(paste("TTE failed:", e$message), type = "error", duration = NULL)
         NULL
       },
@@ -2389,8 +2419,8 @@ ui <- page_fillable(
     if (!is.null(fit)) {
       update_model_debug(pshared_tte_debug, status = "success", stage = "Complete", finished_at = Sys.time(),
                          guidance = adaptive_limit_guidance(fit, "TTE", "Complete. Review the table above."))
-      notify_adaptive_limit(fit, "TTE (shared design)")
-      notify_ppc(fit, "TTE (shared design)")
+      notify_adaptive_limit(fit, "TTE (simulated data)")
+      notify_ppc(fit, "TTE (simulated data)")
     }
   })
 
@@ -2969,11 +2999,6 @@ ui <- page_fillable(
   }
 
   summarize_uscr_context <- function(d, source_label = "Uploaded") {
-    effective_iter <- as.integer(input$iter_uscr)
-    effective_burnin <- as.integer(input$burnin_uscr)
-    effective_thin <- as.integer(input$thin_uscr)
-    effective_M <- as.integer(input$M_uscr)
-
     det_dist <- if ("Detection Distance" %in% names(d$out)) {
       paste0(
         format_num(min(d$out$`Detection Distance`, na.rm = TRUE), 1),
@@ -2993,17 +3018,17 @@ ui <- page_fillable(
       paste(
         "Requested USCR full run:",
         paste0(
-          "iter=", effective_iter,
-          ", burn-in=", effective_burnin,
-          ", thin=", effective_thin,
-          ", chains=", app_n_chains(),
-          ", M=", effective_M
+          "iter=", mcmc_defaults$iter,
+          ", burn-in=", mcmc_defaults$burnin,
+          ", thin=", mcmc_defaults$thin,
+          ", chains=", mcmc_defaults$n_chains,
+          ", M=", mcmc_defaults$M_uscr
         )
       ),
       paste("USCR state-space buffer:", format_num(app_uscr_buffer_m(), 0), "m"),
       paste("USCR density prior:", describe_density_prior_spec(density_prior_spec())),
       paste("Camera-level noise:", noise_label(app_camera_noise())),
-      "USCR reruns automatically at the same chain count shown above: iterations and burn-in double when Rhat is too high, M doubles when the posterior for abundance (N) presses against M, and the state-space buffer grows when the posterior sigma implies animals near the edge could still be detected.",
+      "USCR reruns automatically at the same chain count shown above: iterations and burn-in double when Rhat is too high, M doubles when the posterior for abundance (N) presses against M, and the state-space buffer grows when the posterior \u03c3 implies animals near the edge could still be detected.",
       if (source_label == "Uploaded") {
         "Supported sources here: uploaded field data."
       } else {
@@ -3033,10 +3058,10 @@ ui <- page_fillable(
       paste(
         "Requested REM run:",
         paste0(
-          "iter=", input$iter_rem_tte,
-          ", burn-in=", input$burnin_rem_tte,
-          ", thin=", input$thin_rem_tte,
-          ", chains=", app_n_chains()
+          "iter=", mcmc_defaults$iter,
+          ", burn-in=", mcmc_defaults$burnin,
+          ", thin=", mcmc_defaults$thin,
+          ", chains=", mcmc_defaults$n_chains
         )
       ),
       "Supported sources here: uploaded field data only.",
@@ -3064,10 +3089,10 @@ ui <- page_fillable(
       paste(
         "Requested TTE run:",
         paste0(
-          "iter=", input$iter_rem_tte,
-          ", burn-in=", input$burnin_rem_tte,
-          ", thin=", input$thin_rem_tte,
-          ", chains=", app_n_chains()
+          "iter=", mcmc_defaults$iter,
+          ", burn-in=", mcmc_defaults$burnin,
+          ", thin=", mcmc_defaults$thin,
+          ", chains=", mcmc_defaults$n_chains
         )
       ),
       "Supported sources here: uploaded field data only.",
@@ -3084,10 +3109,10 @@ ui <- page_fillable(
       "REM" = paste(
         "Requested REM run:",
         paste0(
-          "iter=", input$iter_rem_tte,
-          ", burn-in=", input$burnin_rem_tte,
-          ", thin=", input$thin_rem_tte,
-          ", chains=", app_n_chains(),
+          "iter=", mcmc_defaults$iter,
+          ", burn-in=", mcmc_defaults$burnin,
+          ", thin=", mcmc_defaults$thin,
+          ", chains=", mcmc_defaults$n_chains,
           ", default angle=", input$theta,
           " degrees"
         )
@@ -3095,10 +3120,10 @@ ui <- page_fillable(
       "TTE" = paste(
         "Requested TTE run:",
         paste0(
-          "iter=", input$iter_rem_tte,
-          ", burn-in=", input$burnin_rem_tte,
-          ", thin=", input$thin_rem_tte,
-          ", chains=", app_n_chains(),
+          "iter=", mcmc_defaults$iter,
+          ", burn-in=", mcmc_defaults$burnin,
+          ", thin=", mcmc_defaults$thin,
+          ", chains=", mcmc_defaults$n_chains,
           ", default angle=", input$theta,
           " degrees"
         )
@@ -3133,7 +3158,7 @@ ui <- page_fillable(
     }
 
     if (identical(model, "USCR")) {
-      tips <- c(tips, "USCR doubles iterations and burn-in automatically when Rhat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior sigma is larger than the buffer safely covers, so longer runs can be expected when any check fails. If it is too slow for testing, reduce chains, iterations, or M.")
+      tips <- c(tips, "USCR doubles iterations and burn-in automatically when Rhat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior \u03c3 is larger than the buffer safely covers, so longer runs can be expected when any check fails. If it is too slow for testing, reduce chains, iterations, or M.")
     }
     if (identical(model, "REM")) {
       tips <- c(tips, "REM expects per-camera animal events, camera-days, and detection distances.")
@@ -3330,31 +3355,34 @@ ui <- page_fillable(
     )
   })
 
-  app_n_chains <- function() {
-    max(2L, as.integer(input$n_chains))
-  }
+  output$species_count_summary <- renderTable({
+    d <- nps_model_inputs()
+    tibble(
+      category = c("Animals Counted", "Total Camera-Days"),
+      result = c(
+        as.character(sum(d$camera_counts)),
+        format_num(sum(d$camera_days), 1)
+      )
+    )
+  }, colnames = FALSE)
 
   # ---- Effective prior settings ----
-  # Simple mode always uses the default priors; Advanced mode uses the inputs.
-  is_simple_mode <- function() !identical(input$mode, "Advanced")
+  # Default mode always uses the default priors; Advanced mode uses the inputs.
+  is_default_mode <- function() !identical(input$mode, "Advanced")
   prior_input <- function(id) {
-    if (is_simple_mode()) advanced_prior_defaults[[id]] else input[[id]]
-  }
-  default_uscr_buffer_m <- function() {
-    ceiling(uscr_default_buffer_m(advanced_prior_defaults$log_sigma_mean,
-                                  advanced_prior_defaults$log_sigma_sd) / 50) * 50
+    if (is_default_mode()) advanced_prior_defaults[[id]] else input[[id]]
   }
   app_uscr_buffer_m <- function() {
-    if (is_simple_mode()) default_uscr_buffer_m() else input$uscr_buffer_m
+    if (is_default_mode()) default_uscr_buffer_m else input$uscr_buffer_m
   }
 
-  # Switching to Simple resets every Advanced input to its default.
+  # Switching to Default resets every Advanced input to its default.
   observeEvent(input$mode, {
-    if (!is_simple_mode()) return()
+    if (!is_default_mode()) return()
     for (id in names(advanced_prior_defaults)) {
       updateNumericInput(session, id, value = advanced_prior_defaults[[id]])
     }
-    updateNumericInput(session, "uscr_buffer_m", value = default_uscr_buffer_m())
+    updateNumericInput(session, "uscr_buffer_m", value = default_uscr_buffer_m)
     updateCheckboxInput(session, "D_prior_uniform", value = TRUE)
     updateCheckboxInput(session, "camera_noise", value = FALSE)
     for (id in c("D_prior_lo", "D_prior_hi")) {
@@ -3362,10 +3390,10 @@ ui <- page_fillable(
     }
   }, ignoreInit = TRUE)
 
-  # Density prior (all models): uniform in Simple mode or when the box is checked;
-  # otherwise the user's mean and 95% interval (animals/km^2).
+  # Density prior (all models): uniform in Default mode or when the box is
+  # checked; otherwise the user's 95% interval (animals/km^2).
   density_prior_spec <- function() {
-    if (is_simple_mode() || !identical(input$D_prior_uniform, FALSE)) {
+    if (is_default_mode() || !identical(input$D_prior_uniform, FALSE)) {
       return(list(uniform = TRUE))
     }
     list(
@@ -3383,8 +3411,8 @@ ui <- page_fillable(
     paste0("informative, 95% interval ", spec$lo, " to ", spec$hi, " animals/km\u00b2")
   }
 
-  # Starting M for shared-design USCR runs: about twice the abundance expected
-  # under the true density (the density prior can raise it further).
+  # Starting M for USCR runs on simulated data: about twice the abundance
+  # expected under the true density (the density prior can raise it further).
   pshared_suggested_M <- function(s) {
     area <- uscr_buffered_area_km2(
       cbind(s$uscr$data$out$utm_e, s$uscr$data$out$utm_n),
@@ -3393,9 +3421,9 @@ ui <- page_fillable(
     max(50, ceiling(2 * s$D_true * area / 50) * 50)
   }
 
-  # ---- Density prior preview (Model settings > Advanced > Priors: USCR) ----
-  # The prior on density depends on the state-space area (and M), so the
-  # preview uses uploaded data if available, otherwise the shared design.
+  # ---- Density prior preview (Model settings > Advanced > Priors: Density) ----
+  # USCR's prior on density depends on the state-space area (and M), so its
+  # preview uses uploaded data if available, otherwise the current simulation.
   uscr_prior_preview_basis <- reactive({
     d <- tryCatch(nps_model_inputs(), error = function(e) NULL)
     if (!is.null(d) && nrow(d$out) >= 2) {
@@ -3403,13 +3431,13 @@ ui <- page_fillable(
         label = "your uploaded field data",
         out = d$out,
         buffer_m = app_uscr_buffer_m(),
-        M_start = as.integer(input$M_uscr)
+        M_start = mcmc_defaults$M_uscr
       ))
     }
     s <- tryCatch(pshared_sim(), error = function(e) NULL)
     if (!is.null(s)) {
       return(list(
-        label = "the current shared-design simulation",
+        label = "the current simulation",
         out = s$uscr$data$out,
         buffer_m = s$settings$buffer_m,
         M_start = pshared_suggested_M(s)
@@ -3426,21 +3454,21 @@ ui <- page_fillable(
     spec <- density_prior_spec_debounced()
     if (isTRUE(spec$uniform)) return(NULL)
     problem <- density_prior_problem(spec)
-    if (!is.null(problem)) return(list(message = problem, kind = "error"))
+    if (!is.null(problem)) return(list(message = problem))
 
     beta <- tryCatch(
       design_beta_density_prior(spec$lo, spec$hi, encounter_prior_start_D_max(spec$hi)),
       error = function(e) e
     )
     if (inherits(beta, "error")) {
-      return(list(message = conditionMessage(beta), kind = "error"))
+      return(list(message = conditionMessage(beta)))
     }
     out <- list(beta = beta)
 
     # USCR's prior depends on the state-space area, so it needs camera data.
     basis <- uscr_prior_preview_basis()
     if (is.null(basis)) {
-      out$uscr_message <- "its prior depends on the size of the state space, so it appears here once you upload field data or simulate a shared design."
+      out$uscr_message <- "its prior depends on the size of the state space, so it appears here once you upload field data or simulate data."
       return(out)
     }
     area <- uscr_state_space_and_area(basis$out, buffer_m = basis$buffer_m)$area_km2
@@ -3461,17 +3489,19 @@ ui <- page_fillable(
     pv <- density_prior_preview()
     if (is.null(pv)) return(NULL)
     if (!is.null(pv$message)) {
-      color <- if (identical(pv$kind, "error")) "firebrick" else "var(--muted)"
-      return(tags$p(class = "small", style = paste0("color: ", color, ";"), pv$message))
+      return(tags$p(class = "small", style = "color: firebrick;", pv$message))
     }
     fmt <- function(x) format(signif(x, 3), big.mark = ",")
     prior_line <- function(label, d, note) {
       tags$p(
         class = "small",
         tags$strong(label),
-        "95% interval ", fmt(d$achieved[["lo"]]), " to ", fmt(d$achieved[["hi"]]),
-        " animals/km\u00b2, mean ", fmt(d$achieved[["mean"]]),
-        ", median ", fmt(d$achieved[["median"]]), ". ", note
+        paste0(
+          "95% interval ", fmt(d$achieved[["lo"]]), " to ", fmt(d$achieved[["hi"]]),
+          " animals/km\u00b2, mean ", fmt(d$achieved[["mean"]]),
+          ", median ", fmt(d$achieved[["median"]]), "."
+        ),
+        note
       )
     }
     off_target_note <- function(label, d, why) {
@@ -3486,7 +3516,13 @@ ui <- page_fillable(
       )
     }
     tagList(
-      prior_line("REM & TTE: ", pv$beta, paste0("(Starting D_max = ", fmt(pv$beta$D_max), " animals/km\u00b2.)")),
+      prior_line(
+        "REM & TTE: ", pv$beta,
+        tagList(
+          "(Starting D", tags$sub("max", .noWS = c("before", "after")),
+          " = ", fmt(pv$beta$D_max), " animals/km\u00b2.)"
+        )
+      ),
       off_target_note("REM & TTE", pv$beta, ""),
       if (!is.null(pv[["uscr"]])) {
         prior_line(
@@ -3506,7 +3542,7 @@ ui <- page_fillable(
       tags$p(
         class = "small",
         style = "color: var(--muted);",
-        "During fitting, the app may enlarge D_max, M, or the USCR state space. When it does, it re-solves the prior to keep your interval, so the prior used in the fit can differ slightly from this preview. The run-status panel reports the prior actually used."
+        "During fitting, the app may enlarge D", tags$sub("max", .noWS = c("before", "after")), ", M, or the USCR state space. When it does, it re-solves the prior to keep your interval, so the prior used in the fit can differ slightly from this preview. The run-status panel reports the prior actually used."
       )
     )
   })
@@ -3517,9 +3553,9 @@ ui <- page_fillable(
     plot_density_priors(pv$beta, pv[["uscr"]])
   }, res = 110)
 
-  # Camera-level noise (Poisson-lognormal): off in Simple mode and by default.
+  # Camera-level noise (Poisson-lognormal): off in Default mode and by default.
   app_camera_noise <- function() {
-    !is_simple_mode() && isTRUE(input$camera_noise)
+    !is_default_mode() && isTRUE(input$camera_noise)
   }
   noise_label <- function(on) if (isTRUE(on)) "on (Poisson-lognormal counts)" else "off (Poisson counts)"
 
@@ -3610,7 +3646,7 @@ ui <- page_fillable(
           diffs <- c(diffs, paste0("State-space buffer: ", fmt(s$settings$buffer_m), " m (default ", fmt(auto), " m)"))
         }
       } else if (!shared) {
-        auto <- ceiling(uscr_default_buffer_m(prior_input("log_sigma_mean"), prior_input("log_sigma_sd")) / 50) * 50
+        auto <- round_buffer_m(uscr_default_buffer_m(prior_input("log_sigma_mean"), prior_input("log_sigma_sd")))
         if (changed(app_uscr_buffer_m(), auto)) {
           diffs <- c(diffs, paste0("State-space buffer: ", fmt(app_uscr_buffer_m()), " m (default ", fmt(auto), " m)"))
         }
@@ -3627,8 +3663,11 @@ ui <- page_fillable(
       add_prior("log_v_sd", "log(v) SD")
     }
 
-    if (app_max_adapt_rounds() != 6L) {
-      diffs <- c(diffs, paste0("Maximum adaptive rounds: ", app_max_adapt_rounds(), " (default 6)"))
+    if (app_max_adapt_rounds() != mcmc_defaults$max_adapt_rounds) {
+      diffs <- c(diffs, paste0(
+        "Maximum adaptive rounds: ", app_max_adapt_rounds(),
+        " (default ", mcmc_defaults$max_adapt_rounds, ")"
+      ))
     }
     diffs
   }
@@ -3661,7 +3700,7 @@ ui <- page_fillable(
 
   app_max_adapt_rounds <- function() {
     x <- suppressWarnings(as.integer(input$max_adapt_rounds))
-    if (length(x) != 1L || is.na(x) || x < 1L) 6L else x
+    if (length(x) != 1L || is.na(x) || x < 1L) mcmc_defaults$max_adapt_rounds else x
   }
 
   # Run-status guidance for a completed fit. Flags fits that stopped at the
@@ -3702,23 +3741,23 @@ ui <- page_fillable(
   observe({
     req(is.numeric(input$log_sigma_mean), is.numeric(input$log_sigma_sd))
     new_default <- uscr_default_buffer_m(input$log_sigma_mean, input$log_sigma_sd)
-    updateNumericInput(session, "uscr_buffer_m", value = ceiling(new_default / 50) * 50)
+    updateNumericInput(session, "uscr_buffer_m", value = round_buffer_m(new_default))
   })
 
   uscr_run_args <- function(waic = TRUE, status_callback = NULL,
                             buffer_m = NULL, log_lam0_mean = NULL,
                             log_sigma_mean = NULL) {
     args <- list(
-      iter = input$iter_uscr,
-      burnin = input$burnin_uscr,
-      thin = input$thin_uscr,
-      n_chains = app_n_chains(),
-      M = input$M_uscr,
+      iter = mcmc_defaults$iter,
+      burnin = mcmc_defaults$burnin,
+      thin = mcmc_defaults$thin,
+      n_chains = mcmc_defaults$n_chains,
+      M = mcmc_defaults$M_uscr,
       log_sigma_mean = log_sigma_mean %||% prior_input("log_sigma_mean"),
       log_sigma_sd = prior_input("log_sigma_sd"),
       buffer_m = buffer_m %||% app_uscr_buffer_m(),
       log_lam0_mean = log_lam0_mean %||% prior_input("log_lam0_mean"),
-      log_lam0_sd =  prior_input("log_lam0_sd"),
+      log_lam0_sd = prior_input("log_lam0_sd"),
       sd_eps_shape = prior_input("sd_eps_shape"),
       sd_eps_rate = prior_input("sd_eps_rate"),
       adaptive = TRUE,
@@ -3727,7 +3766,7 @@ ui <- page_fillable(
       camera_noise = app_camera_noise(),
       compute_WAIC = waic,
       diagnostic_mode = FALSE,
-      parallel_chains = isTRUE(app_n_chains() > 1),
+      parallel_chains = TRUE,
       status_callback = status_callback,
       verbose = FALSE
     )
@@ -3906,10 +3945,10 @@ ui <- page_fillable(
           r_km         = d$out$`Detection Distance` / 1000,
           camera_days  = d$camera_days,
           theta_deg    = get_camera_angle_vector(d$out, default_deg = input$theta),
-          iter         = input$iter_rem_tte,
-          burnin       = input$burnin_rem_tte,
-          thin         = input$thin_rem_tte,
-          n_chains     = app_n_chains(),
+          iter         = mcmc_defaults$iter,
+          burnin       = mcmc_defaults$burnin,
+          thin         = mcmc_defaults$thin,
+          n_chains     = mcmc_defaults$n_chains,
           D_max        = rem_tte_start_D_max,
           log_v_mean   = prior_input("log_v_mean"),
           log_v_sd     = prior_input("log_v_sd"),
@@ -4012,10 +4051,10 @@ ui <- page_fillable(
           r_km         = d$out$`Detection Distance` / 1000,
           camera_days  = d$camera_days,
           theta_deg    = get_camera_angle_vector(d$out, default_deg = input$theta),
-          iter         = input$iter_rem_tte,
-          burnin       = input$burnin_rem_tte,
-          thin         = input$thin_rem_tte,
-          n_chains     = app_n_chains(),
+          iter         = mcmc_defaults$iter,
+          burnin       = mcmc_defaults$burnin,
+          thin         = mcmc_defaults$thin,
+          n_chains     = mcmc_defaults$n_chains,
           D_max        = rem_tte_start_D_max,
           log_v_mean   = prior_input("log_v_mean"),
           log_v_sd     = prior_input("log_v_sd"),
@@ -4309,16 +4348,6 @@ ui <- page_fillable(
     }
   )
 
-  output$species_count_summary <- renderTable({
-    tibble(
-      category = c("Animals counted", "Camera-days"),
-      result = c(
-        sum(nps_model_inputs()$camera_counts),
-        sum(nps_model_inputs()$camera_days)
-        )
-    )
-  },
-  colnames = F)
 }
 
 # -------------------------------------------------------------------
