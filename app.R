@@ -192,18 +192,18 @@ prepare_combo_density_data <- function(fits) {
 
   waic_weights_available <- FALSE
   if (length(model_names) == 1L) {
-    waic_tbl <- waic_tbl %>%
+    waic_tbl <- waic_tbl |>
       dplyr::mutate(deltaWAIC = 0, rel_lik = 1, w = 1)
     waic_weights_available <- TRUE
   } else if (any(!is.finite(waic_tbl$waic))) {
-    waic_tbl <- waic_tbl %>%
+    waic_tbl <- waic_tbl |>
       dplyr::mutate(
         deltaWAIC = NA_real_,
         rel_lik = NA_real_,
         w = NA_real_
       )
   } else {
-    waic_tbl <- waic_tbl %>%
+    waic_tbl <- waic_tbl |>
       dplyr::mutate(
         deltaWAIC = waic - min(waic),
         rel_lik = exp(-0.5 * deltaWAIC),
@@ -372,7 +372,7 @@ build_combo_interval_plot <- function(fits, title_text) {
     mean = as.numeric(apply(combo_data$density_est, 2, mean)),
     lower = as.numeric(apply(combo_data$density_est, 2, stats::quantile, probs = 0.025)),
     upper = as.numeric(apply(combo_data$density_est, 2, stats::quantile, probs = 0.975))
-  ) %>%
+  ) |>
     dplyr::mutate(
       Summary = dplyr::case_when(
         Method %in% combo_data$model_names ~ "Model",
@@ -1204,7 +1204,6 @@ ui <- page_fillable(
       hr()
     ),
 
-
     # ---------------------- DATA SUMMARY --------------------------
     nav_panel(
       "Data summary",
@@ -1990,27 +1989,27 @@ ui <- page_fillable(
 # SERVER
 # -------------------------------------------------------------------
 
-  server <- function(input, output, session) {
+server <- function(input, output, session) {
 
-    # make_model_debug() is used immediately below (reactiveVal() forces its
-    # initial value right away, unlike observeEvent/render blocks), so it must
-    # be defined here, before first use, rather than further down in the file.
-    make_model_debug <- function(model, data_source, supported_sources, preprocess_note) {
-      list(
-        model = model,
-        data_source = data_source,
-        supported_sources = supported_sources,
-        preprocess_note = preprocess_note,
-        status = "idle",
-        stage = "Not started",
-        started_at = NULL,
-        finished_at = NULL,
-        guidance = "No run has been started yet.",
-        raw_error = NULL,
-        context = character(),
-        history = character()
-      )
-    }
+  # make_model_debug() is used immediately below (reactiveVal() forces its
+  # initial value right away, unlike observeEvent/render blocks), so it must
+  # be defined here, before first use, rather than further down in the file.
+  make_model_debug <- function(model, data_source, supported_sources, preprocess_note) {
+    list(
+      model = model,
+      data_source = data_source,
+      supported_sources = supported_sources,
+      preprocess_note = preprocess_note,
+      status = "idle",
+      stage = "Not started",
+      started_at = NULL,
+      finished_at = NULL,
+      guidance = "No run has been started yet.",
+      raw_error = NULL,
+      context = character(),
+      history = character()
+    )
+  }
 
   # ================================================================
   # POWER ANALYSIS: simulation comparison (USCR + REM + TTE)
@@ -3777,8 +3776,7 @@ ui <- page_fillable(
     args[names(args) %in% valid_names]
   }
 
-
-    # --- USCR: NPS ---
+  # --- USCR: NPS ---
 
   start_uscr_nps_run <- function() {
     req(nps_model_inputs())
@@ -4109,7 +4107,7 @@ ui <- page_fillable(
   # MODEL TAB OUTPUTS (USCR / REM / TTE)
   # ================================================================
 
- output$uscr_nps_text <- renderPrint({
+  output$uscr_nps_text <- renderPrint({
     dbg <- uscr_nps_debug()
     if (uscr_nps_running()) {
       cat("⏳ USCR model is running...\n")
@@ -4211,12 +4209,11 @@ ui <- page_fillable(
     out
   })
 
-   output$uscr_nps_debug <- renderText({
+  output$uscr_nps_debug <- renderText({
     state <- uscr_nps_debug()
     if (identical(state$status, "running")) invalidateLater(1000, session)
     format_model_debug(state, uscr_nps_fit())
   })
-
 
   output$rem_nps_debug <- renderText({
     state <- rem_nps_debug()
@@ -4224,7 +4221,7 @@ ui <- page_fillable(
     format_model_debug(state, rem_nps_fit())
   })
 
-    output$tte_nps_debug <- renderText({
+  output$tte_nps_debug <- renderText({
     state <- tte_nps_debug()
     if (identical(state$status, "running")) invalidateLater(1000, session)
     format_model_debug(state, tte_nps_fit())
@@ -4303,7 +4300,7 @@ ui <- page_fillable(
         rownames = FALSE
       ))
     }
-    df <- combo$table %>%
+    df <- combo$table |>
       mutate(across(where(is.numeric), ~ round(.x, 3)))
     # Bayesian p-values outside 0.05-0.95 (failed posterior predictive check) in red.
     datatable(df, options = list(paging = FALSE, ordering = FALSE, dom = "t", autoWidth = TRUE), rownames = FALSE) |>
