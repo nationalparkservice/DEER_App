@@ -326,82 +326,47 @@ build_nps_model_inputs <- function(
 }
 
 # -------------------------------------------------------------------
-# 3. REM model (nimble) — mirrors Rmd structure
+# 3. MCMC chain runner (all models)
 # -------------------------------------------------------------------
-run_basic_nimble_chain <- function(code,
-                                   constants,
-                                   data,
-                                   monitors,
-                                   niter,
-                                   nburnin,
-                                   thin,
-                                   compute_WAIC = TRUE) {
-  quiet_require("nimble")
 
-  out <- nimble::nimbleMCMC(
-    code = code,
-    constants = constants,
-    data = data,
-    monitors = monitors,
-    niter = niter,
-    nburnin = nburnin,
-    thin = thin,
-    WAIC = compute_WAIC,
-    summary = FALSE,
-    samplesAsCodaMCMC = FALSE
-  )
-
-  normalize_nimble_output(out)
+# nimbleMCMC() returns just the samples matrix when WAIC is off; return the
+# same list(samples, WAIC) shape either way.
+normalize_nimble_output <- function(x) {
+  if (is.matrix(x) || is.data.frame(x)) {
+    return(list(samples = as.matrix(x), WAIC = NULL))
+  }
+  x
 }
 
-run_basic_nimble_chains <- function(code,
-                                    constants,
-                                    data,
-                                    monitors,
-                                    niter,
-                                    nburnin,
-                                    thin,
-                                    n_chains = 1,
-                                    parallel_chains = TRUE,
-                                    compute_WAIC = TRUE,
-                                    seed = NULL) {
+# Runs the chains in parallel worker processes (one per chain, up to the
+# number of cores minus one). make_inits(constants), if given, returns each
+# chain's initial values (USCR uses it to start activity centers near
+# cameras); otherwise nimble chooses initial values itself.
+run_nimble_chains <- function(code,
+                              constants,
+                              data,
+                              monitors,
+                              niter,
+                              nburnin,
+                              thin,
+                              n_chains,
+                              compute_WAIC,
+                              make_inits = NULL) {
   quiet_require("parallel")
-
-  if (n_chains <= 1L || !parallel_chains) {
-    if (!is.null(seed)) {
-      set.seed(seed)
-    }
-
-    return(list(
-      run_basic_nimble_chain(
-        code = code,
-        constants = constants,
-        data = data,
-        monitors = monitors,
-        niter = niter,
-        nburnin = nburnin,
-        thin = thin,
-        compute_WAIC = compute_WAIC
-      )
-    ))
-  }
 
   cl_size <- min(n_chains, max(1L, parallel::detectCores() - 1L))
   cl <- parallel::makeCluster(cl_size)
   on.exit(parallel::stopCluster(cl), add = TRUE)
 
-  if (!is.null(seed)) {
-    parallel::clusterSetRNGStream(cl, iseed = seed)
-  }
-
-  fits <- parallel::parLapply(
+  parallel::parLapply(
     cl = cl,
     X = seq_len(n_chains),
     fun = function(chain_id, code, constants, data, monitors,
-                   niter, nburnin, thin, compute_WAIC) {
+                   niter, nburnin, thin, compute_WAIC,
+                   make_inits, normalize) {
       library(nimble)
 
-      out <- nimble::nimbleMCMC(
+      mcmc_args <- list(
         code = code,
         constants = constants,
         data = data,
@@ -413,11 +378,13 @@ run_basic_nimble_chains <- function(code,
         summary = FALSE,
         samplesAsCodaMCMC = FALSE
       )
-
-      if (is.matrix(out) || is.data.frame(out)) {
-        return(list(samples = as.matrix(out), WAIC = NULL))
+      # nimbleMCMC() doesn't accept inits = NULL, so add inits only when
+      # there are some. quote = TRUE passes the model code as is, rather than
+      # evaluating it.
+      if (!is.null(make_inits)) {
+        mcmc_args$inits <- make_inits(constants)
       }
-      out
+      normalize(do.call(nimble::nimbleMCMC, mcmc_args, quote = TRUE))
     },
     code = code,
     constants = constants,
@@ -426,12 +393,21 @@ run_basic_nimble_chains <- function(code,
     niter = niter,
     nburnin = nburnin,
     thin = thin,
-    compute_WAIC = compute_WAIC
+    compute_WAIC = compute_WAIC,
+    make_inits = make_inits,
+    normalize = normalize_nimble_output
   )
-
-  fits
 }
 
+# -------------------------------------------------------------------
+# 4. REM and TTE: adaptive fit
+# -------------------------------------------------------------------
+
+# Fits REM or TTE (model code and constants from run_REM() or run_TTE()), then
+# reruns it while any check fails, up to max_adapt_rounds rounds: iterations,
+# burn-in, and thinning double if Rhat is above rhat_target, and D_max doubles
+# if the posterior for D presses against it. The checks' thresholds keep their
+# defaults.
 run_encounter_rate_model <- function(method,
                                      code,
                                      constants,
@@ -441,90 +417,61 @@ run_encounter_rate_model <- function(method,
                                      burnin,
                                      thin,
                                      n_chains,
-                                     adaptive = TRUE,
-                                     compute_WAIC = TRUE,
+                                     D_max,
+                                     density_prior,
+                                     max_adapt_rounds,
+                                     compute_WAIC,
+                                     status_callback,
                                      rhat_target = 1.1,
-                                     max_adapt_rounds = 6,
-                                     D_max = 200,
-                                     density_prior = NULL,
                                      D_check_fraction = 0.9,
-                                     D_check_prob = 0.01,
-                                     parallel_chains = TRUE,
-                                     status_callback = NULL,
-                                     seed = NULL,
-                                     verbose = FALSE) {
-  report_status <- function(round, iter, burnin, prev_elapsed_min = NULL, prev_iter = NULL) {
-    if (is.function(status_callback)) {
-      status_callback(
-        round = round,
-        iter = iter,
-        burnin = burnin,
-        prev_elapsed_min = prev_elapsed_min,
-        prev_iter = prev_iter
-      )
-    }
-  }
-
+                                     D_check_prob = 0.01) {
   iter <- as.integer(iter)
   burnin <- as.integer(burnin)
   thin <- as.integer(max(1, thin))
   n_chains <- as.integer(max(1, n_chains))
+  max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
+
+  # density_prior: list(uniform = TRUE) for D ~ Uniform(0, D_max), or
+  # list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2 (the
+  # app checks the interval before running). D_max is the starting upper
+  # limit under the uniform prior; an informative prior starts it at twice
+  # the interval's upper bound instead.
+  informative_prior <- identical(density_prior$uniform, FALSE)
+  current_D_max <- if (informative_prior) {
+    encounter_prior_start_D_max(density_prior$hi)
+  } else {
+    as.numeric(D_max)
+  }
 
   current_iter <- iter
   current_burnin <- burnin
   current_thin <- thin
   round_i <- 0L
   current_rhat <- Inf
-  adapt_log <- list()
+  round_log <- list()
   hit_max_adapt_rounds <- FALSE
   unmet_checks <- character(0)
-  if (!is.null(max_adapt_rounds)) {
-    max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
-  }
-
-  # density_prior: NULL or list(uniform = TRUE) for D ~ Uniform(0, D_max), or
-  # list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2.
-  informative_prior <- !is.null(density_prior) && identical(density_prior$uniform, FALSE)
-  if (informative_prior) {
-    prior_msg <- check_density_prior(density_prior$lo, density_prior$hi)
-    if (!is.null(prior_msg)) stop(prior_msg, call. = FALSE)
-  }
-  current_D_max <- if (informative_prior) {
-    encounter_prior_start_D_max(density_prior$hi)
-  } else {
-    as.numeric(D_max)
-  }
   prior_design <- NULL
-  last_fit <- NULL
   prev_elapsed_min <- NULL
   prev_iter <- NULL
+  fit <- NULL
+  samples_list <- NULL
+  samples_all <- NULL
 
   repeat {
     round_i <- round_i + 1L
 
-    if (!isTRUE(adaptive) && round_i > 1L) {
-      break
-    }
-
-    if (isTRUE(verbose)) {
-      message(
-        method, " MCMC round ", round_i,
-        ": iter=", current_iter,
-        ", burnin=", current_burnin,
-        ", thin=", current_thin,
-        ", chains=", n_chains
-      )
-    }
-    report_status(
+    status_callback(
       round = round_i,
       iter = current_iter,
       burnin = current_burnin,
+      D_max = current_D_max,
       prev_elapsed_min = prev_elapsed_min,
       prev_iter = prev_iter
     )
     round_started <- Sys.time()
 
-    # (Re-)solve the density prior for this round's D_max, so the requested
+    # Re-solve the density prior for this round's D_max, so the requested
     # interval holds as D_max grows.
     prior_design <- if (informative_prior) {
       design_beta_density_prior(density_prior$lo, density_prior$hi, current_D_max)
@@ -535,7 +482,7 @@ run_encounter_rate_model <- function(method,
     constants$D_a <- prior_design$a
     constants$D_b <- prior_design$b
 
-    fit <- run_basic_nimble_chains(
+    fit <- run_nimble_chains(
       code = code,
       constants = constants,
       data = data,
@@ -544,20 +491,19 @@ run_encounter_rate_model <- function(method,
       nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
-      parallel_chains = parallel_chains,
-      compute_WAIC = compute_WAIC,
-      seed = if (is.null(seed)) NULL else seed + round_i
+      compute_WAIC = compute_WAIC
     )
 
     samples_list <- lapply(fit, `[[`, "samples")
+    samples_all <- do.call(rbind, samples_list)
     current_rhat <- safe_rhat_max(samples_list)
     converged <- is.na(current_rhat) || current_rhat <= rhat_target
 
     # D_max is too small if the posterior for D presses against it.
-    D_post <- do.call(rbind, samples_list)[, "D"]
+    D_post <- samples_all[, "D"]
     D_too_small <- mean(D_post > D_check_fraction * current_D_max, na.rm = TRUE) > D_check_prob
 
-    adapt_log[[round_i]] <- data.frame(
+    round_log[[round_i]] <- data.frame(
       round = round_i,
       D_max = current_D_max,
       D_a = prior_design$a,
@@ -571,16 +517,15 @@ run_encounter_rate_model <- function(method,
       stringsAsFactors = FALSE
     )
 
-    last_fit <- fit
     prev_elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
     prev_iter <- current_iter
 
-    if ((converged && !D_too_small) || !isTRUE(adaptive)) {
+    if (converged && !D_too_small) {
       break
     }
 
     # Stop here (before doubling) so the reported settings match the last fit.
-    if (!is.null(max_adapt_rounds) && round_i >= max_adapt_rounds) {
+    if (round_i >= max_adapt_rounds) {
       hit_max_adapt_rounds <- TRUE
       unmet_checks <- c(if (!converged) "Rhat", if (D_too_small) "D_max")
       warning(
@@ -604,16 +549,13 @@ run_encounter_rate_model <- function(method,
     }
   }
 
-  samples_list <- lapply(last_fit, `[[`, "samples")
-  samples_all <- do.call(rbind, samples_list)
-
   list(
     method = method,
     samples_list = samples_list,
     samples_all = samples_all,
-    waic = extract_waic_mean(last_fit),
-    fit_objects = last_fit,
-    round_history = if (length(adapt_log) > 0L) do.call(rbind, adapt_log) else NULL,
+    waic = extract_waic_mean(fit),
+    fit_objects = fit,
+    round_history = do.call(rbind, round_log),
     final_rhat_max = current_rhat,
     hit_max_adapt_rounds = hit_max_adapt_rounds,
     unmet_checks = unmet_checks,
@@ -623,7 +565,6 @@ run_encounter_rate_model <- function(method,
       burnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
-      adaptive = adaptive,
       max_adapt_rounds = max_adapt_rounds,
       rhat_target = rhat_target,
       D_max = current_D_max,
@@ -633,89 +574,82 @@ run_encounter_rate_model <- function(method,
   )
 }
 
+# -------------------------------------------------------------------
+# 5. REM model
+# -------------------------------------------------------------------
+# Random encounter model (Rowcliffe et al. 2008): the expected count at camera
+# j is D * days_j * v * r_j * (2 + theta_j) / pi, with theta_j in radians.
+
+# The app supplies every setting without a default here (its constants live
+# in app.R) and checks the inputs before running. theta_deg is one detection
+# angle for every camera (simulated data) or one per camera (uploaded data).
 run_REM <- function(y,
                     r_km,
                     camera_days,
-                    iter     = 6000,
-                    burnin   = 1000,
-                    thin     = 5,
-                    n_chains = 2,
-                    D_max    = 200,
-                    log_v_mean = 1.130,
-                    log_v_sd   = 0.3372,
-                    sd_eps_shape = 1,
-                    sd_eps_rate  = 1,
-                    theta_deg  = 55,
-                    adaptive = TRUE,
-                    compute_WAIC = TRUE,
-                    rhat_target = 1.1,
-                    max_adapt_rounds = 6,
-                    density_prior = NULL,
-                    camera_noise = FALSE,
-                    parallel_chains = TRUE,
-                    status_callback = NULL,
-                    seed = NULL,
-                    verbose = FALSE) {
-
+                    theta_deg,
+                    iter,
+                    burnin,
+                    thin,
+                    n_chains,
+                    D_max,
+                    log_v_mean,
+                    log_v_sd,
+                    sd_eps_shape,
+                    sd_eps_rate,
+                    density_prior,
+                    camera_noise,
+                    max_adapt_rounds,
+                    compute_WAIC,
+                    status_callback) {
   quiet_require("nimble")
 
   J <- length(y)
-  if (length(r_km) != J || length(camera_days) != J) {
-    stop("run_REM: y, r_km, and camera_days must have same length.", call. = FALSE)
-  }
-  if (J < 2L) {
-    stop("run_REM: at least 2 cameras are required to estimate density.", call. = FALSE)
-  }
-  if (length(theta_deg) == 1L) {
-    theta_deg <- rep(as.numeric(theta_deg), J)
-  } else if (length(theta_deg) != J) {
-    stop("run_REM: theta_deg must have length 1 or the same length as y.", call. = FALSE)
-  }
+  theta_deg <- rep_len(as.numeric(theta_deg), J)
 
   code <- nimble::nimbleCode({
-
-    # Priors
-    p_D    ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
-    D      <- D_max * p_D
-    log_v  ~ dnorm(log_v_mean, sd = log_v_sd)
+    p_D ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
+    D <- D_max * p_D
+    log_v ~ dnorm(log_v_mean, sd = log_v_sd)
     sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
 
-    v     <- exp(log_v)
+    v <- exp(log_v)
 
     for (j in 1:J) {
-
       eps[j] ~ dnorm(0, sd = sd_eps)
 
-      log(lambda[j]) <- log(2 + theta[j]) - log(pi_const) + log(v) +
-        log(r[j]) + log(D) + log(camera_days[j]) + use_eps * eps[j]
+      # Camera-level noise (Poisson-lognormal) only when use_eps = 1. With
+      # use_eps = 0, eps and sd_eps are sampled from their priors but don't
+      # affect the data, and they are not monitored.
+      log(lambda[j]) <- log(D) + log(camera_days[j]) + log(v) + log(r[j]) +
+        log(2 + theta[j]) - log(pi_const) + use_eps * eps[j]
 
-      y[j]     ~ dpois(lambda[j])
+      y[j] ~ dpois(lambda[j])
       y_sim[j] ~ dpois(lambda[j])
 
-      pearson_obs[j] <- (y[j]     - lambda[j])^2 / lambda[j]
+      # Posterior predictive check (see ppc_summary()).
+      pearson_obs[j] <- (y[j] - lambda[j])^2 / lambda[j]
       pearson_sim[j] <- (y_sim[j] - lambda[j])^2 / lambda[j]
     }
 
     sum_obs <- sum(pearson_obs[1:J])
     sum_sim <- sum(pearson_sim[1:J])
-    bp      <- step(sum_sim - sum_obs)
+    bp <- step(sum_sim - sum_obs)
   })
 
-  Const <- list(
-    J          = J,
-    r          = as.numeric(r_km),
+  const <- list(
+    J = J,
+    r = as.numeric(r_km),
     camera_days = as.numeric(camera_days),
-    pi_const   = pi,
-    theta      = as.numeric(theta_deg) * pi / 180,
-    D_max      = D_max,
+    pi_const = pi,
+    theta = theta_deg * pi / 180,
     log_v_mean = log_v_mean,
-    log_v_sd   = log_v_sd,
+    log_v_sd = log_v_sd,
     sd_eps_shape = sd_eps_shape,
-    sd_eps_rate  = sd_eps_rate,
-    use_eps    = as.numeric(isTRUE(camera_noise))
+    sd_eps_rate = sd_eps_rate,
+    use_eps = as.numeric(isTRUE(camera_noise))
   )
 
-  Data <- list(y = as.numeric(y))
+  data_list <- list(y = as.numeric(y))
 
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
   monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
@@ -724,69 +658,52 @@ run_REM <- function(y,
   fit <- run_encounter_rate_model(
     method = "REM",
     code = code,
-    constants = Const,
-    data = Data,
+    constants = const,
+    data = data_list,
     monitors = monitors,
     iter = iter,
     burnin = burnin,
     thin = thin,
     n_chains = n_chains,
-    adaptive = adaptive,
-    compute_WAIC = compute_WAIC,
-    rhat_target = rhat_target,
-    max_adapt_rounds = max_adapt_rounds,
     D_max = D_max,
     density_prior = density_prior,
-    parallel_chains = parallel_chains,
-    status_callback = status_callback,
-    seed = seed,
-    verbose = verbose
+    max_adapt_rounds = max_adapt_rounds,
+    compute_WAIC = compute_WAIC,
+    status_callback = status_callback
   )
   fit$settings$camera_noise <- isTRUE(camera_noise)
   fit
 }
 
 # -------------------------------------------------------------------
-# 4. TTE model (nimble) — mirrors Rmd structure
+# 6. TTE model
 # -------------------------------------------------------------------
+
+# The app supplies every setting without a default here (its constants live
+# in app.R) and checks the inputs before running. theta_deg is one detection
+# angle for every camera (simulated data) or one per camera (uploaded data).
 run_TTE <- function(y,
                     r_km,
                     camera_days,
-                    iter     = 6000,
-                    burnin   = 1000,
-                    thin     = 5,
-                    n_chains = 2,
-                    D_max    = 200,
-                    log_v_mean = 1.130,
-                    log_v_sd   = 0.3372,
-                    sd_eps_shape = 1,
-                    sd_eps_rate  = 1,
-                    theta_deg  = 55,
-                    adaptive = TRUE,
-                    compute_WAIC = TRUE,
-                    rhat_target = 1.1,
-                    max_adapt_rounds = 6,
-                    density_prior = NULL,
-                    camera_noise = FALSE,
-                    parallel_chains = TRUE,
-                    status_callback = NULL,
-                    seed = NULL,
-                    verbose = FALSE) {
-
+                    theta_deg,
+                    iter,
+                    burnin,
+                    thin,
+                    n_chains,
+                    D_max,
+                    log_v_mean,
+                    log_v_sd,
+                    sd_eps_shape,
+                    sd_eps_rate,
+                    density_prior,
+                    camera_noise,
+                    max_adapt_rounds,
+                    compute_WAIC,
+                    status_callback) {
   quiet_require("nimble")
 
   J <- length(y)
-  if (length(r_km) != J || length(camera_days) != J) {
-    stop("run_TTE: y, r_km, and camera_days must have same length.", call. = FALSE)
-  }
-  if (J < 2L) {
-    stop("run_TTE: at least 2 cameras are required to estimate density.", call. = FALSE)
-  }
-  if (length(theta_deg) == 1L) {
-    theta_deg <- rep(as.numeric(theta_deg), J)
-  } else if (length(theta_deg) != J) {
-    stop("run_TTE: theta_deg must have length 1 or the same length as y.", call. = FALSE)
-  }
+  theta_deg <- rep_len(as.numeric(theta_deg), J)
 
   code <- nimble::nimbleCode({
 
@@ -826,7 +743,6 @@ run_TTE <- function(y,
     pi_const    = pi,
     r           = as.numeric(r_km),
     camera_days = as.numeric(camera_days),
-    D_max       = D_max,
     log_v_mean  = log_v_mean,
     log_v_sd    = log_v_sd,
     sd_eps_shape = sd_eps_shape,
@@ -852,16 +768,11 @@ run_TTE <- function(y,
     burnin = burnin,
     thin = thin,
     n_chains = n_chains,
-    adaptive = adaptive,
-    compute_WAIC = compute_WAIC,
-    rhat_target = rhat_target,
-    max_adapt_rounds = max_adapt_rounds,
     D_max = D_max,
     density_prior = density_prior,
-    parallel_chains = parallel_chains,
-    status_callback = status_callback,
-    seed = seed,
-    verbose = verbose
+    max_adapt_rounds = max_adapt_rounds,
+    compute_WAIC = compute_WAIC,
+    status_callback = status_callback
   )
   fit$settings$camera_noise <- isTRUE(camera_noise)
   fit
@@ -1266,8 +1177,6 @@ plot_density_priors <- function(beta_design, uscr_design = NULL) {
 # USCR requires at least 2 cameras: sigma (the spatial decay of detection
 # with distance) is estimated from spatial contrast in detections across
 # cameras at different locations, so a single camera can't identify it.
-# This is the only supported model form; run_USCR() enforces J >= 2 before
-# calling this.
 build_uscr_code <- function() {
   quiet_require("nimble")
 
@@ -1377,66 +1286,6 @@ make_uscr_inits <- function(constants) {
   )
 
   list(hrc = hrc)
-}
-
-normalize_nimble_output <- function(x) {
-  if (is.matrix(x) || is.data.frame(x)) {
-    return(list(samples = as.matrix(x), WAIC = NULL))
-  }
-  x
-}
-
-# Runs the chains in parallel worker processes (one per chain, up to the
-# number of cores minus one).
-run_uscr_chains <- function(code,
-                            constants,
-                            data,
-                            monitors,
-                            niter,
-                            nburnin,
-                            thin,
-                            n_chains,
-                            compute_WAIC) {
-  quiet_require("parallel")
-
-  cl_size <- min(n_chains, max(1L, parallel::detectCores() - 1L))
-  cl <- parallel::makeCluster(cl_size)
-  on.exit(parallel::stopCluster(cl), add = TRUE)
-
-  parallel::parLapply(
-    cl = cl,
-    X = seq_len(n_chains),
-    fun = function(chain_id, code, constants, data, monitors,
-                   niter, nburnin, thin, compute_WAIC,
-                   make_inits, normalize) {
-      library(nimble)
-
-      out <- nimble::nimbleMCMC(
-        code = code,
-        constants = constants,
-        data = data,
-        inits = make_inits(constants),
-        monitors = monitors,
-        niter = niter,
-        nburnin = nburnin,
-        thin = thin,
-        WAIC = compute_WAIC,
-        summary = FALSE,
-        samplesAsCodaMCMC = FALSE
-      )
-      normalize(out)
-    },
-    code = code,
-    constants = constants,
-    data = data,
-    monitors = monitors,
-    niter = niter,
-    nburnin = nburnin,
-    thin = thin,
-    compute_WAIC = compute_WAIC,
-    make_inits = make_uscr_inits,
-    normalize = normalize_nimble_output
-  )
 }
 
 safe_rhat_max <- function(samples_list) {
@@ -1715,7 +1564,7 @@ run_USCR <- function(out,
     )
     round_started <- Sys.time()
 
-    fit <- run_uscr_chains(
+    fit <- run_nimble_chains(
       code = code,
       constants = const,
       data = data_list,
@@ -1724,7 +1573,8 @@ run_USCR <- function(out,
       nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
-      compute_WAIC = compute_WAIC
+      compute_WAIC = compute_WAIC,
+      make_inits = make_uscr_inits
     )
 
     samples_list <- lapply(fit, `[[`, "samples")
@@ -1802,7 +1652,7 @@ run_USCR <- function(out,
     fit_objects = fit,
     samples_list = samples_list,
     samples_all = samples_all,
-    round_history = if (length(round_log) > 0L) do.call(rbind, round_log) else NULL,
+    round_history = do.call(rbind, round_log),
     final_rhat_max = current_rhat,
     settings_M = const$M,
     settings_iter = current_iter,

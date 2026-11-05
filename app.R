@@ -96,6 +96,16 @@ advanced_prior_defaults <- list(
   log_lam0_sd    = 1
 )
 
+# Default detection angle (degrees) for uploaded cameras without a valid
+# Camera Detection Angle value.
+default_theta_deg <- 55
+
+# Format a number with a fixed number of decimal places, for text that quotes
+# values computed from the constants.
+format_fixed <- function(x, digits = 2) {
+  format(round(x, digits), nsmall = digits, trim = TRUE)
+}
+
 # Round a USCR state-space buffer (m) up to the nearest 50 m.
 round_buffer_m <- function(buffer_m) ceiling(buffer_m / 50) * 50
 
@@ -106,11 +116,27 @@ default_uscr_buffer_m <- round_buffer_m(uscr_default_buffer_m(
 ))
 
 # 95% circular home-range area (km^2) at the default prior mean of
-# log(sigma), quoted in the USCR model description.
+# log(sigma), and its approximate 95% prior interval, quoted in the model
+# descriptions.
 default_hr95_km2 <- pi * uscr_home_range_radius_km(
   exp(advanced_prior_defaults$log_sigma_mean),
   p = 0.95
 )^2
+default_hr95_interval_km2 <- pi * uscr_home_range_radius_km(
+  exp(
+    advanced_prior_defaults$log_sigma_mean +
+      c(-1, 1) * stats::qnorm(0.975) * advanced_prior_defaults$log_sigma_sd
+  ),
+  p = 0.95
+)^2
+
+# Daily movement rate v (km/day) at the default prior mean of log(v), and its
+# approximate 95% prior interval, quoted in the model descriptions.
+default_v_km_day <- exp(advanced_prior_defaults$log_v_mean)
+default_v_interval_km_day <- exp(
+  advanced_prior_defaults$log_v_mean +
+    c(-1, 1) * stats::qnorm(0.975) * advanced_prior_defaults$log_v_sd
+)
 
 # -------------------------------------------------------------------
 # Simulation helpers
@@ -1137,7 +1163,7 @@ ui <- page_fillable(
           "- **`Latitude`**: Camera latitude (decimal degrees, WGS84, the standard datum used by GPS devices and phones). The app corrects the sign to match the hemisphere selected in **Model settings** (under Camera geometry and coordinates).",
           "- **`Longitude`**: Camera longitude (decimal degrees, WGS84). The app corrects the sign to match the hemisphere selected in **Model settings** (under Camera geometry and coordinates).",
           "- `Camera Model`: Optional camera make and model, for recordkeeping (for example, `Browning Strike Force Pro`).",
-          "- `Camera Detection Angle`: Optional full detection angle in degrees for that camera (greater than 0 and at most 360). If left blank, the app uses the default angle from **Model settings**.",
+          paste0("- `Camera Detection Angle`: Optional full detection angle in degrees for that camera (greater than 0 and at most ", camera_angle_max_deg, "). If left blank or outside that range, the app uses the default angle from **Model settings**."),
           "- `Camera Height`: Optional camera height (meters).",
           "- `Camera Orientation`: Optional cardinal direction (`N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, or `NW`) or 0-359 degrees.",
           "- **`Camera Functioning`**: Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted.",
@@ -1180,7 +1206,7 @@ ui <- page_fillable(
           "  - A Timestamp is missing or can't be read.",
           "  - A row with a Species has a missing or non-numeric Sighting Count, or a missing Cluster ID.",
           "  - A row's Species and Sighting Count have different numbers of pipe-delimited values.",
-          "- Other problems, such as a missing Camera Functioning or Detection Distance value, or image dates outside a camera's deployment dates, are reported as warnings.",
+          "- Other problems, such as a missing Camera Functioning or Detection Distance value, or image dates outside a camera's deployment dates, are reported as warnings. REM and TTE won't run until every camera has a positive Detection Distance.",
           "- **Analysis window:** each camera contributes the time from its Start Date and Start Time to its End Date and End Time (or to midnight at the start of its Camera Malfunction Date), shortened by the trim if it's on. A detection event counts only if its first image is inside the window; the images check log lists events left out this way (other than by the trim), since they can point to a wrong Start or End Time. Camera effort is the length of the window in days, minus the time spent within detection events (from first to last image of each event).",
           "- Uploading a new deployment file clears the images file; upload the images file again afterward.",
           "- Anything that changes the data the models are fit to (uploading a file, the hemisphere settings, the species to analyze, or the deployment trim) clears existing model results on uploaded data, so results from different data are never compared or combined. Changing priors or other model settings doesn't.",
@@ -1255,7 +1281,9 @@ ui <- page_fillable(
       p(
         class = "small",
         style = "color: var(--muted);",
-        "This tab summarizes uploaded deployment and image data. Simulated datasets are shown in the ",
+        "This tab summarizes uploaded deployment and image data. Summaries appear once the files are uploaded and pass their checks on the ",
+        tags$strong("Add your data", .noWS = "after"),
+        " tab: the deployment summary needs a deployment file, and the species summaries also need an images file. Simulated datasets are shown in the ",
         tags$strong("Simulate data"),
         " tab."
       ),
@@ -1307,14 +1335,14 @@ ui <- page_fillable(
 
       h2("Camera geometry and coordinates"),
       markdown(paste(
-        "Default detection angle is 55° (based on Browning-style camera specifications). This value is used for uploaded cameras that do not include a `Camera Detection Angle` value. The **Simulate data** tab has its own detection angle setting.",
+        paste0("Default detection angle is ", default_theta_deg, "° (based on Browning-style camera specifications). This value is used for uploaded cameras that do not include a `Camera Detection Angle` value. The **Simulate data** tab has its own detection angle setting."),
         "",
         "Longitude and Latitude sign are auto-corrected to match the selected hemispheres below during upload QC (for example, a positive Longitude gets flipped negative for Western sites, and a positive Latitude gets flipped negative for Southern sites).",
         sep = "\n"
       )),
       sliderInput(
         "theta", "Default detection angle θ (degrees)",
-        min = 20, max = 80, value = 55, step = 1
+        min = 1, max = camera_angle_max_deg, value = default_theta_deg, step = 1
       ),
       radioButtons(
         "hemisphere", "Hemisphere (for Longitude sign auto-correction)",
@@ -1441,9 +1469,12 @@ ui <- page_fillable(
             checkboxInput("camera_noise", "Include camera-level noise (Poisson-lognormal counts)", value = FALSE),
             conditionalPanel(
               "input.camera_noise",
-              markdown(
-                "- **σ<sub>ε</sub>** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level random effect. The default `Gamma(1, 1)` prior has mean 1 and variance 1."
-              ),
+              markdown(paste0(
+                "- **σ<sub>ε</sub>** ~ Gamma(shape, rate): Prior on the standard deviation of the camera-level random effect. The default `Gamma(",
+                advanced_prior_defaults$sd_eps_shape, ", ", advanced_prior_defaults$sd_eps_rate, ")` prior has mean ",
+                signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3), " and variance ",
+                signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3), "."
+              )),
               fluidRow(
                 column(
                   6,
@@ -1466,9 +1497,12 @@ ui <- page_fillable(
           tags$details(
             class = "prior-details",
             tags$summary(tags$strong("Priors: REM & TTE")),
-            markdown(
-              "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale, v in km/day). The current default corresponds to a daily movement rate of `3.09 km/day` at the prior mean of log(v), with an approximate 95% interval of `1.60` to `6.00 km/day` (Christensen et al. in prep)."
-            ),
+            markdown(paste0(
+              "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale, v in km/day). The current default corresponds to a daily movement rate of `",
+              format_fixed(default_v_km_day), " km/day` at the prior mean of log(v), with an approximate 95% interval of `",
+              format_fixed(default_v_interval_km_day[1]), "` to `", format_fixed(default_v_interval_km_day[2]),
+              " km/day` (Christensen et al. in prep)."
+            )),
             fluidRow(
               column(
                 6,
@@ -1491,8 +1525,18 @@ ui <- page_fillable(
             class = "prior-details",
             tags$summary(tags$strong("Priors: USCR")),
             markdown(paste(
-              "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale, σ in km). The current default corresponds to a 95% circular home-range size of `0.89 km²` at the prior mean of log(σ), with an approximate 95% interval of `0.48` to `1.62 km²` (Christensen et al. in prep).",
-              "- **log(λ₀)** ~ Normal(mean, SD): Prior on expected detections per day when an animal's activity center is at the camera. The default mean of `0` corresponds to about one expected detection per deployed day at the camera because `exp(0) = 1`.",
+              paste0(
+                "- **log(σ)** ~ Normal(mean, SD): Informative prior on animal space use (log scale, σ in km). The current default corresponds to a 95% circular home-range size of `",
+                format_fixed(default_hr95_km2), " km²` at the prior mean of log(σ), with an approximate 95% interval of `",
+                format_fixed(default_hr95_interval_km2[1]), "` to `", format_fixed(default_hr95_interval_km2[2]),
+                " km²` (Christensen et al. in prep)."
+              ),
+              paste0(
+                "- **log(λ₀)** ~ Normal(mean, SD): Prior on the expected count per camera-day when an animal's activity center is at the camera. The default mean of `",
+                advanced_prior_defaults$log_lam0_mean, "` corresponds to an expected count of `",
+                signif(exp(advanced_prior_defaults$log_lam0_mean), 3), "` per camera-day at the camera (`exp(",
+                advanced_prior_defaults$log_lam0_mean, ") = ", signif(exp(advanced_prior_defaults$log_lam0_mean), 3), "`)."
+              ),
               "- **State-space buffer**: Distance added around the camera array when defining the USCR state space. The buffer is set wide enough that animals with activity centers outside it contribute almost nothing to the counts (under 1% even at the high end of the σ prior). The default is set from the log(σ) prior so it comfortably covers a 99% home range, and updates automatically if you change that prior; the app also checks it against the posterior σ after fitting and grows it (and reruns) if needed.",
               sep = "\n"
             )),
@@ -1596,38 +1640,42 @@ ui <- page_fillable(
     # ---------------------- REM MODEL TAB -------------------------
     nav_panel(
       "REM model",
-      HTML('
+      HTML(paste0('
         <h2>Model 2 — REM (Random Encounter Model)</h2>
         <p><strong>The gist:</strong> Converts <strong>how often animals pass a camera</strong> into density, correcting for <strong>movement speed</strong> and <strong>camera view geometry</strong>.</p>
         <details>
           <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
           <div style="margin: 1rem 0; padding-left: 1rem;">
-            <p>Per-camera Poisson model:</p>
-            <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j)$$</p>
-            <p>$$\\log \\lambda_j = \\log D + \\log(\\mathrm{days}_j) + \\log v + \\log r_j + \\log\\!\\Big(\\frac{2 + \\theta_{\\mathrm{rad},j}}{\\pi}\\Big) + \\epsilon_j$$</p>
-            <p>$$\\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)$$</p>
-            <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
+            <p>Per-camera observation model:</p>
+            <p>$$y_j \\sim \\mathrm{Poisson}(\\lambda_j), \\qquad \\log \\lambda_j = \\log D + \\log(\\mathrm{days}_j) + \\log v + \\log r_j + \\log\\!\\Big(\\frac{2 + \\theta_{\\mathrm{rad},j}}{\\pi}\\Big) + \\epsilon_j$$</p>
+            <p>Density and camera effects:</p>
+            <p>$$D = D_{\\max}\\,p_D, \\qquad p_D \\sim \\mathrm{Beta}(a, b), \\qquad \\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)$$</p>
+            <p>Density is reported in animals/km². Throughout, \\(\\mathcal{N}(m, s)\\) is a normal distribution with mean \\(m\\) and standard deviation \\(s\\).</p>
             <h3>Variables</h3>
             <ul>
-              <li>\\(y_j\\) — number of independent animal detection events at camera \\(j\\).</li>
-              <li>\\(\\mathrm{days}_j\\) — deployed days for camera \\(j\\).</li>
-              <li>\\(D\\) — animal density in animals/km².</li>
-              <li>\\(v\\) — animal movement speed (km/day).</li>
-              <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
-              <li>\\(\\theta_{\\mathrm{rad},j}\\) — full detection angle used for camera \\(j\\) (radians).</li>
-              <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts, included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
+              <li>\\(y_j\\) — number of animals counted at camera \\(j\\): the sum, over detection events in the camera\'s analysis window, of each event\'s maximum Sighting Count.</li>
+              <li>\\(\\mathrm{days}_j\\) — camera-days for camera \\(j\\): the length of its analysis window, minus time within detection events.</li>
+              <li>\\(\\lambda_j\\) — expected number of animals counted at camera \\(j\\).</li>
+              <li>\\(D\\) — animal density (animals/km²).</li>
+              <li>\\(v\\) — daily movement rate (km/day).</li>
+              <li>\\(r_j\\) — effective detection radius (km) for camera \\(j\\): its Detection Distance.</li>
+              <li>\\(\\theta_{\\mathrm{rad},j}\\) — full detection angle (radians) for camera \\(j\\): its Camera Detection Angle, or the default detection angle in Model settings if that value is missing or outside the accepted range (greater than 0 and at most ', camera_angle_max_deg, ' degrees).</li>
+              <li>\\(D_{\\max}\\) — upper limit of the prior distribution for density \\(D\\).</li>
+              <li>\\(p_D\\) — density as a proportion of \\(D_{\\max}\\). Its prior sets the prior on density.</li>
+              <li>\\(\\epsilon_j\\) — camera-level random effect (log scale) for camera \\(j\\), allowing counts to vary more between cameras than a Poisson distribution allows.</li>
+              <li>\\(\\sigma_\\epsilon\\) — standard deviation of the camera-level random effects.</li>
             </ul>
-            <h3>Default priors/inputs used in the app</h3>
+            <h3>Default priors used in the app (can be changed in Model settings)</h3>
             <ul>
-              <li>\\(D = D_{\\max}\\,p_D,\\; p_D \\sim \\mathrm{Beta}(a, b)\\). By default \\(a = b = 1\\), i.e. \\(D \\sim \\mathcal{U}(0, D_{\\max})\\) with \\(D_{\\max}\\) starting at 200 animals/km\u00b2; the app doubles \\(D_{\\max}\\) and reruns if the posterior for \\(D\\) presses against it. An informative density prior (<strong>Model settings &gt; Advanced &gt; Priors: Density (all models)</strong>) sets \\(D_{\\max}\\) to about twice its upper bound and chooses \\(a\\) and \\(b\\) to match its 95% interval.</li>
-              <li>\\(\\log v \\sim \\mathcal{N}(1.130,\\,0.3372)\\), which corresponds to a daily movement rate of about 3.09 km/day at the prior mean of \\(\\log v\\) (Christensen et al. in prep).</li>
-              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(1, 1)\\), the default prior on the standard deviation of the camera-level lognormal random effect (used only when camera-level noise is on).</li>
-              <li>Uploaded field data can provide a camera-specific `Camera Detection Angle`; otherwise the app uses the default angle from Model settings.</li>
+              <li>\\(D_{\\max}\\), the upper limit on density. It starts at ', rem_tte_start_D_max, ' animals/km² (or twice the upper bound of an informative density prior). If the posterior for \\(D\\) presses against \\(D_{\\max}\\), the app doubles it and reruns the model.</li>
+              <li>\\(p_D \\sim \\mathrm{Beta}(a, b)\\). The default \\(a = b = 1\\) (\\(p_D \\sim \\mathrm{Uniform}(0, 1)\\)) gives a uniform prior on \\(D\\) from 0 to \\(D_{\\max}\\). An informative density prior (<strong>Model settings &gt; Advanced &gt; Priors: Density (all models)</strong>) chooses \\(a\\) and \\(b\\) so that \\(D\\) has the requested 95% prior interval.</li>
+              <li>\\(\\log v \\sim \\mathcal{N}(', advanced_prior_defaults$log_v_mean, ',\\,', advanced_prior_defaults$log_v_sd, ')\\), which corresponds to a daily movement rate of about ', format_fixed(default_v_km_day), ' km/day at the prior mean of \\(\\log v\\) (Christensen et al. in prep).</li>
+              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
               <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
             </ul>
           </div>
         </details>
-      '),
+      ')),
       hr(),
       h3("Uploaded field data"),
       uiOutput("run_note_rem_nps"),
@@ -1644,7 +1692,7 @@ ui <- page_fillable(
     # ---------------------- TTE MODEL TAB -------------------------
     nav_panel(
       "TTE model",
-      HTML('
+      HTML(paste0('
         <h2>Model 3 — TTE (Time-to-Event)</h2>
         <p><strong>The gist:</strong> Uses <strong>animal detection events per camera</strong>, scaled by <strong>movement-based time units</strong> and the <strong>viewshed area</strong>. Shorter effective time between encounters implies higher density.</p>
         <details>
@@ -1658,14 +1706,19 @@ ui <- page_fillable(
             <p>The app currently reports density as \\(D_{\\mathrm{km}^2}\\).</p>
             <h3>Variables</h3>
             <ul>
-              <li>\\(y_j\\) — number of animal detection events for camera \\(j\\).</li>
-              <li>\\(\\mathrm{days}_j\\) — total deployed days for camera \\(j\\).</li>
-              <li>\\(U_j\\) — the time needed to move across the average camera viewshed width \\(j\\).</li>
-              <li>\\(v\\) — movement speed (km/day); prior on \\(\\log v\\) as below.</li>
-              <li>\\(r_j\\) — effective detection radius for camera \\(j\\) (km).</li>
-              <li>\\(\\theta_{\\mathrm{deg},j}\\) — full detection angle used for camera \\(j\\) (degrees).</li>
-              <li>\\(A_j\\) — viewshed area for camera \\(j\\) (km²).</li>
-              <li>\\(\\epsilon_j\\) — camera-level random effect for overdispersed counts, included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
+              <li>\\(y_j\\) — number of animals counted at camera \\(j\\): the sum, over detection events in the camera\'s analysis window, of each event\'s maximum Sighting Count.</li>
+              <li>\\(\\mathrm{days}_j\\) — camera-days for camera \\(j\\): the length of its analysis window, minus time within detection events.</li>
+              <li>\\(\\lambda_j\\) — expected number of animals counted at camera \\(j\\).</li>
+              <li>\\(D\\) — animal density (animals/km²).</li>
+              <li>\\(U_j\\) — number of time units per camera-day at camera \\(j\\), where a time unit is the time an animal moving at speed \\(v\\) takes to cross the camera\'s viewshed (average width \\(f(\\theta_j)\\,r_j\\)).</li>
+              <li>\\(v\\) — daily movement rate (km/day).</li>
+              <li>\\(r_j\\) — effective detection radius (km) for camera \\(j\\): its Detection Distance.</li>
+              <li>\\(\\theta_{\\mathrm{deg},j}\\) — full detection angle (degrees) for camera \\(j\\): its Camera Detection Angle, or the default detection angle in Model settings if that value is missing or outside the accepted range (greater than 0 and at most ', camera_angle_max_deg, ' degrees).</li>
+              <li>\\(A_j\\) — viewshed area (km²) for camera \\(j\\).</li>
+              <li>\\(D_{\\max}\\) — upper limit of the prior distribution for density \\(D\\).</li>
+              <li>\\(p_D\\) — density as a proportion of \\(D_{\\max}\\). Its prior sets the prior on density.</li>
+              <li>\\(\\epsilon_j\\) — camera-level random effect (log scale) for camera \\(j\\), allowing counts to vary more between cameras than a Poisson distribution allows.</li>
+              <li>\\(\\sigma_\\epsilon\\) — standard deviation of the camera-level random effects.</li>
             </ul>
             <h3>Default priors/inputs used in the app</h3>
             <ul>
@@ -1677,7 +1730,7 @@ ui <- page_fillable(
             </ul>
           </div>
         </details>
-      '),
+      ')),
       hr(),
       h3("Uploaded field data"),
       uiOutput("run_note_tte_nps"),
@@ -1796,7 +1849,7 @@ ui <- page_fillable(
                sliderInput("pshared_v", "Movement speed (km/day)",
                            min = 0.5, max = 10, value = 3.09, step = 0.1),
                sliderInput("pshared_theta", "Detection angle θ (degrees)",
-                           min = 20, max = 80, value = 55, step = 1),
+                           min = 1, max = camera_angle_max_deg, value = default_theta_deg, step = 1),
                sliderInput("pshared_r", "Detection radius (m)",
                            min = 8, max = 25, value = 12, step = 1)
         )
@@ -2286,7 +2339,7 @@ server <- function(input, output, session) {
         sd_eps_shape = prior_input("sd_eps_shape"), sd_eps_rate = prior_input("sd_eps_rate"),
         max_adapt_rounds = app_max_adapt_rounds(),
         density_prior = density_prior_spec(),
-        camera_noise = s$settings$camera_noise,
+        camera_noise = s$settings$camera_noise, compute_WAIC = FALSE,
         status_callback = make_model_status_callback(pshared_rem_debug, "REM", "pshared_rem_status")
       ),
       error = function(e) {
@@ -2351,7 +2404,7 @@ server <- function(input, output, session) {
         sd_eps_shape = prior_input("sd_eps_shape"), sd_eps_rate = prior_input("sd_eps_rate"),
         max_adapt_rounds = app_max_adapt_rounds(),
         density_prior = density_prior_spec(),
-        camera_noise = s$settings$camera_noise,
+        camera_noise = s$settings$camera_noise, compute_WAIC = FALSE,
         status_callback = make_model_status_callback(pshared_tte_debug, "TTE", "pshared_tte_status")
       ),
       error = function(e) {
@@ -2711,7 +2764,10 @@ server <- function(input, output, session) {
     )
   })
 
+  # req() the uploads too: after a new deployment file clears the images (or
+  # fails its checks), the species dropdown can still hold its old choice.
   species_objects <- reactive({
+    req(deployment_checked(), images_checked())
     species_name <- req(input$summary_species)
     list(
       by_camera = species_by_camera(
@@ -2893,70 +2949,50 @@ server <- function(input, output, session) {
     format(round(x, digits), nsmall = digits, trim = TRUE)
   }
 
-  get_camera_angle_vector <- function(out, default_deg = 55) {
-    default_deg <- as.numeric(default_deg[[1]])
-    if (!is.finite(default_deg)) default_deg <- 55
-    default_deg <- max(1, min(360, default_deg))
-
+  # Which uploaded cameras use the default detection angle (Model settings):
+  # those with no Camera Detection Angle, or one outside the range the upload
+  # check accepts (the check warns about these but doesn't block the upload).
+  camera_angle_uses_default <- function(out) {
     if (!"Camera Detection Angle" %in% names(out)) {
-      return(rep(default_deg, nrow(out)))
+      return(rep(TRUE, nrow(out)))
     }
-
-    theta_raw <- suppressWarnings(as.numeric(out$`Camera Detection Angle`))
-    theta_use <- theta_raw
-    theta_use[is.na(theta_use) | theta_use <= 0 | theta_use > 360] <- default_deg
-    theta_use
+    theta <- suppressWarnings(as.numeric(out$`Camera Detection Angle`))
+    is.na(theta) | theta <= 0 | theta > camera_angle_max_deg
   }
 
-  summarize_camera_angle_source <- function(out, default_deg = 55) {
-    theta_use <- get_camera_angle_vector(out, default_deg = default_deg)
-    has_column <- "Camera Detection Angle" %in% names(out)
-    theta_raw <- if (has_column) suppressWarnings(as.numeric(out$`Camera Detection Angle`)) else numeric(0)
-    n_default <- if (has_column) {
-      sum(is.na(theta_raw) | theta_raw <= 0 | theta_raw > 360, na.rm = FALSE)
-    } else {
-      nrow(out)
+  # Detection angle (degrees) for each uploaded camera.
+  get_camera_angle_vector <- function(out, default_deg) {
+    uses_default <- camera_angle_uses_default(out)
+    theta <- rep(as.numeric(default_deg), nrow(out))
+    # Read the column only when some cameras have a valid angle: it may not
+    # exist, and a tibble warns about a missing column.
+    if (!all(uses_default)) {
+      theta[!uses_default] <- as.numeric(out$`Camera Detection Angle`[!uses_default])
     }
+    theta
+  }
 
+  summarize_camera_angle_source <- function(out, default_deg) {
+    theta <- get_camera_angle_vector(out, default_deg)
+    n_default <- sum(camera_angle_uses_default(out))
     range_text <- paste0(
-      format_num(min(theta_use, na.rm = TRUE), 1),
-      " to ",
-      format_num(max(theta_use, na.rm = TRUE), 1),
-      " degrees"
+      format_num(min(theta), 1), " to ", format_num(max(theta), 1), " degrees"
     )
-
-    if (!has_column) {
-      return(paste("Camera detection angle:", range_text, "(all cameras using default from Model settings)"))
+    source_text <- if (n_default == nrow(out)) {
+      "(all cameras using the default angle from Model settings)"
+    } else if (n_default > 0) {
+      paste0("(", n_default, " camera(s) using the default angle from Model settings)")
+    } else {
+      "(from uploaded deployment data)"
     }
-
-    if (n_default > 0) {
-      return(paste(
-        "Camera detection angle:",
-        range_text,
-        paste0("(", n_default, " camera(s) using the default angle from Model settings)")
-      ))
-    }
-
-    paste("Camera detection angle:", range_text, "(from uploaded deployment data)")
+    paste("Camera detection angle:", range_text, source_text)
   }
 
   summarize_uscr_context <- function(d) {
-    det_dist <- if ("Detection Distance" %in% names(d$out)) {
-      paste0(
-        format_num(min(d$out$`Detection Distance`, na.rm = TRUE), 1),
-        " to ",
-        format_num(max(d$out$`Detection Distance`, na.rm = TRUE), 1),
-        " m"
-      )
-    } else {
-      "Not available"
-    }
-
     c(
       paste("Cameras:", nrow(d$out)),
       paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
       paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
-      paste("Detection distance range:", det_dist),
       paste(
         "Initial MCMC settings:",
         paste0(
@@ -2980,7 +3016,14 @@ server <- function(input, output, session) {
     )
   }
 
-  summarize_rem_context <- function(d) {
+  # Input summary for REM and TTE runs on uploaded data.
+  summarize_encounter_context <- function(d, model) {
+    density_prior <- density_prior_spec()
+    start_D_max <- if (isTRUE(density_prior$uniform)) {
+      rem_tte_start_D_max
+    } else {
+      encounter_prior_start_D_max(density_prior$hi)
+    }
     c(
       paste("Cameras:", nrow(d$out)),
       paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
@@ -2988,9 +3031,9 @@ server <- function(input, output, session) {
       paste(
         "Detection distance range:",
         paste0(
-          format_num(min(d$out$`Detection Distance`, na.rm = TRUE), 1),
+          format_num(min(d$out$`Detection Distance`), 1),
           " to ",
-          format_num(max(d$out$`Detection Distance`, na.rm = TRUE), 1),
+          format_num(max(d$out$`Detection Distance`), 1),
           " m"
         )
       ),
@@ -3001,70 +3044,17 @@ server <- function(input, output, session) {
           "iter=", mcmc_defaults$iter,
           ", burn-in=", mcmc_defaults$burnin,
           ", thin=", mcmc_defaults$thin,
-          ", chains=", mcmc_defaults$n_chains
-        )
-      ),
-      paste("Density prior:", describe_density_prior_spec(density_prior_spec())),
-      paste("Camera-level noise:", noise_label(app_camera_noise()))
-    )
-  }
-
-  summarize_tte_context <- function(d) {
-    c(
-      paste("Cameras:", nrow(d$out)),
-      paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
-      paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
-      paste(
-        "Detection distance range:",
-        paste0(
-          format_num(min(d$out$`Detection Distance`, na.rm = TRUE), 1),
-          " to ",
-          format_num(max(d$out$`Detection Distance`, na.rm = TRUE), 1),
-          " m"
-        )
-      ),
-      summarize_camera_angle_source(d$out, default_deg = input$theta),
-      paste(
-        "Initial MCMC settings:",
-        paste0(
-          "iter=", mcmc_defaults$iter,
-          ", burn-in=", mcmc_defaults$burnin,
-          ", thin=", mcmc_defaults$thin,
-          ", chains=", mcmc_defaults$n_chains
-        )
-      ),
-      paste("Density prior:", describe_density_prior_spec(density_prior_spec())),
-      paste("Camera-level noise:", noise_label(app_camera_noise()))
-    )
-  }
-
-  summarize_shared_sim_context <- function(d, model_label) {
-    model_settings <- switch(
-      model_label,
-      "USCR" = NULL,
-      "REM" = paste(
-        "Initial MCMC settings:",
-        paste0(
-          "iter=", mcmc_defaults$iter,
-          ", burn-in=", mcmc_defaults$burnin,
-          ", thin=", mcmc_defaults$thin,
           ", chains=", mcmc_defaults$n_chains,
-          ", default angle=", input$theta,
-          " degrees"
+          ", D_max=", format_num(start_D_max, 1)
         )
       ),
-      "TTE" = paste(
-        "Initial MCMC settings:",
-        paste0(
-          "iter=", mcmc_defaults$iter,
-          ", burn-in=", mcmc_defaults$burnin,
-          ", thin=", mcmc_defaults$thin,
-          ", chains=", mcmc_defaults$n_chains,
-          ", default angle=", input$theta,
-          " degrees"
-        )
-      ),
-      NULL
+      paste(model, "density prior:", describe_density_prior_spec(density_prior)),
+      paste("Camera-level noise:", noise_label(app_camera_noise())),
+      paste0(
+        model, " reruns automatically, up to ", app_max_adapt_rounds(), " rounds in all, at the same chain count shown above. ",
+        "Each check that fails triggers its own change: iterations, burn-in, and thinning double when the maximum Rhat is above 1.1, ",
+        "and D_max doubles when the posterior probability that D exceeds 90% of D_max is above 1%."
+      )
     )
   }
 
@@ -3087,13 +3077,9 @@ server <- function(input, output, session) {
     if (identical(model, "USCR")) {
       tips <- c(tips, "USCR doubles iterations, burn-in, and thinning automatically when Rhat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior \u03c3 is larger than the buffer safely covers, so longer runs can be expected when any check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable). An informative density prior (Model settings > Advanced > Priors: Density (all models)) can also keep M, and so run time, from growing.")
     }
-    if (identical(model, "REM")) {
-      tips <- c(tips, "REM expects per-camera animals counted, camera-days, and detection distances.")
-      tips <- c(tips, "REM doubles iterations, burn-in, and thinning automatically when Rhat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails.")
-    }
-    if (identical(model, "TTE")) {
-      tips <- c(tips, "TTE expects per-camera animals counted, camera-days, and detection distances.")
-      tips <- c(tips, "TTE doubles iterations, burn-in, and thinning automatically when Rhat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails.")
+    if (model %in% c("REM", "TTE")) {
+      tips <- c(tips, paste0(model, " expects per-camera animals counted, camera-days, and detection distances."))
+      tips <- c(tips, paste0(model, " doubles iterations, burn-in, and thinning automatically when Rhat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable)."))
     }
 
     paste(tips, collapse = "\n")
@@ -3105,17 +3091,19 @@ server <- function(input, output, session) {
   # rerun because a check failed), it also gets the previous round's elapsed
   # time and iterations, so the pop-up can show a rough time estimate. USCR
   # also passes M (its augmentation bound), the previous round's M, and
-  # buffer_m (state-space buffer); REM/TTE don't have these.
+  # buffer_m (state-space buffer); REM/TTE pass D_max (their upper limit on
+  # density) instead.
   #
   # The estimate scales the previous round's time by the change in
   # iterations and, for USCR, by (M / previous M)^2: each update to one
   # augmented individual recomputes every camera's expected count, a sum over
   # all M individuals, so the work per iteration grows roughly with M^2.
   make_model_status_callback <- function(rv, model_label, notification_id) {
-    function(round, iter, burnin, M = NULL, buffer_m = NULL,
+    function(round, iter, burnin, M = NULL, buffer_m = NULL, D_max = NULL,
              prev_elapsed_min = NULL, prev_iter = NULL, prev_M = NULL) {
       message <- paste0(model_label, ": ")
       if (!is.null(M)) message <- paste0(message, "M=", M, ", ")
+      if (!is.null(D_max)) message <- paste0(message, "D_max=", format_num(D_max, 1), " animals/km\u00b2, ")
       if (!is.null(buffer_m)) message <- paste0(message, "buffer=", round(buffer_m), "m, ")
       message <- paste0(message, iter, " iterations, ", burnin, " burn-in")
       if (round > 1L && !is.null(prev_elapsed_min) && !is.null(prev_iter) && prev_iter > 0) {
@@ -3681,10 +3669,13 @@ server <- function(input, output, session) {
     }
 
     d <- nps_model_inputs()
+    detection_m <- suppressWarnings(as.numeric(d$out$`Detection Distance`))
     problem <- if (nrow(d$out) < 2) {
-      "Density can't be estimated from a single camera. Upload data from at least 2 cameras."
+      "The models need data from at least 2 cameras."
     } else if (identical(model, "USCR") && !is_valid_buffer_m(app_uscr_buffer_m())) {
       uscr_buffer_problem
+    } else if (model %in% c("REM", "TTE") && !all(is.finite(detection_m) & detection_m > 0)) {
+      paste(model, "needs a positive Detection Distance for every camera. Fix the deployment file and upload it again (see the Deployment check log on the Add your data tab).")
     } else if (!all(d$camera_days > 0)) {
       "Some cameras have zero or negative camera-days; check deployment dates, or check for overlapping/duplicate Cluster IDs at the same site (overlapping detection events can double-count time and drive camera-days to zero or below)."
     } else {
@@ -3789,11 +3780,11 @@ server <- function(input, output, session) {
     update_model_debug(
       rem_nps_debug,
       started_at = Sys.time(),
-      context = summarize_rem_context(d),
+      context = summarize_encounter_context(d, "REM"),
       log_entry = "Input checks passed. Starting REM MCMC."
     )
     showNotification(
-      "Running REM on uploaded data... This may take several minutes.",
+      "Running REM on uploaded data.",
       type = "message",
       duration = NULL,
       id = "rem_nps_status"
@@ -3804,22 +3795,23 @@ server <- function(input, output, session) {
         status_callback <- make_model_status_callback(rem_nps_debug, "REM", "rem_nps_status")
 
         run_REM(
-          y            = d$camera_counts,
-          r_km         = d$out$`Detection Distance` / 1000,
-          camera_days  = d$camera_days,
-          theta_deg    = get_camera_angle_vector(d$out, default_deg = input$theta),
-          iter         = mcmc_defaults$iter,
-          burnin       = mcmc_defaults$burnin,
-          thin         = mcmc_defaults$thin,
-          n_chains     = mcmc_defaults$n_chains,
-          D_max        = rem_tte_start_D_max,
-          log_v_mean   = prior_input("log_v_mean"),
-          log_v_sd     = prior_input("log_v_sd"),
+          y = d$camera_counts,
+          r_km = d$out$`Detection Distance` / 1000,
+          camera_days = d$camera_days,
+          theta_deg = get_camera_angle_vector(d$out, default_deg = input$theta),
+          iter = mcmc_defaults$iter,
+          burnin = mcmc_defaults$burnin,
+          thin = mcmc_defaults$thin,
+          n_chains = mcmc_defaults$n_chains,
+          D_max = rem_tte_start_D_max,
+          log_v_mean = prior_input("log_v_mean"),
+          log_v_sd = prior_input("log_v_sd"),
           sd_eps_shape = prior_input("sd_eps_shape"),
-          sd_eps_rate  = prior_input("sd_eps_rate"),
-          max_adapt_rounds = app_max_adapt_rounds(),
+          sd_eps_rate = prior_input("sd_eps_rate"),
           density_prior = density_prior_spec(),
           camera_noise = app_camera_noise(),
+          max_adapt_rounds = app_max_adapt_rounds(),
+          compute_WAIC = TRUE,
           status_callback = status_callback
         )
       },
@@ -3846,7 +3838,7 @@ server <- function(input, output, session) {
         rem_nps_debug,
         status = "success",
         finished_at = Sys.time(),
-        guidance = adaptive_limit_guidance(fit, "REM", "REM completed successfully. Review the summary above and the run history below."),
+        guidance = adaptive_limit_guidance(fit, "REM", "Uploaded-data REM completed successfully. Review the summary above and the run history below."),
         log_entry = "Uploaded-data REM run completed."
       )
       showNotification("REM (uploaded data) complete!", type = "message")
@@ -3866,7 +3858,7 @@ server <- function(input, output, session) {
     update_model_debug(
       tte_nps_debug,
       started_at = Sys.time(),
-      context = summarize_tte_context(d),
+      context = summarize_encounter_context(d, "TTE"),
       log_entry = "Input checks passed. Starting TTE MCMC."
     )
     showNotification(
@@ -3897,6 +3889,7 @@ server <- function(input, output, session) {
           max_adapt_rounds = app_max_adapt_rounds(),
           density_prior = density_prior_spec(),
           camera_noise = app_camera_noise(),
+          compute_WAIC = TRUE,
           status_callback = status_callback
         )
       },

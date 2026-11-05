@@ -6,6 +6,12 @@
 # a warning that the user should review but that doesn't block it, and "ℹ️"
 # marks a note about data the models will leave out.
 
+# Largest Camera Detection Angle (degrees) the app accepts. REM's mean
+# viewshed width, r * (2 + theta) / pi, holds only for a convex viewshed
+# (theta up to 180 degrees). Uploaded angles outside (0, 180] get a warning,
+# and the models use the default angle from Model settings for those cameras.
+camera_angle_max_deg <- 180
+
 # -------------------------------------------------------------------
 # Parsing helpers
 # -------------------------------------------------------------------
@@ -385,17 +391,22 @@ check_deployments <- function(deployment, hemisphere = "Western",
     if ("Camera Detection Angle" %in% names(deployment)) {
       theta_val <- deployment$`Camera Detection Angle`[i]
       theta_num <- suppressWarnings(as.numeric(theta_val))
-      if (!is.na(theta_val) && theta_val != "") {
-        if (is.na(theta_num)) {
-          issues <- c(issues, paste0(
-            "⚠️ Non-numeric value in Camera Detection Angle row ", i, ": ", theta_val
-          ))
-        } else if (theta_num <= 0 || theta_num > 360) {
-          issues <- c(issues, paste0(
-            "⚠️ Camera Detection Angle out of range in row ", i, ": ", theta_val,
-            " (must be greater than 0 and at most 360 degrees)"
-          ))
-        }
+      if (is.na(theta_val) || theta_val == "") {
+        issues <- c(issues, paste0(
+          "⚠️ Camera Detection Angle missing in row ", i,
+          "; the default angle from Model settings is used instead"
+        ))
+      } else if (is.na(theta_num)) {
+        issues <- c(issues, paste0(
+          "⚠️ Non-numeric value in Camera Detection Angle row ", i, ": ", theta_val,
+          "; the default angle from Model settings is used instead"
+        ))
+      } else if (theta_num <= 0 || theta_num > camera_angle_max_deg) {
+        issues <- c(issues, paste0(
+          "⚠️ Camera Detection Angle out of range in row ", i, ": ", theta_val,
+          " (must be greater than 0 and at most ", camera_angle_max_deg,
+          " degrees); the default angle from Model settings is used instead"
+        ))
       }
     }
 
