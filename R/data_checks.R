@@ -6,11 +6,13 @@
 # a warning that the user should review but that doesn't block it, and "ℹ️"
 # marks a note about data the models will leave out.
 
-# Largest Camera Detection Angle (degrees) the app accepts. REM's mean
-# viewshed width, r * (2 + theta) / pi, holds only for a convex viewshed
-# (theta up to 180 degrees). Uploaded angles outside (0, 180] get a warning,
-# and the models use the default angle from Model settings for those cameras.
-camera_angle_max_deg <- 180
+# Range of Camera Detection Angles (degrees, inclusive) the app accepts: the
+# angles TTE's average path length across the viewshed
+# (tte_path_length_multiplier()) was fitted to. Uploaded angles outside this
+# range get a warning, and the models use the default angle from Model
+# settings for those cameras.
+camera_angle_min_deg <- 5
+camera_angle_max_deg <- 90
 
 # -------------------------------------------------------------------
 # Parsing helpers
@@ -401,10 +403,10 @@ check_deployments <- function(deployment, hemisphere = "Western",
           "⚠️ Non-numeric value in Camera Detection Angle row ", i, ": ", theta_val,
           "; the default angle from Model settings is used instead"
         ))
-      } else if (theta_num <= 0 || theta_num > camera_angle_max_deg) {
+      } else if (theta_num < camera_angle_min_deg || theta_num > camera_angle_max_deg) {
         issues <- c(issues, paste0(
           "⚠️ Camera Detection Angle out of range in row ", i, ": ", theta_val,
-          " (must be greater than 0 and at most ", camera_angle_max_deg,
+          " (must be from ", camera_angle_min_deg, " to ", camera_angle_max_deg,
           " degrees); the default angle from Model settings is used instead"
         ))
       }

@@ -21,7 +21,11 @@ home_range_km2_to_sigma_m <- function(home_range_km2) {
   sigma_km * 1000
 }
 
-tte_detection_radius_multiplier <- function(theta_deg) {
+# Average length of a straight-line path across a camera viewshed (a circular
+# sector with full angle theta_deg degrees), as a multiple of the viewshed's
+# radius. The quadratic was fitted to simulations of random straight-line paths
+# across circular sectors with central angles from 5 to 90 degrees.
+tte_path_length_multiplier <- function(theta_deg) {
   theta_deg <- as.numeric(theta_deg)
   3.324e-01 + 5.580e-03 * theta_deg - 1.454e-05 * theta_deg^2
 }
@@ -208,7 +212,7 @@ simulate_teaching_counts <- function(model = c("REM", "TTE"),
     lambda <- ((2 + theta_rad) / pi) * v_km_day * r_km * D_per_km2 * camera_days * exp(use_eps * eps)
   } else {
     area_km2 <- pi * r_km^2 * theta_deg / 360
-    time_unit <- tte_detection_radius_multiplier(theta_deg) * r_km / v_km_day
+    time_unit <- tte_path_length_multiplier(theta_deg) * r_km / v_km_day
     tte_units <- camera_days / time_unit
     lambda <- D_per_km2 * tte_units * area_km2 * exp(use_eps * eps)
   }
@@ -678,6 +682,11 @@ run_REM <- function(y,
 # -------------------------------------------------------------------
 # 6. TTE model
 # -------------------------------------------------------------------
+# Time-to-event model (Moeller et al. 2018), fit as the equivalent Poisson
+# count model: the expected count at camera j is D * days_j * U_j * A_j, where
+# U_j = v / (f(theta_j) * r_j) is the number of viewshed-crossing times per
+# day, f() is tte_path_length_multiplier(), A_j = pi * r_j^2 * theta_j / 360
+# is the viewshed area, and theta_j is in degrees.
 
 # The app supplies every setting without a default here (its constants live
 # in app.R) and checks the inputs before running. theta_deg is one detection
@@ -703,56 +712,53 @@ run_TTE <- function(y,
   quiet_require("nimble")
 
   J <- length(y)
+  r_km <- as.numeric(r_km)
   theta_deg <- rep_len(as.numeric(theta_deg), J)
 
   code <- nimble::nimbleCode({
-
-    p_D    ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
-    D      <- D_max * p_D
-    log_v  ~ dnorm(log_v_mean, sd = log_v_sd)
+    p_D ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
+    D <- D_max * p_D
+    log_v ~ dnorm(log_v_mean, sd = log_v_sd)
     sd_eps ~ dgamma(sd_eps_shape, sd_eps_rate)
 
-    v     <- exp(log_v)
+    v <- exp(log_v)
 
     for (j in 1:J) {
-
-      a[j] <- pi_const * r[j]^2 * theta[j] / 360
-      mvw[j] <- angle_mult[j] * r[j]
-      time_unit[j]  <- mvw[j] / v
-      tte_units[j]  <- camera_days[j] / time_unit[j]
-
+      U[j] <- v / path_length[j]
       eps[j] ~ dnorm(0, sd = sd_eps)
 
-      log(lambda[j]) <- log(D) + log(tte_units[j]) + log(a[j]) + use_eps * eps[j]
+      # Camera-level noise (Poisson-lognormal) only when use_eps = 1. With
+      # use_eps = 0, eps and sd_eps are sampled from their priors but don't
+      # affect the data, and they are not monitored.
+      log(lambda[j]) <- log(D) + log(camera_days[j]) + log(U[j]) + log(A[j]) +
+        use_eps * eps[j]
 
-      y[j]     ~ dpois(lambda[j])
+      y[j] ~ dpois(lambda[j])
       y_sim[j] ~ dpois(lambda[j])
 
-      pearson_obs[j] <- (y[j]     - lambda[j])^2 / lambda[j]
+      # Posterior predictive check (see ppc_summary()).
+      pearson_obs[j] <- (y[j] - lambda[j])^2 / lambda[j]
       pearson_sim[j] <- (y_sim[j] - lambda[j])^2 / lambda[j]
     }
 
     sum_obs <- sum(pearson_obs[1:J])
     sum_sim <- sum(pearson_sim[1:J])
-
     bp <- step(sum_sim - sum_obs)
   })
 
-  Const <- list(
-    J           = J,
-    pi_const    = pi,
-    r           = as.numeric(r_km),
+  const <- list(
+    J = J,
     camera_days = as.numeric(camera_days),
-    log_v_mean  = log_v_mean,
-    log_v_sd    = log_v_sd,
+    path_length = tte_path_length_multiplier(theta_deg) * r_km,
+    A = pi * r_km^2 * theta_deg / 360,
+    log_v_mean = log_v_mean,
+    log_v_sd = log_v_sd,
     sd_eps_shape = sd_eps_shape,
-    sd_eps_rate  = sd_eps_rate,
-    use_eps     = as.numeric(isTRUE(camera_noise)),
-    theta       = as.numeric(theta_deg),
-    angle_mult  = tte_detection_radius_multiplier(theta_deg)
+    sd_eps_rate = sd_eps_rate,
+    use_eps = as.numeric(isTRUE(camera_noise))
   )
 
-  Data <- list(y = as.numeric(y))
+  data_list <- list(y = as.numeric(y))
 
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
   monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
@@ -761,8 +767,8 @@ run_TTE <- function(y,
   fit <- run_encounter_rate_model(
     method = "TTE",
     code = code,
-    constants = Const,
-    data = Data,
+    constants = const,
+    data = data_list,
     monitors = monitors,
     iter = iter,
     burnin = burnin,
