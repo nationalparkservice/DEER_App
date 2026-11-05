@@ -309,7 +309,7 @@ build_nps_model_inputs <- function(
   events <- detection_events(images, deployments, max_days = max_days) |>
     dplyr::filter(Species == species_to_analyze, in_window) |>
     dplyr::group_by(`Site Name`) |>
-    dplyr::summarise(
+    dplyr::summarize(
       events_count = sum(count),
       event_days   = sum(days_in_window),
       .groups      = "drop"
@@ -1358,12 +1358,14 @@ extract_param_draws <- function(samples_all, param_name) {
 # observed counts with one for counts simulated from the fitted model. Values
 # near 0 mean the observed counts vary more than the model expects (e.g.
 # overdispersion); values near 1 mean they vary less. The check "fails" when
-# the p-value falls outside [lower, upper].
-ppc_summary <- function(fit, lower = 0.05, upper = 0.95) {
+# the p-value falls outside pass_range (lower and upper limits).
+ppc_summary <- function(fit, pass_range) {
   if (is.null(fit) || is.null(fit$samples_all) || !"bp" %in% colnames(fit$samples_all)) {
     return(NULL)
   }
   p <- mean(fit$samples_all[, "bp"], na.rm = TRUE)
+  lower <- pass_range[1]
+  upper <- pass_range[2]
   list(p = p, fail = is.finite(p) && (p < lower || p > upper), lower = lower, upper = upper)
 }
 

@@ -100,6 +100,10 @@ advanced_prior_defaults <- list(
 # Camera Detection Angle value.
 default_theta_deg <- 55
 
+# Bayesian p-values (posterior predictive check) inside this range pass; a
+# model whose p-value falls outside it fails the check.
+ppc_pass_range <- c(0.05, 0.95)
+
 # Format a number with a fixed number of decimal places, for text that quotes
 # values computed from the constants.
 format_fixed <- function(x, digits = 2) {
@@ -145,333 +149,183 @@ default_v_interval_km_day <- exp(
 #   simulate_camera_counts(), sim_model_inputs(), build_nps_model_inputs()
 
 # -------------------------------------------------------------------
-# Generic helpers for summaries & WAIC-combo (like Rmd)
+# Model summaries and model averaging
 # -------------------------------------------------------------------
 
-get_waic_value <- function(fit) {
-  if (is.null(fit$waic)) return(NA_real_)
-  if (is.list(fit$waic) && !is.null(fit$waic$WAIC)) {
-    as.numeric(fit$waic$WAIC)
-  } else {
-    as.numeric(fit$waic)
-  }
-}
-
+# Posterior summary of density (animals/km²) and WAIC, for a model tab.
 summarize_method <- function(fit) {
   D_km2 <- fit$samples_all[, "D"]
 
   list(
-    mean_km2  = mean(D_km2),
+    mean_km2   = mean(D_km2),
     median_km2 = stats::median(D_km2),
-    sd_km2    = sd(D_km2),
-    q2.5_km2  = quantile(D_km2, 0.025),
-    q97.5_km2 = quantile(D_km2, 0.975),
-    waic      = get_waic_value(fit)
+    q2.5_km2   = stats::quantile(D_km2, 0.025),
+    q97.5_km2  = stats::quantile(D_km2, 0.975),
+    waic       = fit$waic
   )
 }
 
-extract_density_draws_km2 <- function(fit) {
-  if (is.null(fit) || is.null(fit$samples_all) || !"D" %in% colnames(fit$samples_all)) {
-    return(numeric(0))
-  }
-  x <- as.numeric(fit$samples_all[, "D"])
-  x[is.finite(x)]
+# Mixture of the models' posteriors: each draw comes from model (column) k
+# with probability weights[k], as a random posterior draw from that model.
+sample_mixture <- function(draws, weights) {
+  n_draws <- nrow(draws)
+  draws[cbind(
+    sample.int(n_draws, n_draws, replace = TRUE),
+    sample.int(ncol(draws), n_draws, replace = TRUE, prob = weights)
+  )]
 }
 
-generate_mixture_posterior <- function(draws_list, weights, n_draws = NULL) {
-
-  if (is.null(n_draws)) {
-    n_draws <- min(lengths(draws_list))
-  }
-
-  model_ids <- sample(
-    seq_along(draws_list),
-    size = n_draws,
-    replace = TRUE,
-    prob = weights
-  )
-
-  mixture_draws <- numeric(n_draws)
-
-  for (i in seq_len(n_draws)) {
-
-    m <- model_ids[i]
-
-    mixture_draws[i] <- sample(
-      draws_list[[m]],
-      size = 1,
-      replace = TRUE
-    )
-  }
-
-  mixture_draws
-}
-
+# Combines posterior draws of density across the models in `fits`, a named
+# list in which models not run yet are NULL. Returns NULL if no model has been
+# run; otherwise the fits that have been, their WAIC weights (NA if any
+# model's WAIC is missing), and a matrix of density draws with one column per
+# model followed by one column per model average.
 prepare_combo_density_data <- function(fits) {
-  model_order <- c("REM", "TTE", "USCR")
-  fits <- fits[model_order[model_order %in% names(fits)]]
-  fits <- fits[!vapply(fits, is.null, logical(1))]
+  fits <- purrr::compact(fits)
   if (!length(fits)) return(NULL)
 
-  model_names <- names(fits)
-  waic_tbl <- tibble::tibble(
-    model = model_names,
-    waic = vapply(fits, get_waic_value, numeric(1))
-  )
-
-  waic_weights_available <- FALSE
-  if (length(model_names) == 1L) {
-    waic_tbl <- waic_tbl |>
-      dplyr::mutate(deltaWAIC = 0, rel_lik = 1, w = 1)
-    waic_weights_available <- TRUE
-  } else if (any(!is.finite(waic_tbl$waic))) {
-    waic_tbl <- waic_tbl |>
-      dplyr::mutate(
-        deltaWAIC = NA_real_,
-        rel_lik = NA_real_,
-        w = NA_real_
-      )
+  # WAIC weights: w_k = exp(-delta_k / 2) / sum_j exp(-delta_j / 2), where
+  # delta_k = WAIC_k - min(WAIC).
+  waic <- vapply(fits, function(fit) fit$waic, numeric(1))
+  weights <- if (length(fits) == 1L) {
+    1
+  } else if (all(is.finite(waic))) {
+    rel_lik <- exp(-0.5 * (waic - min(waic)))
+    unname(rel_lik / sum(rel_lik))
   } else {
-    waic_tbl <- waic_tbl |>
-      dplyr::mutate(
-        deltaWAIC = waic - min(waic),
-        rel_lik = exp(-0.5 * deltaWAIC),
-        w = rel_lik / sum(rel_lik)
-      )
-    waic_weights_available <- TRUE
+    rep(NA_real_, length(fits))
   }
 
-  density_draws <- lapply(fits, function(fit) sort(extract_density_draws_km2(fit)))
-  #For mixture distribution
-  raw_density_draws <- lapply(
-    fits,
-    extract_density_draws_km2
-  )
-  draw_lengths <- lengths(density_draws)
-  if (any(!is.finite(draw_lengths)) || any(draw_lengths < 1L)) return(NULL)
+  # Row s holds each model's s-th smallest draw, so averaging across a row
+  # averages the models' quantiles. That needs the same number of draws from
+  # every model, which holds because all three models start from the same
+  # MCMC settings, and adaptive reruns double iterations, burn-in, and
+  # thinning together, leaving (iterations - burn-in) / thinning unchanged.
+  draws <- lapply(fits, function(fit) sort(fit$samples_all[, "D"]))
+  stopifnot(length(unique(lengths(draws))) == 1L)
+  draws <- do.call(cbind, draws)
 
-  # Quantile-based averaging (below) assumes every model contributes the same
-  # number of posterior draws, so that sorted position s means the same thing
-  # (the same quantile) in each model. In practice this always holds because
-  # D is a bounded quantity for all three models (REM/TTE: D_max times a Beta
-  # draw; USCR: N / area_km2, with N in [0, M] and area_km2 a fixed
-  # constant), so it can't produce non-finite draws that get filtered out
-  # unevenly across models. If that assumption is ever violated,
-  # fail loudly rather than silently truncating every model down to the
-  # shortest one, which would quietly drop the upper tail of the longer
-  # model(s) instead of matching quantiles.
-  if (length(unique(draw_lengths)) > 1L) {
-    stop(
-      "prepare_combo_density_data: models have unequal numbers of finite ",
-      "posterior draws (",
-      paste0(model_names, " = ", draw_lengths, collapse = ", "),
-      "). Quantile-based model averaging assumes an equal number of draws ",
-      "per model; this most likely means D contained non-finite values ",
-      "in one model's samples that were filtered out. Investigate the ",
-      "affected fit(s) instead of truncating to the shortest model.",
-      call. = FALSE
-    )
-  }
-
-  mat <- do.call(cbind, density_draws)
-  colnames(mat) <- model_names
-
-  density_est <- mat
-  summary_rows <- character()
-  if (ncol(mat) > 1L) {
-
+  density_est <- draws
+  if (ncol(draws) > 1L) {
     density_est <- cbind(
-      mat,
-      `unweighted mean` = rowMeans(mat)
+      density_est,
+      `Unweighted quantile average` = rowMeans(draws)
     )
-
-    summary_rows <- "unweighted mean"
-
-    if (isTRUE(waic_weights_available)) {
-
-      # weighted quantile averaging
+    if (!anyNA(weights)) {
       density_est <- cbind(
         density_est,
-        `weighted quantile mean` =
-          as.numeric(mat %*% waic_tbl$w)
-      )
-
-      # mixture distribution averaging
-      mixture_draws <- generate_mixture_posterior(
-        draws_list = raw_density_draws,
-        weights = waic_tbl$w,
-        n_draws = nrow(mat)
-      )
-
-      density_est <- cbind(
-        density_est,
-        `mixture distribution` =
-          mixture_draws
-      )
-
-      summary_rows <- c(
-        summary_rows,
-        "weighted quantile mean",
-        "mixture distribution"
+        `WAIC-weighted quantile average` = as.numeric(draws %*% weights),
+        `WAIC-weighted mixture` = sample_mixture(draws, weights)
       )
     }
   }
 
-  list(
-    fits = fits,
-    model_names = model_names,
-    waic = waic_tbl,
-    waic_weights_available = waic_weights_available,
-    model_draws = density_draws,
-    density_est = density_est,
-    summary_rows = summary_rows
-  )
+  list(fits = fits, weights = weights, density_est = density_est)
 }
 
-build_combo_table_from_fits <- function(fits, density_threshold = 20) {
-  combo_data <- prepare_combo_density_data(fits)
-  if (is.null(combo_data)) return(NULL)
-
-  waic_tbl <- combo_data$waic
-  model_names <- combo_data$model_names
+# Density estimates, P(D > density_threshold), WAIC weights, and Bayesian
+# p-values for each model and model average. The failed_check column marks
+# models that failed their posterior predictive check (hidden in the app,
+# where it sets the p-value's highlight).
+build_combo_table <- function(combo_data, density_threshold, ppc_pass_range) {
   density_est <- combo_data$density_est
-  summary_rows <- combo_data$summary_rows
-  waic_weights_available <- combo_data$waic_weights_available
-
-  means <- apply(density_est, 2, mean)
-  medians <- apply(density_est, 2, stats::median)
-  lower <- apply(density_est, 2, stats::quantile, probs = 0.025)
-  upper <- apply(density_est, 2, stats::quantile, probs = 0.975)
-  prob_threshold <- apply(density_est, 2, function(x) mean(x > density_threshold))
-  # Posterior predictive check (Bayesian p-value) for each model; summary rows get NA.
-  ppc_p <- vapply(combo_data$fits, function(f) {
-    x <- ppc_summary(f)
-    if (is.null(x)) NA_real_ else x$p
-  }, numeric(1))
+  n_averages <- ncol(density_est) - length(combo_data$fits)
+  ppc <- lapply(combo_data$fits, ppc_summary, pass_range = ppc_pass_range)
+  column_stat <- function(f, ...) unname(apply(density_est, 2, f, ...))
   threshold_label <- paste0(
     "P(D > ",
     format(density_threshold, trim = TRUE, scientific = FALSE),
     " animals/km²)"
   )
 
-  table_out <- tibble::tibble(
-    Method = c(model_names, summary_rows),
-    `Mean density (animals/km²)` = as.numeric(means),
-    `Median density (animals/km²)` = as.numeric(medians),
-    `Lower 2.5%` = as.numeric(lower),
-    `Upper 97.5%` = as.numeric(upper),
-    `WAIC weight` = c(waic_tbl$w, rep(NA_real_, length(summary_rows))),
-    `Bayesian p-value` = c(ppc_p, rep(NA_real_, length(summary_rows)))
-  )
-  table_out[[threshold_label]] <- as.numeric(prob_threshold)
-  table_out <- table_out[, c(
-    "Method",
-    "Mean density (animals/km²)",
-    "Median density (animals/km²)",
-    "Lower 2.5%",
-    "Upper 97.5%",
-    threshold_label,
-    "WAIC weight",
-    "Bayesian p-value"
-  )]
-
-  list(
-    table = table_out,
-    waic = waic_tbl,
-    models_available = model_names,
-    waic_weights_available = waic_weights_available
+  tibble::tibble(
+    Method = colnames(density_est),
+    `Mean density (animals/km²)` = column_stat(mean),
+    `Median density (animals/km²)` = column_stat(stats::median),
+    `Lower 2.5%` = column_stat(stats::quantile, probs = 0.025),
+    `Upper 97.5%` = column_stat(stats::quantile, probs = 0.975),
+    !!threshold_label := column_stat(function(x) mean(x > density_threshold)),
+    `WAIC weight` = c(combo_data$weights, rep(NA_real_, n_averages)),
+    `Bayesian p-value` = c(
+      vapply(ppc, function(x) x$p, numeric(1), USE.NAMES = FALSE),
+      rep(NA_real_, n_averages)
+    ),
+    failed_check = c(
+      vapply(ppc, function(x) x$fail, logical(1), USE.NAMES = FALSE),
+      rep(FALSE, n_averages)
+    )
   )
 }
 
+# Colors and point shapes for each model and model average in the plots.
 combo_plot_colors <- c(
+  "USCR" = "#4F6FA3",
   "REM" = "#8C4F2D",
   "TTE" = "#3F7F5F",
-  "USCR" = "#4F6FA3",
-  "unweighted mean" = "#8A8677",
-  "weighted quantile mean" = "#2F3E46",
-  "mixture distribution" = "#8E44AD"
+  "Unweighted quantile average" = "#8A8677",
+  "WAIC-weighted quantile average" = "#2F3E46",
+  "WAIC-weighted mixture" = "#8E44AD"
+)
+combo_plot_shapes <- c(
+  "USCR" = 16,
+  "REM" = 16,
+  "TTE" = 16,
+  "Unweighted quantile average" = 17,
+  "WAIC-weighted quantile average" = 15,
+  "WAIC-weighted mixture" = 18
 )
 
-build_combo_interval_plot <- function(fits, title_text) {
-  combo_data <- prepare_combo_density_data(fits)
-  if (is.null(combo_data)) return(NULL)
-
+# Posterior mean and 95% credible interval of density for each model and
+# model average.
+build_combo_interval_plot <- function(combo_data, title_text) {
+  density_est <- combo_data$density_est
   interval_df <- tibble::tibble(
-    Method = colnames(combo_data$density_est),
-    mean = as.numeric(apply(combo_data$density_est, 2, mean)),
-    lower = as.numeric(apply(combo_data$density_est, 2, stats::quantile, probs = 0.025)),
-    upper = as.numeric(apply(combo_data$density_est, 2, stats::quantile, probs = 0.975))
-  ) |>
-    dplyr::mutate(
-      Summary = dplyr::case_when(
-        Method %in% combo_data$model_names ~ "Model",
-        Method == "weighted quantile mean" ~
-          "Weighted quantile mean",
+    # Levels reversed so the first column is plotted at the top.
+    Method = factor(colnames(density_est), levels = rev(colnames(density_est))),
+    mean = unname(colMeans(density_est)),
+    lower = unname(apply(density_est, 2, stats::quantile, probs = 0.025)),
+    upper = unname(apply(density_est, 2, stats::quantile, probs = 0.975))
+  )
 
-        Method == "mixture distribution" ~
-          "Mixture distribution",
-        TRUE ~ "Unweighted mean"
-      ),
-      Method = factor(Method, levels = rev(Method)),
-      point_shape = dplyr::case_when(
-        Summary == "Model" ~ 16,
-        Summary == "Weighted quantile mean" ~ 15,
-        Summary == "Mixture distribution" ~ 18,
-        TRUE ~ 17
-      )
-    )
-
-  interval_levels <- rev(colnames(combo_data$density_est))
-  interval_colors <- combo_plot_colors[interval_levels]
-  interval_colors <- interval_colors[!is.na(interval_colors)]
-
-  ggplot(interval_df, aes(x = mean, y = Method, color = Method)) +
-    geom_errorbar(aes(xmin = lower, xmax = upper), orientation = "y", width = 0.18, linewidth = 1, alpha = 0.95) +
-    geom_point(aes(shape = point_shape), size = 3.2, show.legend = FALSE) +
-    scale_color_manual(
-      values = interval_colors,
-      drop = FALSE
+  ggplot(
+    interval_df,
+    aes(x = mean, y = Method, color = Method, shape = Method)
+  ) +
+    geom_errorbar(
+      aes(xmin = lower, xmax = upper),
+      orientation = "y",
+      width = 0.18,
+      linewidth = 1,
+      alpha = 0.95
     ) +
-    scale_shape_identity() +
-    labs(
-      title = title_text,
-      x = "Density (animals/km²)",
-      y = NULL,
-      color = NULL
-    ) +
+    geom_point(size = 3.2) +
+    scale_color_manual(values = combo_plot_colors) +
+    scale_shape_manual(values = combo_plot_shapes) +
+    labs(title = title_text, x = "Density (animals/km²)", y = NULL) +
     theme_minimal(base_size = 12) +
     theme(
-      legend.position = "top",
+      legend.position = "none",
       panel.grid.minor = element_blank(),
       plot.title = element_text(face = "bold")
     )
 }
 
-build_combo_density_overlay_plot <- function(fits, title_text) {
-  combo_data <- prepare_combo_density_data(fits)
-  if (is.null(combo_data)) return(NULL)
-
-  density_df <- purrr::imap_dfr(
-    combo_data$model_draws,
-    ~ tibble::tibble(
-      Method = .y,
-      density_km2 = .x
-    )
-  )
-  if (!nrow(density_df)) return(NULL)
-
-  density_colors <- combo_plot_colors[c("REM", "TTE", "USCR")]
+# Posterior distributions of density for each model, overlaid.
+build_combo_density_overlay_plot <- function(combo_data, title_text) {
+  model_names <- names(combo_data$fits)
+  density_df <- combo_data$density_est[, model_names, drop = FALSE] |>
+    tibble::as_tibble() |>
+    tidyr::pivot_longer(
+      dplyr::everything(),
+      names_to = "Method",
+      values_to = "density_km2"
+    ) |>
+    dplyr::mutate(Method = factor(Method, levels = model_names))
 
   ggplot(density_df, aes(x = density_km2, color = Method, fill = Method)) +
     geom_density(alpha = 0.16, linewidth = 1) +
-    scale_color_manual(
-      values = density_colors,
-      drop = FALSE
-    ) +
-    scale_fill_manual(
-      values = density_colors,
-      drop = FALSE
-    ) +
+    scale_color_manual(values = combo_plot_colors) +
+    scale_fill_manual(values = combo_plot_colors) +
     labs(
       title = title_text,
       x = "Density (animals/km²)",
@@ -487,50 +341,57 @@ build_combo_density_overlay_plot <- function(fits, title_text) {
     )
 }
 
-#' Posterior summary for CSV export (parameter names, mean, 95% CI)
+# Posterior summary of a fit's parameters for the CSV download, one row per
+# parameter. D is renamed D_km2 so the units are explicit. log_sigma and
+# log_lam_0 (USCR) duplicate sigma and lam_0 on the log scale, and sum_obs and
+# sum_sim are intermediate sums for bp, so all four are dropped. bp is 0 or 1
+# in each draw, so only its mean (the Bayesian p-value) is reported.
 posterior_summary_df <- function(fit) {
-  if (is.null(fit) || is.null(fit$samples_all)) return(NULL)
-  m <- as.data.frame(fit$samples_all)
-
-  # Density: all three models monitor "D" in animals/km² (USCR derives it
-  # as N / area_km2). Export it as "D_km2" so the units are explicit.
-  if ("D" %in% names(m)) {
-    m$D_km2 <- m$D
-    m$D     <- NULL
-  }
-
-  # log_sigma/log_lam_0 (USCR) duplicate sigma/lam_0 on the log scale, and
-  # sum_obs/sum_sim are just the intermediate discrepancy sums used to
-  # compute bp (the Bayesian p-value) — drop all four rather than exporting
-  # redundant or purely intermediate columns.
-  drop_cols <- intersect(c("log_sigma", "log_lam_0", "sum_obs", "sum_sim"), names(m))
-  if (length(drop_cols) > 0) m[drop_cols] <- NULL
+  draws <- tibble::as_tibble(fit$samples_all) |>
+    dplyr::rename(D_km2 = D) |>
+    dplyr::select(
+      -dplyr::any_of(c("log_sigma", "log_lam_0", "sum_obs", "sum_sim"))
+    ) |>
+    dplyr::relocate(dplyr::any_of(
+      c("D_km2", "v", "sd_eps", "N", "psi", "sigma", "lam_0", "bp")
+    ))
 
   tibble::tibble(
-    parameter = names(m),
-    mean      = round(sapply(m, mean), 2),
-    median    = round(sapply(m, stats::median), 2),
-    q025      = round(sapply(m, function(x) stats::quantile(x, 0.025)), 2),
-    q975      = round(sapply(m, function(x) stats::quantile(x, 0.975)), 2)
-  )
+    parameter = names(draws),
+    mean = vapply(draws, mean, numeric(1)),
+    median = vapply(draws, stats::median, numeric(1)),
+    q025 = vapply(draws, stats::quantile, numeric(1), probs = 0.025),
+    q975 = vapply(draws, stats::quantile, numeric(1), probs = 0.975)
+  ) |>
+    dplyr::mutate(
+      dplyr::across(
+        c(median, q025, q975),
+        function(x) dplyr::if_else(parameter == "bp", NA_real_, x)
+      ),
+      dplyr::across(where(is.numeric), function(x) round(x, 3))
+    )
 }
-  #' Shared legend describing posterior summary CSV columns, shown below the
-  #' download buttons on the Compare & combine tab.
-  posterior_param_legend <- function() {
-    markdown(paste(
-      "**Posterior summary column reference:**",
-      "",
-      "- `bp` — Bayesian p-value (posterior predictive check); values below 0.05 or above 0.95 mean the check failed.",
-      "- `sd_eps` (σ<sub>ε</sub>) — standard deviation of the camera-level lognormal random effect in the Poisson-lognormal count model. Only included when camera-level noise is turned on (**Model settings > Advanced > Priors: Camera-level noise**); with it off, `sd_eps` is not estimated and does not appear here.",
-      "- `v` — animal movement speed (km/day).",
-      "- `D_km2` — density, in animals per km².",
-      "- `N` — USCR only: abundance, the total number of animals estimated within the state space.",
-      "- `lam_0` (λ₀) — USCR only: expected detections per deployed day if an animal's activity center were at the camera.",
-      "- `psi` (ψ) — USCR only: the probability that a data-augmented individual is a real member of the population. Its prior sets the prior on abundance and density.",
-      "- `sigma` (σ) — USCR only: spatial scale parameter (km), related to home-range size and how quickly detection falls with distance from an animal's activity center.",
-      sep = "\n"
-    ))
-  }
+
+# Explains the posterior summary CSV, below its download button.
+posterior_param_legend <- function() {
+  markdown(paste(
+    "**Posterior summary CSV:** one row per model and parameter, with the posterior mean, median, and 2.5% and 97.5% quantiles (`q025`, `q975`).",
+    "",
+    "- `D_km2` — density (animals/km²).",
+    "- `v` — REM and TTE only: daily movement rate (km/day).",
+    "- `sd_eps` (σ<sub>ε</sub>) — standard deviation of the camera-level random effects. Only included when camera-level noise is turned on (**Model settings > Advanced > Priors: Camera-level noise**).",
+    "- `N` — USCR only: abundance, the number of animals in the state space.",
+    "- `psi` (ψ) — USCR only: probability that an augmented individual is part of the real population. Its prior sets the prior on abundance and density.",
+    "- `sigma` (σ) — USCR only: spatial scale parameter (km), related to home-range size and how quickly detection falls with distance.",
+    "- `lam_0` (λ₀) — USCR only: expected count of an individual per camera-day if its activity center were at the camera.",
+    paste0(
+      "- `bp` — posterior predictive check. Its mean is the Bayesian p-value; the check fails if it is below ",
+      ppc_pass_range[1], " or above ", ppc_pass_range[2],
+      ". `bp` is 0 or 1 in each draw, so its median and quantiles are left blank."
+    ),
+    sep = "\n"
+  ))
+}
 
 # -------------------------------------------------------------------
 # UI
@@ -1749,39 +1610,54 @@ ui <- page_fillable(
     # ---------------------- COMPARE & COMBINE --------------------
     nav_panel(
       "Compare & combine",
-      markdown(paste(
-        "**Uploaded field data:** the table below updates as REM, TTE, and USCR finish. If only some models have completed, the table will still summarize the completed fits.",
-        "",
-        "1. Compute ΔWAIC and WAIC weights when multiple models are available and WAIC is available for all completed fits;",
-        "2. Combine posterior draws of density (animals/km²) across the completed fits;",
-        "3. Report model-specific densities, and when possible also report unweighted, WAIC-weighted, and mixture distribution summaries plus the probability that density exceeds the user-set threshold. If WAIC is missing for one or more completed fits, only the unweighted summary is shown.",
-        "",
-        "Run the models from their tabs first, then check the tables.",
-        sep = "\n"
-      )),
+      HTML(paste0('
+        <h2>Compare &amp; combine</h2>
+        <p><strong>The gist:</strong> Compares the models run on <strong>uploaded field data</strong> using <strong>WAIC</strong>, and combines their density estimates into <strong>model averages</strong>.</p>
+        <details>
+          <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
+          <div style="margin: 1rem 0; padding-left: 1rem;">
+            <p>WAIC weights, where \\(\\mathrm{WAIC}_k\\) is model \\(k\\)\'s WAIC (averaged across its chains):</p>
+            <p>$$w_k = \\frac{\\exp(-\\Delta_k / 2)}{\\sum_j \\exp(-\\Delta_j / 2)}, \\qquad \\Delta_k = \\mathrm{WAIC}_k - \\min_j \\mathrm{WAIC}_j$$</p>
+            <p>Quantile averages, where \\(D_{k(s)}\\) is the \\(s\\)th smallest posterior draw of density from model \\(k\\):</p>
+            <p>$$\\bar{D}_{(s)} = \\sum_k w_k\\,D_{k(s)}$$</p>
+            <p>The WAIC-weighted quantile average uses the WAIC weights \\(w_k\\) above; the unweighted quantile average sets each \\(w_k = 1/K\\), where \\(K\\) is the number of models.</p>
+            <p>WAIC-weighted mixture, where \\(p_k(D \\mid y)\\) is model \\(k\\)\'s posterior distribution of density:</p>
+            <p>$$p_{\\mathrm{mix}}(D \\mid y) = \\sum_k w_k\\,p_k(D \\mid y)$$</p>
+            <p>Each mixture draw comes from model \\(k\\) with probability \\(w_k\\), as a random posterior draw of density from that model.</p>
+            <p>For each model and model average, \\(P(D > \\text{threshold})\\) is the proportion of draws of density above the threshold set below. Density is reported in animals/km².</p>
+            <h3>Notes</h3>
+            <ul>
+              <li>The table summarizes whichever models have been run on uploaded data, and updates as each one finishes. Model averages need at least two models. The WAIC-weighted averages also need a WAIC for every model; otherwise only the unweighted quantile average is shown.</li>
+              <li>A Bayesian p-value in red means that model failed its posterior predictive check (p-value below ', ppc_pass_range[1], ' or above ', ppc_pass_range[2], '), so its estimates and intervals may be unreliable.</li>
+              <li>Results are cleared whenever the data the models were fit to change, so models are only compared and combined when fit to the same data.</li>
+              <li>WAIC isn\'t computed for simulated data, so this tab covers uploaded field data only.</li>
+            </ul>
+          </div>
+        </details>
+      ')),
+      hr(),
+      h3("Uploaded field data"),
       numericInput(
         "combo_density_threshold",
-        "Density threshold for probability summary (animals/km²): Enter a density value below. The app will calculate the probability that the estimated density exceeds this threshold for each individual model and for the weighted and unweighted combined estimates.",
+        "Density threshold (animals/km²)",
         value = 8,
         min = 0,
         step = 1
       ),
-
-      h2("Uploaded field data – model comparison and combined results (animals/km²)"),
       DTOutput("nps_combo_table"),
-      h3("Visual summaries"),
+      h4("Visual summaries"),
       plotOutput("nps_combo_interval_plot", height = "320px"),
       div(
-        downloadButton("dl_nps_combo_interval_png", "Download uploaded-data interval plot (PNG)"),
+        downloadButton("dl_nps_combo_interval_png", "Download interval plot (PNG)"),
         style = "margin-bottom: 12px;"
       ),
       plotOutput("nps_combo_density_plot", height = "320px"),
       div(
-        downloadButton("dl_nps_combo_density_png", "Download uploaded-data posterior overlay (PNG)"),
+        downloadButton("dl_nps_combo_density_png", "Download posterior density plot (PNG)"),
         style = "margin-bottom: 12px;"
       ),
-      p("Posterior summaries (all monitored parameters, mean, 95% CI) for each completed model:"),
-      downloadButton("dl_nps_all_csv", "Download available uploaded-data posterior summaries (CSV)"),
+      h4("Posterior summaries"),
+      downloadButton("dl_nps_all_csv", "Download posterior summaries (CSV)"),
       posterior_param_legend()
     ),
 
@@ -2280,7 +2156,7 @@ server <- function(input, output, session) {
         across(where(is.numeric), ~round(.x, 3))
       )
     # Posterior predictive check under the table (red when it fails).
-    ppc <- ppc_summary(fit)
+    ppc <- ppc_summary(fit, ppc_pass_range)
     caption <- if (!is.null(ppc)) {
       htmltools::tags$caption(
         style = paste0("caption-side: bottom; text-align: left; color: ",
@@ -3468,9 +3344,9 @@ server <- function(input, output, session) {
 
   # Posterior predictive check text for a fit (see ppc_summary()).
   ppc_text <- function(fit) {
-    ppc <- ppc_summary(fit)
+    ppc <- ppc_summary(fit, ppc_pass_range)
     if (is.null(ppc)) return(NULL)
-    base <- sprintf("Posterior predictive check: Bayesian p-value = %.2f", ppc$p)
+    base <- sprintf("Posterior predictive check: Bayesian p-value = %.3f", ppc$p)
     if (!ppc$fail) {
       return(paste0(base, " (passes; values from ", ppc$lower, " to ", ppc$upper, " pass)."))
     }
@@ -3486,11 +3362,11 @@ server <- function(input, output, session) {
     )
   }
   notify_ppc <- function(fit, label) {
-    ppc <- ppc_summary(fit)
+    ppc <- ppc_summary(fit, ppc_pass_range)
     if (!is.null(ppc) && isTRUE(ppc$fail)) {
       showNotification(
         paste0(label, " failed its posterior predictive check (Bayesian p-value ",
-               sprintf("%.2f", ppc$p), "). See the run-status panel."),
+               sprintf("%.3f", ppc$p), "). See the run-status panel."),
         type = "warning", duration = NULL
       )
     }
@@ -3945,14 +3821,14 @@ server <- function(input, output, session) {
     s <- summarize_method(fit)
     out <- list(
       dataset                   = "Uploaded field data",
-      mean_density_animals_per_km2 = round(s$mean_km2, 2),
-      median_density_animals_per_km2 = round(s$median_km2, 2),
-      CI95_km2                  = c(round(s$q2.5_km2, 2), round(s$q97.5_km2, 2))
+      mean_density_animals_per_km2 = round(s$mean_km2, 3),
+      median_density_animals_per_km2 = round(s$median_km2, 3),
+      CI95_km2                  = c(round(s$q2.5_km2, 3), round(s$q97.5_km2, 3))
     )
-    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 2)
-    ppc <- ppc_summary(fit)
+    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 3)
+    ppc <- ppc_summary(fit, ppc_pass_range)
     if (!is.null(ppc)) {
-      out$bayesian_p_value <- round(ppc$p, 2)
+      out$bayesian_p_value <- round(ppc$p, 3)
       out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
     }
     out
@@ -3972,14 +3848,14 @@ server <- function(input, output, session) {
     s <- summarize_method(fit)
     out <- list(
       dataset                   = "Uploaded field data",
-      mean_density_animals_per_km2 = round(s$mean_km2, 2),
-      median_density_animals_per_km2 = round(s$median_km2, 2),
-      CI95_km2                  = c(round(s$q2.5_km2, 2), round(s$q97.5_km2, 2))
+      mean_density_animals_per_km2 = round(s$mean_km2, 3),
+      median_density_animals_per_km2 = round(s$median_km2, 3),
+      CI95_km2                  = c(round(s$q2.5_km2, 3), round(s$q97.5_km2, 3))
     )
-    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 2)
-    ppc <- ppc_summary(fit)
+    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 3)
+    ppc <- ppc_summary(fit, ppc_pass_range)
     if (!is.null(ppc)) {
-      out$bayesian_p_value <- round(ppc$p, 2)
+      out$bayesian_p_value <- round(ppc$p, 3)
       out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
     }
     out
@@ -3999,14 +3875,14 @@ server <- function(input, output, session) {
     s <- summarize_method(fit)
     out <- list(
       dataset                   = "Uploaded field data",
-      mean_density_animals_per_km2 = round(s$mean_km2, 2),
-      median_density_animals_per_km2 = round(s$median_km2, 2),
-      CI95_km2                  = c(round(s$q2.5_km2, 2), round(s$q97.5_km2, 2))
+      mean_density_animals_per_km2 = round(s$mean_km2, 3),
+      median_density_animals_per_km2 = round(s$median_km2, 3),
+      CI95_km2                  = c(round(s$q2.5_km2, 3), round(s$q97.5_km2, 3))
     )
-    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 2)
-    ppc <- ppc_summary(fit)
+    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 3)
+    ppc <- ppc_summary(fit, ppc_pass_range)
     if (!is.null(ppc)) {
-      out$bayesian_p_value <- round(ppc$p, 2)
+      out$bayesian_p_value <- round(ppc$p, 3)
       out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
     }
     out
@@ -4028,98 +3904,87 @@ server <- function(input, output, session) {
   })
 
   # ================================================================
-  # COMPARE & COMBINE (WAIC-based)
+  # COMPARE & COMBINE
   # ================================================================
-  nps_combo <- reactive({
-    build_combo_table_from_fits(
-      list(
-        REM = rem_nps_fit(),
-        TTE = tte_nps_fit(),
-        USCR = uscr_nps_fit()
-      ),
-      density_threshold = input$combo_density_threshold
-    )
-  })
-
-  nps_combo_fits <- reactive({
-    fits <- list(
+  # Combined once, so the table and plots use the same mixture draws.
+  nps_combo_data <- reactive({
+    prepare_combo_density_data(list(
+      USCR = uscr_nps_fit(),
       REM = rem_nps_fit(),
-      TTE = tte_nps_fit(),
-      USCR = uscr_nps_fit()
-    )
-    fits[!vapply(fits, is.null, logical(1))]
+      TTE = tte_nps_fit()
+    ))
   })
 
   nps_combo_interval_plot_obj <- reactive({
-    fits <- nps_combo_fits()
-    if (!length(fits)) return(NULL)
-    build_combo_interval_plot(
-      fits,
-      title_text = "Uploaded field data: density estimates by model"
-    )
+    combo_data <- nps_combo_data()
+    if (!is.null(combo_data)) {
+      build_combo_interval_plot(
+        combo_data,
+        title_text = "Uploaded field data: density estimates"
+      )
+    }
   })
 
   nps_combo_density_plot_obj <- reactive({
-    fits <- nps_combo_fits()
-    if (!length(fits)) return(NULL)
-    build_combo_density_overlay_plot(
-      fits,
-      title_text = "Uploaded field data: posterior density overlap"
-    )
+    combo_data <- nps_combo_data()
+    if (!is.null(combo_data)) {
+      build_combo_density_overlay_plot(
+        combo_data,
+        title_text = "Uploaded field data: posterior distributions of density"
+      )
+    }
   })
 
-  output$dl_nps_all_csv <- downloadHandler(
-    filename = function() {
-      paste0("DEER_uploaded_data_posterior_summary_", Sys.Date(), ".csv")
-    },
-    content = function(file) {
-      fits <- nps_combo_fits()
-      req(length(fits) > 0)
-      df <- dplyr::bind_rows(
-        lapply(names(fits), function(model_name) {
-          dplyr::mutate(
-            posterior_summary_df(fits[[model_name]]),
-            model = model_name,
-            .before = 1
-          )
-        })
-      )
-      readr::write_csv(df, file)
-    }
-  )
-
   output$nps_combo_table <- renderDT({
-    combo <- nps_combo()
-    if (is.null(combo)) {
-      note_text <- "Run at least one uploaded-data model from its tab first. The table will update as REM, TTE, and USCR finish."
+    combo_data <- nps_combo_data()
+    if (is.null(combo_data)) {
       return(DT::datatable(
         data.frame(
-          Note = note_text
+          Note = "Run at least one model on uploaded data from its tab. The table updates as USCR, REM, and TTE finish."
         ),
         options = list(dom = "t", paging = FALSE),
         rownames = FALSE
       ))
     }
-    df <- combo$table |>
-      mutate(across(where(is.numeric), ~ round(.x, 3)))
-    # Bayesian p-values outside 0.05-0.95 (failed posterior predictive check) in red.
-    datatable(df, options = list(paging = FALSE, ordering = FALSE, dom = "t", autoWidth = TRUE), rownames = FALSE) |>
+    df <- build_combo_table(
+      combo_data,
+      density_threshold = input$combo_density_threshold,
+      ppc_pass_range = ppc_pass_range
+    ) |>
+      dplyr::mutate(dplyr::across(where(is.numeric), function(x) round(x, 3)))
+    # Bayesian p-values of models that failed their posterior predictive check
+    # in bold red, set by the hidden failed_check column.
+    DT::datatable(
+      df,
+      options = list(
+        paging = FALSE,
+        ordering = FALSE,
+        dom = "t",
+        autoWidth = TRUE,
+        columnDefs = list(list(
+          visible = FALSE,
+          targets = which(names(df) == "failed_check") - 1L
+        ))
+      ),
+      rownames = FALSE
+    ) |>
       DT::formatStyle(
         "Bayesian p-value",
-        color = DT::styleInterval(c(0.05, 0.95), c("firebrick", "inherit", "firebrick")),
-        fontWeight = DT::styleInterval(c(0.05, 0.95), c("bold", "normal", "bold"))
+        valueColumns = "failed_check",
+        color = DT::styleEqual(TRUE, "firebrick"),
+        fontWeight = DT::styleEqual(TRUE, "bold")
       )
   })
 
   output$nps_combo_interval_plot <- renderPlot({
     p <- nps_combo_interval_plot_obj()
-    validate(need(!is.null(p), "Run at least one uploaded-data model first."))
+    validate(need(!is.null(p), "Run at least one model on uploaded data first."))
     p
   }, res = 120)
 
   output$nps_combo_density_plot <- renderPlot({
     p <- nps_combo_density_plot_obj()
-    validate(need(!is.null(p), "Run at least one uploaded-data model first."))
+    validate(need(!is.null(p), "Run at least one model on uploaded data first."))
     p
   }, res = 120)
 
@@ -4129,22 +3994,36 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p <- nps_combo_interval_plot_obj()
-      req(!is.null(p))
+      req(p)
       ggplot2::ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
     }
   )
 
   output$dl_nps_combo_density_png <- downloadHandler(
     filename = function() {
-      paste0("DEER_uploaded_data_density_overlay_", Sys.Date(), ".png")
+      paste0("DEER_uploaded_data_density_plot_", Sys.Date(), ".png")
     },
     content = function(file) {
       p <- nps_combo_density_plot_obj()
-      req(!is.null(p))
+      req(p)
       ggplot2::ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
     }
   )
 
+  output$dl_nps_all_csv <- downloadHandler(
+    filename = function() {
+      paste0("DEER_uploaded_data_posterior_summary_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      combo_data <- nps_combo_data()
+      req(combo_data)
+      purrr::imap(combo_data$fits, function(fit, model) {
+        dplyr::mutate(posterior_summary_df(fit), model = model, .before = 1)
+      }) |>
+        dplyr::bind_rows() |>
+        readr::write_csv(file)
+    }
+  )
 }
 
 # -------------------------------------------------------------------

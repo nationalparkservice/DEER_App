@@ -582,7 +582,7 @@ check_images <- function(images, deployments) {
   cluster_site_counts <- images |>
     dplyr::filter(!is.na(`Cluster ID`) & `Cluster ID` != "") |>
     dplyr::group_by(`Cluster ID`) |>
-    dplyr::summarise(n_sites = dplyr::n_distinct(`Site Name`), .groups = "drop")
+    dplyr::summarize(n_sites = dplyr::n_distinct(`Site Name`), .groups = "drop")
   bad_clusters <- cluster_site_counts$`Cluster ID`[cluster_site_counts$n_sites > 1]
   if (length(bad_clusters) > 0) {
     issues <- c(issues, paste0(
@@ -714,7 +714,7 @@ check_images <- function(images, deployments) {
   window_check <- img_dates |>
     dplyr::inner_join(deployment_windows, by = "Site Name") |>
     dplyr::group_by(`Site Name`) |>
-    dplyr::summarise(
+    dplyr::summarize(
       dep_start = dplyr::first(dep_start),
       dep_end = dplyr::first(dep_end),
       malfunction_date = dplyr::first(malfunction_date),
@@ -775,7 +775,7 @@ check_images <- function(images, deployments) {
   outside <- images |>
     dplyr::filter(!is.na(Species), Species != "") |>
     dplyr::group_by(`Site Name`, `Cluster ID`) |>
-    dplyr::summarise(start = min(Timestamp), .groups = "drop") |>
+    dplyr::summarize(start = min(Timestamp), .groups = "drop") |>
     dplyr::inner_join(windows, by = "Site Name") |>
     dplyr::inner_join(deployment_windows, by = "Site Name") |>
     dplyr::mutate(start_date = as.Date(format(start, "%Y-%m-%d"))) |>
@@ -784,7 +784,7 @@ check_images <- function(images, deployments) {
       start_date <= dep_end + grace_days
     ) |>
     dplyr::group_by(`Site Name`, window_start, window_end) |>
-    dplyr::summarise(
+    dplyr::summarize(
       n_early = sum(start < window_start),
       n_late = sum(start > window_end & !malfunction),
       .groups = "drop"
@@ -897,7 +897,7 @@ detection_events <- function(images, deployments, max_days = NULL) {
   images |>
     dplyr::filter(!is.na(Species), Species != "") |>
     dplyr::group_by(`Site Name`, `Cluster ID`, Species) |>
-    dplyr::summarise(
+    dplyr::summarize(
       n_images = dplyr::n(),
       count    = max(`Sighting Count`),
       start    = min(Timestamp),
@@ -925,7 +925,7 @@ detection_events <- function(images, deployments, max_days = NULL) {
 # subtracted here.
 summarize_deployments <- function(deployments, max_days = NULL) {
   analysis_windows(deployments, max_days = max_days) |>
-    dplyr::summarise(
+    dplyr::summarize(
       n_cameras         = dplyr::n(),
       mean_days         = mean(days),
       total_camera_days = sum(days)
@@ -943,7 +943,7 @@ summarize_species <- function(images, events) {
   event_counts <- events |>
     dplyr::filter(in_window) |>
     dplyr::group_by(Species) |>
-    dplyr::summarise(
+    dplyr::summarize(
       n_events = dplyr::n(),
       animals  = sum(count),
       cameras  = dplyr::n_distinct(`Site Name`),
@@ -967,7 +967,7 @@ species_by_camera <- function(images, events, deployments, species_name) {
   event_counts <- events |>
     dplyr::filter(Species == species_name, in_window) |>
     dplyr::group_by(`Site Name`) |>
-    dplyr::summarise(n_events = dplyr::n(), animals = sum(count), .groups = "drop")
+    dplyr::summarize(n_events = dplyr::n(), animals = sum(count), .groups = "drop")
 
   deployments |>
     dplyr::transmute(
@@ -987,5 +987,5 @@ species_by_day <- function(events, species_name) {
     dplyr::filter(Species == species_name, in_window) |>
     dplyr::mutate(Date = as.Date(format(start, "%Y-%m-%d"))) |>
     dplyr::group_by(`Site Name`, Date) |>
-    dplyr::summarise(animals = sum(count), .groups = "drop")
+    dplyr::summarize(animals = sum(count), .groups = "drop")
 }
