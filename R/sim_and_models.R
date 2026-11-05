@@ -1,6 +1,7 @@
 ## R/sim_and_models.R
-## Simulation helpers + NPS model inputs + REM / USCR / TTE models
-## Models follow Camera_Unmarked_Analyses_updated.Rmd, with a speed-aware adaptive USCR fit for app use.
+## Simulation helpers, model inputs for uploaded data, and the USCR, REM,
+## and TTE models (which follow Camera_Unmarked_Analyses_updated.Rmd, with
+## adaptive reruns for app use).
 
 # -------------------------------------------------------------------
 # Package checks (loaded lazily where needed)
@@ -13,13 +14,8 @@ quiet_require <- function(pkg) {
 }
 
 # -------------------------------------------------------------------
-# 1. Simulation helpers (for teaching/sim tab)
+# 1. Simulation helpers (Simulate data tab)
 # -------------------------------------------------------------------
-home_range_km2_to_sigma_m <- function(home_range_km2) {
-  radius_km <- sqrt(home_range_km2 / pi)
-  sigma_km <- radius_km / 2.45
-  sigma_km * 1000
-}
 
 # Average length of a straight-line path across a camera viewshed (a circular
 # sector with full angle theta_deg degrees), as a multiple of the viewshed's
@@ -30,62 +26,59 @@ tte_path_length_multiplier <- function(theta_deg) {
   3.324e-01 + 5.580e-03 * theta_deg - 1.454e-05 * theta_deg^2
 }
 
+# Square grid of n_side x n_side cameras spacing_m apart, centered on the
+# origin: x and y in meters (for plots and tables), utm_e and utm_n in km
+# (for the models).
+build_sim_camera_grid <- function(n_side, spacing_m) {
+  coords <- expand.grid(
+    x = seq(0, by = spacing_m, length.out = n_side),
+    y = seq(0, by = spacing_m, length.out = n_side)
+  )
+  coords <- coords[order(coords$y, coords$x), , drop = FALSE]
+
+  coords |>
+    dplyr::mutate(
+      x = x - mean(range(x)),
+      y = y - mean(range(y)),
+      `Site Name` = paste0("C", dplyr::row_number()),
+      utm_e = x / 1000,
+      utm_n = y / 1000
+    )
+}
+
 # Simulate USCR camera counts on a square camera grid. This mirrors the NIMBLE
 # model in build_uscr_code(), so the simulated data and the fitted model share
 # the same state space and observation process:
-#   - Cameras: the same centered square grid the REM/TTE teaching simulator
-#     uses (build_teaching_sim_grid()).
+#   - Cameras: the grid from build_sim_camera_grid().
 #   - Activity centers: N_rect ~ Poisson(D * rectangle area) points drawn with
 #     runif() over the camera rectangle +/- buffer, keeping only those within
-#     `buffer` of at least one camera (the model's in_ss constraint). The kept
-#     points are a Poisson process with density D over exactly the model's
-#     state space (the union of circles of radius `buffer` around cameras).
-#   - Counts: y_j ~ Poisson(days_j * sum_i lambda0 * exp(-d_ij^2 / (2 sigma^2))
+#     the buffer of at least one camera (the model's in_ss constraint). The
+#     kept points are a Poisson process with density D over exactly the
+#     model's state space (the union of circles of radius buffer around the
+#     cameras).
+#   - Counts: y_j ~ Poisson(days * sum_i lambda0 * exp(-d_ij^2 / (2 sigma^2))
 #     * exp(use_eps * eps_j)), with camera-level noise eps_j ~ Normal(0, sd_eps)
 #     and use_eps = 1 when camera_noise is on, 0 when off. eps is always
 #     drawn, so the same seed gives the same activity centers and counts
 #     (apart from the noise) with noise on or off, mirroring the model.
-# All distances are in km internally; buffer_m and sigma_m are in meters.
-simulate_camera_counts <- function(n_side   = 5,
-                                   spacing_m = 300,
-                                   days      = 21,
-                                   D_per_km2 = 25,
-                                   lambda0   = 0.20,
-                                   home_range_km2 = 0.89,
-                                   sigma_m   = NULL,
-                                   buffer_m  = NULL,
-                                   sd_eps    = 1,
-                                   camera_noise = FALSE,
-                                   seed      = 1) {
-  if (n_side < 2 || days < 1 || spacing_m <= 0) {
-    stop("USCR simulator needs at least a 2 x 2 grid, positive spacing, and at least 1 day.",
-         call. = FALSE)
-  }
-  if (D_per_km2 < 0 || lambda0 <= 0 || sd_eps < 0) {
-    stop("USCR simulator density, detection rate, and heterogeneity inputs are out of range.",
-         call. = FALSE)
-  }
-
+# sigma_km is in km and buffer_m in meters; the activity centers and the
+# state-space outline are returned in meters, for plotting.
+simulate_camera_counts <- function(n_side,
+                                   spacing_m,
+                                   days,
+                                   D_per_km2,
+                                   lambda0,
+                                   sigma_km,
+                                   buffer_m,
+                                   sd_eps,
+                                   camera_noise,
+                                   seed) {
   set.seed(seed)
 
-  if (is.null(sigma_m)) {
-    sigma_m <- home_range_km2_to_sigma_m(home_range_km2)
-  }
-  sigma_km <- sigma_m / 1000
-  if (is.null(buffer_m) || !is.finite(buffer_m) || buffer_m <= 0) {
-    buffer_m <- uscr_buffer_from_sigma_km(sigma_km)
-  }
-  buffer_km <- buffer_m / 1000
-
-  # Cameras (detection radius is filled in later by sim_model_inputs()).
-  out <- build_teaching_sim_grid(
-    n_side = n_side,
-    spacing_m = spacing_m,
-    detection_radius_m = NA_real_,
-    days = days
-  )
+  out <- build_sim_camera_grid(n_side, spacing_m)
   cam <- cbind(out$utm_e, out$utm_n)
   J <- nrow(cam)
+  buffer_km <- buffer_m / 1000
 
   # Activity centers: uniform over the rectangle, then keep those within the
   # buffer of at least one camera.
@@ -97,150 +90,75 @@ simulate_camera_counts <- function(n_side   = 5,
     stats::runif(N_rect, ylim[1], ylim[2])
   )
   dist2 <- outer(ac[, 1], cam[, 1], "-")^2 + outer(ac[, 2], cam[, 2], "-")^2
-  dist2 <- matrix(dist2, nrow = N_rect, ncol = J)
   keep <- if (N_rect > 0) apply(dist2, 1, min) < buffer_km^2 else logical(0)
   ac <- ac[keep, , drop = FALSE]
   dist2 <- dist2[keep, , drop = FALSE]
 
   # Counts.
   camera_days <- rep(as.numeric(days), J)
-  Lambda <- colSums(lambda0 * exp(-dist2 / (2 * sigma_km^2)))  # per day, per camera
+  Lambda <- colSums(lambda0 * exp(-dist2 / (2 * sigma_km^2)))  # per camera-day
   eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
   use_eps <- as.numeric(isTRUE(camera_noise))
   mu <- camera_days * Lambda * exp(use_eps * eps)
-  camera_counts <- stats::rpois(J, mu)
-
-  area_km2 <- uscr_buffered_area_km2(cam, buffer_km)
 
   list(
     out = out,
-    camera_counts = camera_counts,
+    camera_counts = stats::rpois(J, mu),
     camera_days = camera_days,
-    activity_centers = data.frame(x = ac[, 1] * 1000, y = ac[, 2] * 1000),  # meters
-    state_space_outline = uscr_buffered_outline(cam, buffer_km, scale = 1000),  # meters
-    truth = list(
-      D_per_km2 = D_per_km2,
-      N = nrow(ac),
-      area_km2 = area_km2,
-      realized_D_per_km2 = nrow(ac) / area_km2,
-      lambda0   = lambda0,
-      home_range_km2 = home_range_km2,
-      sigma_m   = sigma_m,
-      buffer_m  = buffer_m,
-      sd_eps    = sd_eps,
-      camera_noise = isTRUE(camera_noise),
-      days      = days,
-      spacing_m = spacing_m,
-      n_side    = n_side,
-      n_cams    = J
-    )
+    activity_centers = data.frame(x = ac[, 1] * 1000, y = ac[, 2] * 1000),
+    state_space_outline = uscr_buffered_outline(cam, buffer_km, scale = 1000),
+    N = nrow(ac),
+    area_km2 = uscr_buffered_area_km2(cam, buffer_km)
   )
 }
 
-# For simulations: create "NPS-like" inputs for models
-sim_model_inputs <- function(sim, detection_radius_m) {
-  out <- sim$out
-  out$`Detection Distance` <- detection_radius_m
-
-  list(
-    out           = out,
-    camera_counts = sim$camera_counts,
-    camera_days   = sim$camera_days
-  )
-}
-
-build_teaching_sim_grid <- function(n_side, spacing_m, detection_radius_m, days) {
-  coords <- expand.grid(
-    x = seq(0, by = spacing_m, length.out = n_side),
-    y = seq(0, by = spacing_m, length.out = n_side)
-  )
-  coords <- coords[order(coords$y, coords$x), , drop = FALSE]
-  coords$x <- coords$x - mean(range(coords$x))
-  coords$y <- coords$y - mean(range(coords$y))
-
-  coords |>
-    dplyr::mutate(
-      `Site Name` = paste0("C", dplyr::row_number()),
-      utm_e = x / 1000,
-      utm_n = y / 1000,
-      `Detection Distance` = detection_radius_m,
-      `Start Index` = 1L,
-      `End Index` = as.integer(days)
-    )
-}
-
-simulate_teaching_counts <- function(model = c("REM", "TTE"),
-                                     n_side = 5,
-                                     spacing_m = 300,
-                                     days = 21,
-                                     D_per_km2 = 25,
-                                     detection_radius_m = 12,
-                                     theta_deg = 55,
-                                     v_km_day = 4,
-                                     sd_eps = 1,
-                                     camera_noise = FALSE,
-                                     seed = 1) {
-  model <- match.arg(model)
-  quiet_require("dplyr")
-
-  if (n_side < 1 || days < 1 || spacing_m <= 0 || detection_radius_m <= 0) {
-    stop("Teaching simulator inputs must be positive.", call. = FALSE)
-  }
-  if (D_per_km2 < 0 || v_km_day <= 0 || sd_eps < 0) {
-    stop("Density, movement speed, and heterogeneity inputs are out of range.", call. = FALSE)
-  }
-
+# Simulate REM or TTE camera counts on a square camera grid, from the
+# expected count per camera that the model uses (see run_REM() and
+# run_TTE()):
+#   - REM: D * days * v * r * (2 + theta) / pi, with theta in radians.
+#   - TTE: D * days * U * A, where U = v / (f(theta) * r) is the number of
+#     viewshed-crossing times per day, f() is tte_path_length_multiplier(),
+#     and A = pi * r^2 * theta / 360 is the viewshed area, with theta in
+#     degrees.
+# Each camera's expected count is multiplied by exp(use_eps * eps_j), with
+# camera-level noise eps_j ~ Normal(0, sd_eps) and use_eps = 1 when
+# camera_noise is on, 0 when off. eps is always drawn, so the same seed gives
+# the same counts (apart from the noise) with noise on or off, mirroring the
+# model.
+simulate_encounter_counts <- function(model,
+                                      n_side,
+                                      spacing_m,
+                                      days,
+                                      D_per_km2,
+                                      detection_radius_m,
+                                      theta_deg,
+                                      v_km_day,
+                                      sd_eps,
+                                      camera_noise,
+                                      seed) {
   set.seed(seed)
 
-  out <- build_teaching_sim_grid(
-    n_side = n_side,
-    spacing_m = spacing_m,
-    detection_radius_m = detection_radius_m,
-    days = days
-  )
-
+  out <- build_sim_camera_grid(n_side, spacing_m) |>
+    dplyr::mutate(`Detection Distance` = detection_radius_m)
   J <- nrow(out)
   camera_days <- rep(as.numeric(days), J)
-  r_km <- rep(detection_radius_m / 1000, J)
-  # Camera-level noise is always drawn and multiplied by use_eps (0 or 1), so
-  # the same seed gives the same data apart from the noise, mirroring the model.
+  r_km <- detection_radius_m / 1000
   eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
   use_eps <- as.numeric(isTRUE(camera_noise))
 
-  if (identical(model, "REM")) {
-    theta_rad <- theta_deg * pi / 180
-    lambda <- ((2 + theta_rad) / pi) * v_km_day * r_km * D_per_km2 * camera_days * exp(use_eps * eps)
+  per_day <- if (identical(model, "REM")) {
+    D_per_km2 * v_km_day * r_km * (2 + theta_deg * pi / 180) / pi
   } else {
-    area_km2 <- pi * r_km^2 * theta_deg / 360
-    time_unit <- tte_path_length_multiplier(theta_deg) * r_km / v_km_day
-    tte_units <- camera_days / time_unit
-    lambda <- D_per_km2 * tte_units * area_km2 * exp(use_eps * eps)
+    crossings_per_day <- v_km_day / (tte_path_length_multiplier(theta_deg) * r_km)
+    viewshed_km2 <- pi * r_km^2 * theta_deg / 360
+    D_per_km2 * crossings_per_day * viewshed_km2
   }
-
-  camera_counts <- stats::rpois(J, lambda = lambda)
+  mu <- camera_days * per_day * exp(use_eps * eps)
 
   list(
-    model = model,
     out = out,
-    camera_counts = camera_counts,
-    camera_days = camera_days,
-    truth = list(
-      model = model,
-      D_per_km2 = D_per_km2,
-      detection_radius_m = detection_radius_m,
-      theta_deg = theta_deg,
-      v_km_day = v_km_day,
-      sd_eps = sd_eps,
-      camera_noise = isTRUE(camera_noise),
-      seed = seed,
-      n_cams = J,
-      n_side = n_side,
-      spacing_m = spacing_m,
-      days = days,
-      mean_lambda = mean(lambda),
-      total_expected = sum(lambda),
-      total_observed = sum(camera_counts)
-    )
+    camera_counts = stats::rpois(J, mu),
+    camera_days = camera_days
   )
 }
 
@@ -802,6 +720,12 @@ uscr_home_range_radius_km <- function(sigma_km, p = uscr_buffer_p) {
   sigma_km * sqrt(stats::qchisq(p, df = 2))
 }
 
+# The inverse: sigma (km) for a circular home range of area home_range_km2
+# (km^2) containing proportion p of an animal's activity.
+uscr_sigma_km_from_home_range <- function(home_range_km2, p) {
+  sqrt(home_range_km2 / pi) / sqrt(stats::qchisq(p, df = 2))
+}
+
 # Suggested state-space buffer (m), given a sigma value (km) and a safety
 # multiplier on the home-range radius. Used both to size the buffer up front
 # (from the log(sigma) prior) and to check it after fitting (from the
@@ -823,7 +747,6 @@ uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = uscr_buffer_
 
 # -------------------------------------------------------------------
 # USCR: state space, buffer, area
-# Drop-in replacement for the USCR section in sim_and_models.R
 # -------------------------------------------------------------------
 
 # Union of circles of radius buffer_km around each camera (cam: J x 2 matrix
@@ -1338,7 +1261,7 @@ extract_waic_mean <- function(fits) {
 }
 
 # -------------------------------------------------------------------
-# Power-analysis helpers: compare posterior draws to known simulated truth
+# Simulate data tab: compare posterior draws to the simulated truth
 # -------------------------------------------------------------------
 
 # Pull posterior draws for a given parameter name, normalizing density to
@@ -1369,8 +1292,8 @@ ppc_summary <- function(fit, pass_range) {
   list(p = p, fail = is.finite(p) && (p < lower || p > upper), lower = lower, upper = upper)
 }
 
-# Build a truth-vs-estimate table for the power-analysis blocks.
-# truth: named list, e.g. list(D_km2 = 25, sigma = 0.217, lam_0 = 0.2)
+# Truth-vs-estimate table for a model fit to simulated data.
+# truth: named list, e.g. list(D_km2 = 25, sigma = 0.217, lam_0 = 1)
 summarize_vs_truth <- function(fit, truth) {
   if (is.null(fit) || is.null(fit$samples_all)) return(NULL)
 
