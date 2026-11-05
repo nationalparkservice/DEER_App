@@ -41,7 +41,7 @@ tte_detection_radius_multiplier <- function(theta_deg) {
 #     and use_eps = 1 when camera_noise is on, 0 when off. eps is always
 #     drawn, so the same seed gives the same activity centers and counts
 #     (apart from the noise) with noise on or off, mirroring the model.
-# All distances are in km internally; buffer_m and sigma_m are in metres.
+# All distances are in km internally; buffer_m and sigma_m are in meters.
 simulate_camera_counts <- function(n_side   = 5,
                                    spacing_m = 300,
                                    days      = 21,
@@ -112,8 +112,8 @@ simulate_camera_counts <- function(n_side   = 5,
     out = out,
     camera_counts = camera_counts,
     camera_days = camera_days,
-    activity_centers = data.frame(x = ac[, 1] * 1000, y = ac[, 2] * 1000),  # metres
-    state_space_outline = uscr_buffered_outline(cam, buffer_km, scale = 1000),  # metres
+    activity_centers = data.frame(x = ac[, 1] * 1000, y = ac[, 2] * 1000),  # meters
+    state_space_outline = uscr_buffered_outline(cam, buffer_km, scale = 1000),  # meters
     truth = list(
       D_per_km2 = D_per_km2,
       N = nrow(ac),
@@ -870,8 +870,18 @@ run_TTE <- function(y,
 # -------------------------------------------------------------------
 # USCR: buffer sizing from sigma (movement/space-use scale)
 # -------------------------------------------------------------------
-# 99% circular home-range radius (km) implied by a given sigma (km).
-uscr_home_range_radius_km <- function(sigma_km, p = 0.99) {
+# Buffer rule: the state-space buffer must be at least uscr_buffer_multiplier
+# times the radius of a circular home range containing uscr_buffer_p of an
+# animal's activity. When the post-fit check finds the buffer too small,
+# run_USCR() sets it uscr_buffer_safety_factor times above that minimum, so
+# the next round passes if sigma barely changes.
+uscr_buffer_p <- 0.99
+uscr_buffer_multiplier <- 1.05
+uscr_buffer_safety_factor <- 1.01
+
+# Circular home-range radius (km) containing proportion p of an animal's
+# activity, for a given sigma (km).
+uscr_home_range_radius_km <- function(sigma_km, p = uscr_buffer_p) {
   sigma_km * sqrt(stats::qchisq(p, df = 2))
 }
 
@@ -880,14 +890,16 @@ uscr_home_range_radius_km <- function(sigma_km, p = 0.99) {
 # (from the log(sigma) prior) and to check it after fitting (from the
 # posterior). A bigger multiplier is safer but increases the state space
 # (and run time).
-uscr_buffer_from_sigma_km <- function(sigma_km, p = 0.99, multiplier = 1.05) {
+uscr_buffer_from_sigma_km <- function(sigma_km, p = uscr_buffer_p,
+                                      multiplier = uscr_buffer_multiplier) {
   multiplier * uscr_home_range_radius_km(sigma_km, p = p) * 1000
 }
 
 # Default buffer (m) computed from the log(sigma) prior before any data are
 # fit: uses the p-quantile of the prior as a quick, conservative guess at
 # sigma, then sizes the buffer from that guess via uscr_buffer_from_sigma_km().
-uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = 0.99, multiplier = 1.05) {
+uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = uscr_buffer_p,
+                                  multiplier = uscr_buffer_multiplier) {
   sigma_q <- exp(log_sigma_mean + log_sigma_sd * stats::qnorm(p))
   uscr_buffer_from_sigma_km(sigma_q, p = p, multiplier = multiplier)
 }
@@ -914,7 +926,7 @@ uscr_buffered_area_km2 <- function(cam, buffer_km) {
 }
 
 # Outline of the buffered state space as a data frame (x, y, group) for
-# plotting; `scale` converts km to the plot's units (1000 for metres).
+# plotting; `scale` converts km to the plot's units (1000 for meters).
 uscr_buffered_outline <- function(cam, buffer_km, scale = 1) {
   xy <- sf::st_coordinates(uscr_buffered_union(cam, buffer_km))
   grp_cols <- intersect(c("L1", "L2", "L3"), colnames(xy))
@@ -925,72 +937,17 @@ uscr_buffered_outline <- function(cam, buffer_km, scale = 1) {
   )
 }
 
-uscr_state_space_and_area <- function(out,
-                                      buffer_m = NULL,
-                                      log_sigma_mean = -1.5269,
-                                      log_sigma_sd = 0.1535) {
-  if (!is.null(buffer_m) && is.finite(buffer_m) && buffer_m > 0) {
-    buffer <- as.numeric(buffer_m) / 1000
-  } else {
-    buffer <- uscr_default_buffer_m(log_sigma_mean, log_sigma_sd) / 1000
-  }
-  buffer_sq <- buffer ^ 2
-
-  xlim <- c(
-    min(out$utm_e, na.rm = TRUE) - buffer,
-    max(out$utm_e, na.rm = TRUE) + buffer
-  )
-  ylim <- c(
-    min(out$utm_n, na.rm = TRUE) - buffer,
-    max(out$utm_n, na.rm = TRUE) + buffer
-  )
-
-  if (all(c("Longitude", "Latitude") %in% names(out))) {
-    quiet_require("sf")
-
-    site_col <- if ("Site Name" %in% names(out)) "Site Name" else NULL
-    coords_df <- unique(out[, c(site_col, "Longitude", "Latitude"), drop = FALSE])
-    # Latitude/Longitude validity is enforced at upload time (see
-    # check_deployments()); simulated grids never reach this branch, since
-    # they have no Longitude/Latitude columns at all. All that's needed here
-    # is numeric coercion.
-    coords_df$Longitude <- as.numeric(coords_df$Longitude)
-    coords_df$Latitude  <- as.numeric(coords_df$Latitude)
-    # Same WGS84/UTM approach as build_nps_model_inputs(): global rather
-    # than North-America-only, with the hemisphere taken from mean latitude.
-    mean_lon <- mean(coords_df$Longitude, na.rm = TRUE)
-    mean_lat <- mean(coords_df$Latitude, na.rm = TRUE)
-    utm_zone <- floor((mean_lon + 180) / 6) + 1
-    utm_zone <- min(60L, max(1L, as.integer(utm_zone)))
-    epsg_code <- if (mean_lat >= 0) 32600 + utm_zone else 32700 + utm_zone
-
-    cam_buff <- sf::st_as_sf(coords_df, coords = c("Longitude", "Latitude"), crs = 4326) |>
-      sf::st_transform(crs = epsg_code) |>
-      sf::st_buffer(buffer * 1000) |>
-      sf::st_union()
-
-    area_km2 <- as.numeric(sf::st_area(cam_buff)) / 1e6  # m^2 -> km^2
-  } else {
-    if (any(!is.finite(out$utm_e) | !is.finite(out$utm_n))) {
-      bad <- which(!is.finite(out$utm_e) | !is.finite(out$utm_n))
-      bad_sites <- if ("Site Name" %in% names(out)) as.character(out$`Site Name`[bad]) else as.character(bad)
-      stop(
-        "Missing or invalid projected coordinates for site(s): ",
-        paste(unique(bad_sites), collapse = ", "),
-        call. = FALSE
-      )
-    }
-    # Simulated grids (planar km coordinates, no Longitude/Latitude): same
-    # union-of-circles state space as field data, computed in km directly.
-    area_km2 <- uscr_buffered_area_km2(cbind(out$utm_e, out$utm_n), buffer)
-  }
-
+# USCR state space: the union of circles of radius buffer_m around the
+# cameras, using their projected coordinates (utm_e, utm_n, in km), plus the
+# bounding box for the activity-center priors and the area of the union.
+uscr_state_space_and_area <- function(out, buffer_m) {
+  cam <- cbind(out$utm_e, out$utm_n)
+  buffer <- buffer_m / 1000
   list(
-    buffer = buffer,
-    buffer_sq = buffer_sq,
-    xlim = xlim,
-    ylim = ylim,
-    area_km2 = area_km2
+    buffer_sq = buffer^2,
+    xlim = range(cam[, 1]) + c(-1, 1) * buffer,
+    ylim = range(cam[, 2]) + c(-1, 1) * buffer,
+    area_km2 = uscr_buffered_area_km2(cam, buffer)
   )
 }
 
@@ -1379,15 +1336,10 @@ make_uscr_constants <- function(out,
                                 sd_eps_shape,
                                 sd_eps_rate,
                                 buffer_m,
-                                psi_a = 1,
-                                psi_b = 1,
-                                camera_noise = FALSE) {
-  ss <- uscr_state_space_and_area(
-    out,
-    buffer_m = buffer_m,
-    log_sigma_mean = log_sigma_mean,
-    log_sigma_sd = log_sigma_sd
-  )
+                                psi_a,
+                                psi_b,
+                                camera_noise) {
+  ss <- uscr_state_space_and_area(out, buffer_m = buffer_m)
 
   const <- list(
     M = as.integer(M),
@@ -1434,33 +1386,8 @@ normalize_nimble_output <- function(x) {
   x
 }
 
-run_uscr_chain <- function(code,
-                           constants,
-                           data,
-                           monitors,
-                           niter,
-                           nburnin,
-                           thin,
-                           compute_WAIC = FALSE) {
-  quiet_require("nimble")
-
-  out <- nimble::nimbleMCMC(
-    code = code,
-    constants = constants,
-    data = data,
-    inits = make_uscr_inits(constants),
-    monitors = monitors,
-    niter = niter,
-    nburnin = nburnin,
-    thin = thin,
-    WAIC = compute_WAIC,
-    summary = FALSE,
-    samplesAsCodaMCMC = FALSE
-  )
-
-  normalize_nimble_output(out)
-}
-
+# Runs the chains in parallel worker processes (one per chain, up to the
+# number of cores minus one).
 run_uscr_chains <- function(code,
                             constants,
                             data,
@@ -1468,60 +1395,27 @@ run_uscr_chains <- function(code,
                             niter,
                             nburnin,
                             thin,
-                            n_chains = 1,
-                            parallel_chains = TRUE,
-                            compute_WAIC = FALSE,
-                            seed = NULL) {
+                            n_chains,
+                            compute_WAIC) {
   quiet_require("parallel")
-
-  if (n_chains <= 1L || !parallel_chains) {
-    if (!is.null(seed)) {
-      set.seed(seed)
-    }
-
-    return(list(
-      run_uscr_chain(
-        code = code,
-        constants = constants,
-        data = data,
-        monitors = monitors,
-        niter = niter,
-        nburnin = nburnin,
-        thin = thin,
-        compute_WAIC = compute_WAIC
-      )
-    ))
-  }
 
   cl_size <- min(n_chains, max(1L, parallel::detectCores() - 1L))
   cl <- parallel::makeCluster(cl_size)
   on.exit(parallel::stopCluster(cl), add = TRUE)
 
-  if (!is.null(seed)) {
-    parallel::clusterSetRNGStream(cl, iseed = seed)
-  }
-
-  fits <- parallel::parLapply(
+  parallel::parLapply(
     cl = cl,
     X = seq_len(n_chains),
     fun = function(chain_id, code, constants, data, monitors,
-                   niter, nburnin, thin, compute_WAIC) {
+                   niter, nburnin, thin, compute_WAIC,
+                   make_inits, normalize) {
       library(nimble)
-
-      Mloc <- as.integer(constants$M)
-      Jloc <- as.integer(constants$J)
-      cam <- constants$cam
-      idx <- sample.int(Jloc, Mloc, replace = TRUE)
-      hrc <- cbind(
-        cam[idx, 1] + runif(Mloc, -0.01, 0.01),
-        cam[idx, 2] + runif(Mloc, -0.01, 0.01)
-      )
 
       out <- nimble::nimbleMCMC(
         code = code,
         constants = constants,
         data = data,
-        inits = list(hrc = hrc),
+        inits = make_inits(constants),
         monitors = monitors,
         niter = niter,
         nburnin = nburnin,
@@ -1530,11 +1424,7 @@ run_uscr_chains <- function(code,
         summary = FALSE,
         samplesAsCodaMCMC = FALSE
       )
-
-      if (is.matrix(out) || is.data.frame(out)) {
-        return(list(samples = as.matrix(out), WAIC = NULL))
-      }
-      out
+      normalize(out)
     },
     code = code,
     constants = constants,
@@ -1543,10 +1433,10 @@ run_uscr_chains <- function(code,
     niter = niter,
     nburnin = nburnin,
     thin = thin,
-    compute_WAIC = compute_WAIC
+    compute_WAIC = compute_WAIC,
+    make_inits = make_uscr_inits,
+    normalize = normalize_nimble_output
   )
-
-  fits
 }
 
 safe_rhat_max <- function(samples_list) {
@@ -1652,56 +1542,42 @@ summarize_vs_truth <- function(fit, truth) {
 
 # -------------------------------------------------------------------
 # Main USCR wrapper
-# Direct app implementation of the collaborator Rmd while-loop logic.
 # -------------------------------------------------------------------
+# Fits USCR, then reruns it while any check fails, up to max_adapt_rounds
+# rounds: iterations, burn-in, and thinning double if Rhat is above
+# rhat_target; M doubles if the posterior for N presses against it; and the
+# state-space buffer grows if it is too small for the largest posterior sigma.
 
+# The app supplies every setting without a default here (its constants live
+# in app.R). The checks' thresholds and the buffer rule keep their defaults.
 run_USCR <- function(out,
                      camera_counts,
                      camera_days,
-                     iter = 6000,
-                     burnin = 1000,
-                     thin = 5,
-                     n_chains = 2,
-                     M = 100,
-                     log_sigma_mean = -1.5269,
-                     log_sigma_sd = 0.1535,
-                     log_lam0_mean = 0,
-                     log_lam0_sd = 1,
-                     sd_eps_shape = 1,
-                     sd_eps_rate = 1,
-                     buffer_m = NULL,
-                     adaptive = TRUE,
-                     compute_WAIC = TRUE,
-                     diagnostic_mode = FALSE,
+                     iter,
+                     burnin,
+                     thin,
+                     n_chains,
+                     M,
+                     log_sigma_mean,
+                     log_sigma_sd,
+                     log_lam0_mean,
+                     log_lam0_sd,
+                     sd_eps_shape,
+                     sd_eps_rate,
+                     buffer_m,
+                     density_prior,
+                     camera_noise,
+                     max_adapt_rounds,
+                     compute_WAIC,
+                     status_callback,
                      rhat_target = 1.1,
-                     density_prior = NULL,
-                     camera_noise = FALSE,
                      M_check_fraction = 0.9,
                      M_check_prob = 0.01,
-                     buffer_p = 0.99,
-                     buffer_multiplier = 1.05,
-                     buffer_safety_factor = 1.01,
-                     max_adapt_rounds = 6,
-                     parallel_chains = TRUE,
-                     status_callback = NULL,
-                     seed = NULL,
-                     verbose = FALSE) {
+                     buffer_p = uscr_buffer_p,
+                     buffer_multiplier = uscr_buffer_multiplier,
+                     buffer_safety_factor = uscr_buffer_safety_factor) {
 
   quiet_require("nimble")
-
-  report_status <- function(round, iter, burnin, M = NULL, buffer_m = NULL, prev_elapsed_min = NULL, prev_iter = NULL) {
-    if (is.function(status_callback)) {
-      status_callback(
-        round = round,
-        iter = iter,
-        burnin = burnin,
-        M = M,
-        buffer_m = buffer_m,
-        prev_elapsed_min = prev_elapsed_min,
-        prev_iter = prev_iter
-      )
-    }
-  }
 
   build_uscr_result <- function(fit_objects,
                                 samples_list,
@@ -1729,8 +1605,6 @@ run_USCR <- function(out,
         thin = settings_thin,
         n_chains = n_chains,
         compute_WAIC = compute_WAIC,
-        diagnostic_mode = diagnostic_mode,
-        adaptive = adaptive,
         max_adapt_rounds = max_adapt_rounds,
         rhat_target = rhat_target,
         M_check_fraction = M_check_fraction,
@@ -1744,24 +1618,9 @@ run_USCR <- function(out,
         log_lam0_mean = log_lam0_mean,
         log_lam0_sd = log_lam0_sd,
         sd_eps_shape = sd_eps_shape,
-        sd_eps_rate = sd_eps_rate
+        sd_eps_rate = sd_eps_rate,
+        camera_noise = isTRUE(camera_noise)
       )
-    )
-  }
-
-  J <- nrow(out)
-  if (length(camera_counts) != J || length(camera_days) != J) {
-    stop(
-      "run_USCR: camera_counts and camera_days must have length nrow(out).",
-      call. = FALSE
-    )
-  }
-  if (J < 2L) {
-    stop(
-      "run_USCR: at least 2 cameras are required. USCR estimates the spatial ",
-      "scale parameter sigma from detection contrast across cameras at ",
-      "different locations, which a single camera cannot provide.",
-      call. = FALSE
     )
   }
 
@@ -1771,28 +1630,18 @@ run_USCR <- function(out,
   n_chains <- as.integer(max(1, n_chains))
   M <- as.integer(max(1, M))
 
-  # density_prior: NULL or list(uniform = TRUE) for the default uniform prior,
-  # or list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2.
-  informative_prior <- !is.null(density_prior) && identical(density_prior$uniform, FALSE)
-  if (informative_prior) {
-    prior_msg <- check_density_prior(density_prior$lo, density_prior$hi)
-    if (!is.null(prior_msg)) stop(prior_msg, call. = FALSE)
-  }
+  # density_prior: list(uniform = TRUE) for the default uniform prior, or
+  # list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2 (the
+  # app checks the interval before running).
+  informative_prior <- identical(density_prior$uniform, FALSE)
   prior_design <- NULL
 
-  # sd_eps and eps are only meaningful (and only monitored) with camera-level
-  # noise on.
-  base_monitors <- c(
+  # sd_eps is only meaningful (and only monitored) with camera-level noise on.
+  monitors <- c(
     "log_sigma", "log_lam_0", "psi", if (isTRUE(camera_noise)) "sd_eps",
     "sigma", "lam_0", "N", "D",
     "sum_obs", "sum_sim", "bp"
   )
-  latent_monitors <- c("z", "hrc", if (isTRUE(camera_noise)) "eps")
-  final_monitors <- if (isTRUE(diagnostic_mode)) {
-    c(base_monitors, latent_monitors)
-  } else {
-    base_monitors
-  }
 
   code <- build_uscr_code()
 
@@ -1800,21 +1649,16 @@ run_USCR <- function(out,
   current_iter <- iter
   current_burnin <- burnin
   current_thin <- thin
-  current_buffer_m <- if (!is.null(buffer_m) && is.finite(buffer_m) && buffer_m > 0) {
-    as.numeric(buffer_m)
-  } else {
-    uscr_default_buffer_m(log_sigma_mean, log_sigma_sd, p = buffer_p, multiplier = buffer_multiplier)
-  }
+  current_buffer_m <- as.numeric(buffer_m)
   round_log <- list()
   current_rhat <- Inf
   round_i <- 0L
   hit_max_adapt_rounds <- FALSE
   unmet_checks <- character(0)
-  if (!is.null(max_adapt_rounds)) {
-    max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
-  }
+  max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
   prev_elapsed_min <- NULL
   prev_iter <- NULL
+  prev_M <- NULL
   fit <- NULL
   samples_list <- NULL
   samples_all <- NULL
@@ -1823,18 +1667,9 @@ run_USCR <- function(out,
   repeat {
     round_i <- round_i + 1L
 
-    if (!isTRUE(adaptive) && round_i > 1L) {
-      break
-    }
-
     # Re-solve the density prior for this round's state-space area and M, so
     # the prior on density stays fixed as the buffer and M change.
-    round_area_km2 <- uscr_state_space_and_area(
-      out,
-      buffer_m = current_buffer_m,
-      log_sigma_mean = log_sigma_mean,
-      log_sigma_sd = log_sigma_sd
-    )$area_km2
+    round_area_km2 <- uscr_state_space_and_area(out, buffer_m = current_buffer_m)$area_km2
     if (informative_prior) {
       current_M <- max(current_M, uscr_prior_start_M(density_prior$hi, round_area_km2))
       prior_design <- design_uscr_density_prior(
@@ -1868,25 +1703,15 @@ run_USCR <- function(out,
       in_ss = rep(1L, const$M)
     )
 
-    if (isTRUE(verbose)) {
-      message(
-        "USCR round ", round_i,
-        ": M=", const$M,
-        ", buffer=", round(current_buffer_m), "m",
-        ", iter=", current_iter,
-        ", burnin=", current_burnin,
-        ", thin=", current_thin,
-        ", chains=", n_chains
-      )
-    }
-    report_status(
+    status_callback(
       round = round_i,
       iter = current_iter,
       burnin = current_burnin,
       M = const$M,
       buffer_m = current_buffer_m,
       prev_elapsed_min = prev_elapsed_min,
-      prev_iter = prev_iter
+      prev_iter = prev_iter,
+      prev_M = prev_M
     )
     round_started <- Sys.time()
 
@@ -1894,14 +1719,12 @@ run_USCR <- function(out,
       code = code,
       constants = const,
       data = data_list,
-      monitors = final_monitors,
+      monitors = monitors,
       niter = current_iter,
       nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
-      parallel_chains = parallel_chains,
-      compute_WAIC = compute_WAIC,
-      seed = if (is.null(seed)) NULL else seed + round_i
+      compute_WAIC = compute_WAIC
     )
 
     samples_list <- lapply(fit, `[[`, "samples")
@@ -1935,18 +1758,15 @@ run_USCR <- function(out,
 
     prev_elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
     prev_iter <- current_iter
+    prev_M <- const$M
 
     if (converged && !M_too_small && !buffer_too_small) {
       break
     }
 
-    if (!isTRUE(adaptive)) {
-      break
-    }
-
     # Stop here (before growing iter/M/buffer) so the reported settings match
     # the last fit.
-    if (!is.null(max_adapt_rounds) && round_i >= max_adapt_rounds) {
+    if (round_i >= max_adapt_rounds) {
       hit_max_adapt_rounds <- TRUE
       unmet_checks <- c(
         if (!converged) "Rhat",
@@ -1994,25 +1814,5 @@ run_USCR <- function(out,
   result$hit_max_adapt_rounds <- hit_max_adapt_rounds
   result$unmet_checks <- unmet_checks
   result$density_prior <- prior_design  # the prior used in the final round
-  result$settings$camera_noise <- isTRUE(camera_noise)
   result
 }
-
-# -------------------------------------------------------------------
-# Suggested fast call for app / simulation contexts
-# -------------------------------------------------------------------
-# uscr_fit <- run_USCR(
-#   out = out,
-#   camera_counts = camera_counts,
-#   camera_days = camera_days,
-#   M = 100,
-#   iter = 6000,
-#   burnin = 1000,
-#   thin = 5,
-#   n_chains = 1,
-#   adaptive = TRUE,
-#   compute_WAIC = FALSE,
-#   diagnostic_mode = FALSE,
-#   seed = 123,
-#   verbose = TRUE
-# )
