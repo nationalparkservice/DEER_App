@@ -1,233 +1,214 @@
 # DEER App
 
-**Density Estimation from Encounter Rates** — A Shiny application for estimating animal density using unmarked camera trap methods.
+![](www/deer_app_banner.png)
 
-![DEER App](www/deer_app_logo.png)
+**Density Estimation from Encounter Rates**: a Shiny app for estimating animal density from unmarked camera-trap data.
+
+**Try the app online:** <https://shiny-nps.uri.edu/DEER/>. For long model runs, you may prefer to run it on your own computer (see [Installation](#installation)).
 
 ## Overview
 
-The DEER App provides a user-friendly interface for running three Bayesian models (`USCR`, `REM`, and `TTE`) to estimate animal density from camera trap data. For **uploaded field data** that follow the current TrapTagger / upload-workflow column names, completed models can be compared in the **Compare & combine** tab and combined with **WAIC-based model averaging** when multiple fits are available. On the **simulated** side, one **shared spatial simulator** can feed `USCR`, `REM`, and `TTE` so the simulated fits can be compared on the same dataset.
+The DEER App fits three Bayesian models (USCR, REM, and TTE) to camera-trap data to estimate animal density in animals/km², without requiring individually identifiable animals. Upload deployment and images files, choose a species and priors, and fit each model. On the **Compare & combine** tab, models fit to your data are compared with WAIC and their density estimates combined by model averaging. The **Simulate data** tab simulates data from a study design you choose and fits each model to see how well it recovers the true density.
 
 ## Features
 
-- **Three Bayesian Models:**
-  - **USCR** (Unmarked Spatial Capture-Recapture): Estimates animal density by learning from spatial detection patterns across a camera array
-  - **REM** (Random Encounter Model): Converts encounter rates into density, correcting for movement speed and camera view geometry
-  - **TTE** (Time-to-Event): Uses animal detection events per camera, camera-days, and viewshed geometry to estimate density
-
-- **Data Options:**
-  - Simulate camera trap data with customizable parameters using one shared spatial simulator for all three models
-  - Upload deployment and images CSV files that follow the current TrapTagger / upload-workflow column names
-
-- **Model Averaging (uploaded field data):**
-  - WAIC-based model averaging across whichever uploaded-data models have completed
-  - Weighted and unweighted density estimates with 95% credible intervals
-
-- **Interactive Visualizations:**
-  - Camera grid plots
-  - Simulated animal-detection maps
-  - Interactive leaflet maps
-  - Species summary plots
-  - Daily detection time series
+- **Three Bayesian models.** The app fits three models with NIMBLE:
+  - **USCR** (Unmarked Spatial Capture-Recapture) estimates density from where and how many animals are counted across a camera array.
+  - **REM** (Random Encounter Model) converts how often animals pass a camera into density, correcting for movement speed and camera view geometry.
+  - **TTE** (Time-to-Event) converts how many animals each camera counts into density, using movement speed to measure camera time in viewshed-crossing time units and correcting for viewshed area.
+- **Data checks.** Uploaded deployment and images files are checked for required columns, formats, and consistency. Errors and warnings are clearly described.
+- **Priors.** All priors are fully customizable, including informative prior distributions on density.
+- **Adaptive runs.** Each run checks convergence and reruns with adjusted settings until every check passes or the adaptive-round limit is reached.
+- **Model comparison and averaging.** The app reports WAIC-weighted and unweighted model averages of density with 95% credible intervals, and the probability that density exceeds a threshold you set.
+- **Posterior predictive checks.** Each run reports a Bayesian p-value, and failed checks are highlighted.
+- **Simulations.** You can simulate data from a camera grid with customizable spacing, survey length, and true density, then compare each model's estimates with the true values.
+- **Summaries.** The app provides a camera map, detection summaries, and posterior summaries.
 
 ## Installation
 
 ### Prerequisites
 
-- R (version 4.0 or higher)
+- R 4.1 or higher
 - RStudio (recommended)
+- A C++ compiler, which NIMBLE needs to compile the models (Rtools on Windows; the Xcode Command Line Tools on macOS). See the [NIMBLE installation guide](https://r-nimble.org/download.html).
 
-### Required R Packages
+### Required R packages
 
-The app checks required packages on startup and can install missing ones automatically. You can also install them manually:
+When the app starts, it installs any missing packages. You can also install them yourself:
 
 ```r
 install.packages(c(
   "shiny", "bslib", "DT", "ggplot2", "dplyr", "tidyr",
   "readr", "purrr", "stringr", "data.table",
   "leaflet", "ggrepel",
-  "nimble", "MCMCvis", "lubridate"
+  "nimble", "MCMCvis", "lubridate", "sf", "tibble"
 ))
 ```
 
-**Note:** Some packages may require additional system dependencies:
-- `nimble` requires a working C++ compiler/toolchain for model compilation. See the [NIMBLE installation guide](https://r-nimble.org/download.html).
-- `leaflet` may require additional system libraries on some machines. If mapping packages fail to install, start with the [leaflet for R documentation](https://rstudio.github.io/leaflet/).
+On Linux, `sf` needs the GDAL, GEOS, and PROJ system libraries; see the [sf installation instructions](https://r-spatial.github.io/sf/#installing). On Windows and macOS, the CRAN binaries include them.
 
-### Cloning from GitHub
+### Getting the code
 
-If you use [Git](https://git-scm.com/), you can copy the project to your computer in one step:
+With [Git](https://git-scm.com/):
 
-1. Open the repository on GitHub (this project: [github.com/nationalparkservice/DEER_App](https://github.com/nationalparkservice/DEER_App)).
-2. Click the green **Code** button, choose **HTTPS**, and copy the URL (it looks like `https://github.com/nationalparkservice/DEER_App.git`).
-3. In a terminal, go to the folder where you want the project, then run:
-   ```bash
-   git clone https://github.com/nationalparkservice/DEER_App.git
-   cd DEER_App
-   ```
-   That creates a folder named after the repository (here, `DEER_App`) with all files. To update later, run `git pull` inside that folder.
+```bash
+git clone https://github.com/nationalparkservice/DEER_App.git
+cd DEER_App
+```
 
-If you do not use Git, use **Code → Download ZIP** on GitHub and unzip the archive; then open the unzipped folder in RStudio.
+To update later, run `git pull` in that folder.
 
-### Running the App
+Without Git, click **Code → Download ZIP** on the [GitHub repository](https://github.com/nationalparkservice/DEER_App) and unzip it.
 
-1. With the project folder as your working directory (see **Cloning from GitHub** above), open `app.R` in RStudio, or from R set the working directory to the project folder.
-2. Click **Run App** or run:
-   ```r
-   shiny::runApp()
-   ```
+### Running the app
+
+Open `app.R` in RStudio and click **Run App**, or, with the project folder as the working directory, run:
+
+```r
+shiny::runApp()
+```
 
 From the command line:
 
 ```bash
-Rscript -e "shiny::runApp('/path/to/DEER_App')"
+Rscript -e "shiny::runApp('/path/to/DEER_App', launch.browser = TRUE)"
 ```
 
 ## Usage
 
-### Step 1: Simulate or Upload Data
+The app's tabs are **About**, **Add your data**, **Data summary**, **Model settings**, **USCR model**, **REM model**, **TTE model**, **Compare & combine**, and **Simulate data**.
 
-**Option 1: Simulate Data**
-- Navigate to the **Simulate data** tab
-- Adjust simulation parameters (grid size, spacing, days, density, etc.)
-- Click **Simulate data** to generate one shared spatial simulated dataset
-- Run **USCR**, **REM**, and **TTE** from their own model tabs
-- Use **Compare & combine** to summarize whichever simulated model fits have finished from that shared dataset
+### Step 1: Add your data
 
-**Option 2: Upload field data**
-- Prepare two CSV files:
-  - **Deployment file**: Camera deployment information such as where and when cameras were set and recording
-  - **Images file**: Detection records such as timestamps, species, counts, and Cluster IDs
-- See the **Add your data** tab for required column specifications (including **`Timestamp`** on images)
-- During upload, you can optionally trim images at each camera to the first 56 deployed days to meet the closed-population assumption used by the models
-- Upload files using the file input controls
+On the **Add your data** tab, upload a deployment CSV, then an images CSV (see [Data format requirements](#data-format-requirements)). Each upload is checked, and its check log lists any problems. By default, each camera's analysis window is trimmed to 56 days (24-hour periods) from its start date and time; you can change the number of days or turn the trim off. Cleaned copies of both files can be downloaded.
 
-### Step 2: Review Data Summary
+### Step 2: Review the data summary
 
-- Check the **Data summary** tab to verify your data
-- Review deployment summaries, species detections, and spatial distributions
-- This tab summarizes **uploaded** data; simulated runs are summarized in the model tabs and **Compare & combine**
+The **Data summary** tab summarizes the uploaded data: camera-days and a map of the cameras, detections by species, and counts by site and by day for a selected species.
 
-### Step 3: Run Models
+### Step 3: Choose model settings
 
-Navigate to the model tabs (USCR, REM, TTE):
-- **Simulated data:** run **USCR**, **REM**, and **TTE** from their tabs after generating the shared simulated dataset
-- **Uploaded field data:** run each model from its tab with the uploaded-data buttons
-- Run-status panels show each round's settings, convergence checks, and a run history once the model has retried at least once
-- A popup message reports each model's iteration and burn-in settings while it runs (plus the current M and state-space buffer for USCR), and an approximate remaining run time once the model has retried at least once
-- Results appear below the buttons when complete
+On the **Model settings** tab:
 
-**Model settings:**
-- Open the **Model settings** tab, then choose **Advanced** to adjust:
-  - Prior parameters (independent priors per analysis; see **Meta-analysis** below)
-  - Model-specific settings such as detection angle
+- Choose the **species to analyze**.
+- Set the **default detection angle**, used for cameras without a valid `Camera Detection Angle`, and the hemispheres used to correct Latitude and Longitude signs.
+- Set the **maximum adaptive rounds** per model run (6 by default).
+- Review the **priors**. The default priors are calibrated for white-tailed deer (*Odocoileus virginianus*), and results can be sensitive to them, so think about whether they suit your species and site. Switch to **Advanced** to set an informative density prior (a 95% interval shared by all three models), turn on camera-level noise, or change the other priors and the USCR state-space buffer.
 
-**Meta-analysis:** The app uses independent informative priors for each dataset. Pooling across sites or studies with hyperpriors is not implemented; combine posterior outputs externally if you run multi-study syntheses.
+### Step 4: Run the models
 
-### Step 4: Compare & Combine Results
+Run each model from its own tab (**USCR model**, **REM model**, **TTE model**). The note above each Run button lists any settings that differ from the defaults. While a model runs, a pop-up shows each round's settings and, from the second round on, an estimate of how long the round will take. When it finishes, results appear below the button, and the run-status panel shows each round's checks and any troubleshooting advice.
 
-- **Compare & combine** tab:
-  - **Simulated:** results update as simulated `USCR`, `REM`, and `TTE` finish from the shared spatial simulator
-  - **Uploaded field data:** results update as models finish; once multiple models are available the tab shows WAIC values and weights when WAIC is available for all completed fits, plus model-averaged density (animals/km²), 95% credible intervals, and probability of exceeding threshold densities
-- Download **CSV** posterior summaries (parameter names, mean, 2.5% and 97.5% quantiles) from the same tab
+Anything that changes the data the models are fit to (a new upload, the hemisphere settings, the species, or the trim) clears existing results, so results from different data are never compared or combined.
 
-## File Structure
+### Step 5: Compare and combine results
+
+The **Compare & combine** tab summarizes whichever models have been run on the uploaded data: posterior mean, median, and 95% credible interval of density, the probability that density exceeds a threshold you set, WAIC weights, and each model's posterior predictive check (failed checks are highlighted). With two or more models, it also shows model-averaged density. Download the plots (PNG) and posterior summaries for every parameter (CSV) from the same tab.
+
+<!-- TODO: add a screenshot of the Compare & combine tab (results table and interval plot) after running all three models on the example data. -->
+
+### Simulate data
+
+The **Simulate data** tab is a study-design tool. Choose a camera grid, spacing, survey length, and true density, plus the values each model needs, and click **Simulate data**. Each model gets its own dataset, simulated from that model's own observation model. Then run USCR, REM, and TTE from their sections on the same tab, and compare their estimates and 95% credible intervals with the true values.
+
+- Priors, including their means, come from **Model settings**, as for uploaded data, so you can also see how a fit behaves when its priors are far from the simulated truth.
+- USCR's activity centers are simulated within a simulation buffer, set on this tab, that is separate from the fit's state-space buffer in **Model settings**.
+- WAIC isn't computed for simulated data, so simulations don't appear on **Compare & combine**.
+- Each click simulates one dataset per model, so try several random seeds before drawing conclusions about a design.
+
+## File structure
 
 ```
 DEER_App/
-├── app.R                    # Main Shiny application
+├── app.R                    # Main Shiny app (UI and server)
 ├── R/
-│   ├── sim_and_models.R     # Model functions (USCR, REM, TTE)
-│   └── data_checks.R        # Data validation and summary functions
+│   ├── sim_and_models.R     # Simulation and model functions (USCR, REM, TTE)
+│   └── data_checks.R        # Data checks and summary functions
 ├── www/
-│   ├── deer_app_banner.png  # Banner shown at the top of the app
-│   └── deer_app_logo.png    # Logo used in this README
+│   └── deer_app_banner.png  # Banner shown at the top of the app and this README
 ├── README.md                # This file
 └── deer_app_v2.Rproj        # RStudio project file
 ```
 
-## Data Format Requirements
+## Data format requirements
 
-### Deployment File Required Columns:
-- **Site Name**: Camera location identifier
-- **Start Date / End Date**: Deployment dates in `MM/DD/YYYY`
-- **Latitude / Longitude**: Decimal degrees, WGS84 (standard GPS coordinates)
-- **Camera Functioning**: `Yes` or `No` (common variants like `TRUE`/`FALSE`/`1`/`0` are normalized on import)
-- **Camera Malfunction Date**: Keep the column in the file; fill it when `Camera Functioning = No` for a site with images
-- **Detection Distance**: Detection radius in meters
+The app expects data formatted following [TrapTagger](https://wildeyeconservation.org/traptagger/), with the exact column names below. Files from other tagging workflows can usually be renamed to match. The **Add your data** tab has full details, including the checks that block an upload.
 
-Commonly used but not always required for model fitting:
-- **Site**: Optional higher-level site identifier
-- **Camera ID**: Camera identifier
-- **SD Card ID**: SD card identifier
-- **Start Time / End Time**: Deployment times in 24-hour format
-- **Camera Height**: Numeric camera height
-- **Camera Orientation**: Cardinal direction or 0-359 degrees
-- **Camera Detection Angle**: Optional full detection angle in degrees; if omitted, the app uses the default angle from Model settings
-- **Camera Model**: Optional descriptive metadata
-- **Notes**: Keep the column even if some rows are blank
+<!-- TODO: add example deployment and images CSVs (e.g., in an example_data/ folder), describe them here, and add the folder to the file structure. -->
 
-### Images File Required Columns:
-- **Site Name**: Must match deployment file
-- **Timestamp**: Detection date-time (the app expects this column name; see **Add your data** for format details)
-- **Species**: Species name
-- **Cluster ID**: Identifier for an independent detection event; any format is accepted, and multiple rows can share the same value (e.g. burst photos)
-- **Sighting Count**: Number of animals in the image; pipe-delimited values are allowed for multi-species rows
+### Deployment file
 
-Optional image columns:
-- **Latitude / Longitude**: Accepted when available, but not required for model fitting if deployments provide camera coordinates
-- **Image URL**: Optional recordkeeping field
+Required columns:
 
-See the **Add your data** tab in the app for detailed column specifications.
-Cross-year winter surveys (for example December to January) are supported; the app uses the actual deployment dates/times and image timestamps, so no separate `Survey Year` field is required.
+- **Site Name**: camera site identifier, unique across rows.
+- **Start Date / End Date**: deployment dates (`MM/DD/YYYY`).
+- **Start Time / End Time**: deployment times (`HH:MM` or `HH:MM:SS`, 24-hour). The columns are required, but a blank or unreadable value is allowed: the analysis window then starts at midnight at the end of Start Date, or ends at midnight at the start of End Date.
+- **Latitude / Longitude**: decimal degrees, WGS84 (standard GPS coordinates). Signs are corrected to match the hemispheres set in **Model settings**.
+- **Camera Functioning**: `Yes`/`No` (`TRUE`/`FALSE`, `T`/`F`, and `1`/`0` are also accepted).
+- **Camera Malfunction Date**: blank for cameras that didn't malfunction. If Camera Functioning is `No`, the first date whose data should be discarded (`MM/DD/YYYY`).
+- **Detection Distance**: effective detection radius (meters). REM and TTE need a positive value for every camera.
 
-## Model Details
+Optional columns:
 
-### USCR (Unmarked Spatial Capture-Recapture)
-- Estimates density by modeling activity centers and detection probability as a function of distance
+- **Site**, **Camera ID**, **SD Card ID**, **Camera Model**: for recordkeeping.
+- **Camera Detection Angle**: full detection angle in degrees, from 5 to 90. A blank or out-of-range value uses the default angle from **Model settings**, with a warning.
+- **Camera Height**: meters.
+- **Camera Orientation**: cardinal direction (`N`, `NE`, …) or 0–359 degrees.
 
-### REM (Random Encounter Model)
-- Converts encounter rates to density using movement speed and detection area
+### Images file
 
-### TTE (Time-to-Event)
-- In this app, uses animal detection events per camera plus camera-days and viewshed geometry to estimate density
+All columns are required except Image URL.
 
-## Performance Notes
+- **Site Name**: must exactly match a Site Name in the deployment file.
+- **Timestamp**: image date and time, month/day/year or year-month-day, with an optional 24-hour time. A missing or unreadable Timestamp blocks the upload.
+- **Species**: species name. Pipe-delimited values (`deer|squirrel`) are allowed for multi-species rows. A blank Species (for example, a trigger with no animal) is allowed, but the row isn't counted.
+- **Cluster ID**: identifier for an independent detection event; any format. Rows from the same event (burst photos, or one row per species) share a Cluster ID. Required on every row with a Species.
+- **Sighting Count**: number of animals in the image. Pipe-delimited values (`1|3`) are allowed, in the same order as Species. Required on every row with a Species.
+- **Image URL** (optional): image reference or link.
 
-- **USCR** is the most computationally intensive model. For faster demos, use smaller datasets or smaller simulated examples for quick checks.
+All three models need data from at least 2 cameras. Cross-year surveys (for example, December to January) are supported; the app uses the actual deployment dates and image timestamps.
 
-- **USCR** doubles iterations/burn-in when Rhat is too high, doubles M when the augmentation bound is too small, and grows the state-space buffer when the posterior sigma is larger than the buffer safely covers, so it can rerun (and take longer) if any check fails
+## Model details
 
-- **REM** and **TTE** are generally faster but still benefit from reduced iterations for quick tests
+All three models use the number of animals counted at each camera (the sum, over detection events, of each event's largest Sighting Count) and its camera-days (the length of its analysis window, minus time within detection events). Each model tab describes its equations, variables, and default priors.
 
-- The app uses a minimum of 2 chains for model runs
+- **USCR**: estimates abundance in a state space around the cameras from the spatial pattern of counts, using the spatial scale σ and the detection rate λ₀ at an activity center. Density is abundance divided by the state-space area.
+- **REM**: models each camera's count from density, daily movement rate, detection radius, and detection angle.
+- **TTE**: models each camera's count from density, the number of viewshed-crossing time units per camera-day (from movement rate and the average path length across the viewshed), and viewshed area.
 
-## Deployment and concurrent users
+With camera-level noise turned on, each model adds a camera-level random effect, so counts are Poisson-lognormal rather than Poisson.
 
-- **Single session:** `shiny::runApp()` is still the main local workflow.
-- **Concurrent users:** support is still being improved. Each model run occupies its session while fitting; full multi-user server behavior still needs deployment-side testing.
+## Performance notes
 
-
-
+- Runs are adaptive. After each round, iterations, burn-in, and thinning double if R̂ is above 1.1. M (USCR) or D<sub>max</sub> (REM, TTE) doubles if the posterior presses against it. For USCR, the state-space buffer grows if it is too small. A run stops when every check passes or the adaptive-round limit is reached.
+- USCR is the slowest model, especially at high density or with many cameras, since its run time grows roughly with the square of M. REM and TTE are usually much faster.
+- MCMC settings (2 chains; starting iterations, burn-in, and thinning) are fixed. Only the maximum adaptive rounds can be changed.
 
 ## Troubleshooting
 
-**Models not running:**
-- Check that all required packages are installed
-- Verify data format matches requirements
-- Ensure camera deployment dates are valid
-- Check that detection distances are provided
+**A model won't run:**
+- Check that both uploads passed their checks on **Add your data**.
+- Check that a species is selected in **Model settings** and that data come from at least 2 cameras.
+- For REM and TTE, check that every camera has a positive Detection Distance.
+
+**A model reaches the adaptive-round limit without passing every check:**
+- Increase **Maximum adaptive rounds** in **Model settings** and rerun. The run-status panel shows which check failed.
+
+**A posterior predictive check fails:**
+- Try turning on camera-level noise (**Model settings > Advanced > Priors: Camera-level noise**).
 
 **Memory issues:**
-- Use a smaller dataset or smaller simulated example for quick checks
-- Close other R sessions
+- Use a smaller dataset or simulation for quick checks.
+- Close other R sessions.
 
 ## Citation
 
-If you use this app in your research, please cite the underlying methods:
+If you use this app in your research, please cite:
+
+- Van Buskirk, A. et al. (in review).
 - USCR: Chandler, R.B. & Royle, J.A. (2013). DOI: [10.1214/12-AOAS610](https://doi.org/10.1214/12-AOAS610)
 - REM: Rowcliffe, J.M. et al. (2008). DOI: [10.1111/j.1365-2664.2008.01473.x](https://doi.org/10.1111/j.1365-2664.2008.01473.x)
-- TTE: Moeller, A.K. et al. (2018). *Ecosphere* 9(6):e02331. DOI: [10.1002/ecs2.2331](https://doi.org/10.1002/ecs2.2331) ([journal page](https://esajournals.onlinelibrary.wiley.com/doi/10.1002/ecs2.2331))
+- TTE: Moeller, A.K. et al. (2018). *Ecosphere* 9(6):e02331. DOI: [10.1002/ecs2.2331](https://doi.org/10.1002/ecs2.2331)
 
 ## License
 
@@ -235,34 +216,30 @@ License to be determined.
 
 ## Acknowledgments
 
-### Model Development
-The underlying models and code were created by **Dr. Amanda Van Buskirk** under the advisement of [**Dr. Christopher Rota**](https://www.davis.wvu.edu/faculty-staff/directory/christopher-rota) within the **School of Natural Resources and the Environment at West Virginia University**.
+### Model development
 
-Collaboration and feedback from **Dr. Laura C. Gigliotti** (U.S. Geological Survey, West Virginia Cooperative Fish and Wildlife Research Unit, West Virginia University) helped shape QC checks and model integration. Any **USGS logo** in the app must follow agency approval rules (see **USGS logo** above).
+The underlying models and code were created by **Dr. Amanda Van Buskirk** with guidance from [**Dr. Christopher Rota**](https://www.davis.wvu.edu/faculty-staff/directory/christopher-rota) at **West Virginia University, School of Natural Resources and the Environment**.
 
-### Shiny App Development
-This Shiny application was primarily developed by **PhD Candidate Kacie Ring** as part of the **SciComm in the Parks fellowship**. **Dr. Christopher Rota** and **Dr. Amanda Van Buskirk** also contributed edits to the app.
+Scientific collaboration and feedback on model integration and quality control also came from **Dr. Laura C. Gigliotti** (U.S. Geological Survey, West Virginia Cooperative Fish and Wildlife Research Unit, West Virginia University).
 
-The **SciComm in the Parks fellowship** is a collaborative effort between the **Ecological Society of America (ESA)** and the **National Park Service (NPS)**. Learn more: [https://esa.org/programs/scip/](https://esa.org/programs/scip/)
+<!-- TODO: add a Funding subsection acknowledging NPS funding, once NPS confirms the wording. -->
 
-**Fellowship Support:**
-- **Dr. Brian Mitchell** (NPS) - Fellowship Liaison
-- **Jasjeet Dhanota** (ESA) - Mentor
-- **Mary Joy Mulumba** (ESA) - Program Assistant
+### Shiny app development
 
-### Technical Acknowledgments
-- Built with R Shiny and NIMBLE
-- West Virginia University (WVU)
-- National Park Service (NPS)
+This Shiny app was primarily developed by **PhD Candidate Kacie Ring** as part of the [**SciComm in the Parks fellowship**](https://esa.org/programs/scip/), a collaboration between the **Ecological Society of America (ESA)** and the **National Park Service (NPS)**. **Dr. Christopher Rota** and **Dr. Amanda Van Buskirk** also contributed edits to the app.
+
+**Fellowship support:**
+- **Dr. Brian Mitchell** (NPS): Fellowship Liaison
+- **Jasjeet Dhanota** (ESA): Mentor
+- **Mary Joy Mulumba** (ESA): Program Assistant
 
 ## Contact
 
-**Kacie Ring**  
-University of California, Santa Barbara  
-Website: [kaciering.com](https://kaciering.com)  
-GitHub: [@kcring](https://github.com/kcring)
+**Maintainer:** [Dr. Christopher Rota](https://www.davis.wvu.edu/faculty-staff/directory/christopher-rota), West Virginia University
+
+For questions, bug reports, or feature requests, please [open an issue](https://github.com/nationalparkservice/DEER_App/issues) on GitHub. Pull requests are welcome too; for larger changes, please open an issue first so we can discuss them.
 
 ---
 
-**DEER App** — Density Estimation from Encounter Rates  
-USCR · REM · TTE — unmarked camera methods, model-averaged to animals/km².
+**DEER App**: Density Estimation from Encounter Rates  
+USCR · REM · TTE: three unmarked camera methods for estimating animal density, reported as animals/km².
