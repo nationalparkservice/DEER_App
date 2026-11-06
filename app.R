@@ -1,4 +1,3 @@
-# Deer Density Lab – USCR vs REM vs TTE
 # Models run via run_USCR(), run_REM(), run_TTE() in R/sim_and_models.R
 
 # -------------------------------------------------------------------
@@ -7,20 +6,15 @@
 
 needs <- c(
   "shiny", "bslib", "DT", "ggplot2", "dplyr", "tidyr",
-  "readr", "purrr", "stringr", "data.table",
+  "readr", "purrr",
   "leaflet", "ggrepel",
   "nimble", "parallel", "MCMCvis", "lubridate", "sf", "tibble"
-)
-
-# Redwood-inspired palette (hex only — no extra color package)
-redwood_colors <- c(
-  "#303018", "#604830", "#609048", "#90A860", "#786048", "#B8C4A8"
 )
 
 missing <- needs[!needs %in% rownames(installed.packages())]
 if (length(missing)) {
   message("DEER App: installing missing packages: ", paste(missing, collapse = ", "))
-  utils::install.packages(missing, dependencies = TRUE)
+  install.packages(missing, dependencies = TRUE)
 }
 failed <- character()
 for (pkg in needs) {
@@ -44,8 +38,6 @@ suppressPackageStartupMessages({
   library(tidyr)
   library(readr)
   library(purrr)
-  library(stringr)
-  library(data.table)
   library(leaflet)
   library(ggrepel)
   library(tibble)
@@ -59,6 +51,15 @@ suppressPackageStartupMessages({
 
 source("R/sim_and_models.R")   # run_USCR(), run_REM(), run_TTE()
 source("R/data_checks.R")      # QC + summary helpers
+
+# -------------------------------------------------------------------
+# Colors
+# -------------------------------------------------------------------
+
+# Redwood-inspired palette (hex only — no extra color package)
+redwood_colors <- c(
+  "#303018", "#604830", "#609048", "#90A860", "#786048", "#B8C4A8"
+)
 
 # -------------------------------------------------------------------
 # Default MCMC settings (not user-facing)
@@ -75,6 +76,16 @@ mcmc_defaults <- list(
   thin             = 5L,
   M_uscr           = 100L,
   max_adapt_rounds = 6L
+)
+
+# Checks after each round of an adaptive run. A round passes when the largest
+# R-hat is at most rhat_max, and when the posterior probability that
+# abundance (USCR) or density (REM, TTE) exceeds limit_fraction of its upper
+# limit (M or D_max) is at most limit_prob.
+adapt_checks <- list(
+  rhat_max       = 1.1,
+  limit_fraction = 0.9,
+  limit_prob     = 0.01
 )
 
 # -------------------------------------------------------------------
@@ -100,13 +111,20 @@ advanced_prior_defaults <- list(
 # Camera Detection Angle value.
 default_theta_deg <- 55
 
+# Default deployment trim (days).
+default_trim_days <- 56
+
 # Bayesian p-values (posterior predictive check) inside this range pass; a
 # model whose p-value falls outside it fails the check.
 ppc_pass_range <- c(0.05, 0.95)
 
-# Format a number with a fixed number of decimal places, for text that quotes
-# values computed from the constants.
+# Decimal places for model results.
+result_digits <- 3
+
+# Format a number with a fixed number of decimal places ("NA" if it is
+# missing or not finite).
 format_fixed <- function(x, digits = 2) {
+  if (length(x) != 1 || !is.finite(x)) return("NA")
   format(round(x, digits), nsmall = digits, trim = TRUE)
 }
 
@@ -123,7 +141,7 @@ default_uscr_buffer_m <- round_buffer_m(uscr_default_buffer_m(
 uscr_buffer_rule_text <- paste0(
   uscr_buffer_multiplier, " times the ", 100 * uscr_buffer_p,
   "% home-range radius at the ", 100 * uscr_buffer_p,
-  "th percentile of the log(\u03c3) prior, rounded up to the nearest 50 m"
+  "th percentile of the log(σ) prior, rounded up to the nearest 50 m"
 )
 
 # 95% circular home-range area (km^2) at the default prior mean of
@@ -136,7 +154,7 @@ default_hr95_km2 <- pi * uscr_home_range_radius_km(
 default_hr95_interval_km2 <- pi * uscr_home_range_radius_km(
   exp(
     advanced_prior_defaults$log_sigma_mean +
-      c(-1, 1) * stats::qnorm(0.975) * advanced_prior_defaults$log_sigma_sd
+      c(-1, 1) * qnorm(0.975) * advanced_prior_defaults$log_sigma_sd
   ),
   p = 0.95
 )^2
@@ -146,7 +164,7 @@ default_hr95_interval_km2 <- pi * uscr_home_range_radius_km(
 default_v_km_day <- exp(advanced_prior_defaults$log_v_mean)
 default_v_interval_km_day <- exp(
   advanced_prior_defaults$log_v_mean +
-    c(-1, 1) * stats::qnorm(0.975) * advanced_prior_defaults$log_v_sd
+    c(-1, 1) * qnorm(0.975) * advanced_prior_defaults$log_v_sd
 )
 
 # -------------------------------------------------------------------
@@ -159,9 +177,9 @@ summarize_method <- function(fit) {
 
   list(
     mean_km2   = mean(D_km2),
-    median_km2 = stats::median(D_km2),
-    q2.5_km2   = stats::quantile(D_km2, 0.025),
-    q97.5_km2  = stats::quantile(D_km2, 0.975),
+    median_km2 = median(D_km2),
+    q2.5_km2   = quantile(D_km2, 0.025),
+    q97.5_km2  = quantile(D_km2, 0.975),
     waic       = fit$waic
   )
 }
@@ -182,7 +200,7 @@ sample_mixture <- function(draws, weights) {
 # model's WAIC is missing), and a matrix of density draws with one column per
 # model followed by one column per model average.
 prepare_combo_density_data <- function(fits) {
-  fits <- purrr::compact(fits)
+  fits <- compact(fits)
   if (!length(fits)) return(NULL)
 
   # WAIC weights: w_k = exp(-delta_k / 2) / sum_j exp(-delta_j / 2), where
@@ -239,12 +257,12 @@ build_combo_table <- function(combo_data, density_threshold, ppc_pass_range) {
     " animals/km²)"
   )
 
-  tibble::tibble(
+  tibble(
     Method = colnames(density_est),
     `Mean density (animals/km²)` = column_stat(mean),
-    `Median density (animals/km²)` = column_stat(stats::median),
-    `Lower 2.5%` = column_stat(stats::quantile, probs = 0.025),
-    `Upper 97.5%` = column_stat(stats::quantile, probs = 0.975),
+    `Median density (animals/km²)` = column_stat(median),
+    `Lower 2.5%` = column_stat(quantile, probs = 0.025),
+    `Upper 97.5%` = column_stat(quantile, probs = 0.975),
     !!threshold_label := column_stat(function(x) mean(x > density_threshold)),
     `WAIC weight` = c(combo_data$weights, rep(NA_real_, n_averages)),
     `Bayesian p-value` = c(
@@ -280,12 +298,12 @@ combo_plot_shapes <- c(
 # model average.
 build_combo_interval_plot <- function(combo_data, title_text) {
   density_est <- combo_data$density_est
-  interval_df <- tibble::tibble(
+  interval_df <- tibble(
     # Levels reversed so the first column is plotted at the top.
     Method = factor(colnames(density_est), levels = rev(colnames(density_est))),
     mean = unname(colMeans(density_est)),
-    lower = unname(apply(density_est, 2, stats::quantile, probs = 0.025)),
-    upper = unname(apply(density_est, 2, stats::quantile, probs = 0.975))
+    lower = unname(apply(density_est, 2, quantile, probs = 0.025)),
+    upper = unname(apply(density_est, 2, quantile, probs = 0.975))
   )
 
   ggplot(
@@ -315,13 +333,13 @@ build_combo_interval_plot <- function(combo_data, title_text) {
 build_combo_density_overlay_plot <- function(combo_data, title_text) {
   model_names <- names(combo_data$fits)
   density_df <- combo_data$density_est[, model_names, drop = FALSE] |>
-    tibble::as_tibble() |>
-    tidyr::pivot_longer(
-      dplyr::everything(),
+    as_tibble() |>
+    pivot_longer(
+      everything(),
       names_to = "Method",
       values_to = "density_km2"
     ) |>
-    dplyr::mutate(Method = factor(Method, levels = model_names))
+    mutate(Method = factor(Method, levels = model_names))
 
   ggplot(density_df, aes(x = density_km2, color = Method, fill = Method)) +
     geom_density(alpha = 0.16, linewidth = 1) +
@@ -344,32 +362,30 @@ build_combo_density_overlay_plot <- function(combo_data, title_text) {
 
 # Posterior summary of a fit's parameters for the CSV download, one row per
 # parameter. D is renamed D_km2 so the units are explicit. log_sigma and
-# log_lam_0 (USCR) duplicate sigma and lam_0 on the log scale, and sum_obs and
-# sum_sim are intermediate sums for bp, so all four are dropped. bp is 0 or 1
-# in each draw, so only its mean (the Bayesian p-value) is reported.
+# log_lam_0 (USCR) duplicate sigma and lam_0 on the log scale, so they are
+# dropped. bp is 0 or 1 in each draw, so only its mean (the Bayesian p-value)
+# is reported.
 posterior_summary_df <- function(fit) {
-  draws <- tibble::as_tibble(fit$samples_all) |>
-    dplyr::rename(D_km2 = D) |>
-    dplyr::select(
-      -dplyr::any_of(c("log_sigma", "log_lam_0", "sum_obs", "sum_sim"))
-    ) |>
-    dplyr::relocate(dplyr::any_of(
+  draws <- as_tibble(fit$samples_all) |>
+    rename(D_km2 = D) |>
+    select(-any_of(c("log_sigma", "log_lam_0"))) |>
+    relocate(any_of(
       c("D_km2", "v", "sd_eps", "N", "psi", "sigma", "lam_0", "bp")
     ))
 
-  tibble::tibble(
+  tibble(
     parameter = names(draws),
     mean = vapply(draws, mean, numeric(1)),
-    median = vapply(draws, stats::median, numeric(1)),
-    q025 = vapply(draws, stats::quantile, numeric(1), probs = 0.025),
-    q975 = vapply(draws, stats::quantile, numeric(1), probs = 0.975)
+    median = vapply(draws, median, numeric(1)),
+    q025 = vapply(draws, quantile, numeric(1), probs = 0.025),
+    q975 = vapply(draws, quantile, numeric(1), probs = 0.975)
   ) |>
-    dplyr::mutate(
-      dplyr::across(
+    mutate(
+      across(
         c(median, q025, q975),
-        function(x) dplyr::if_else(parameter == "bp", NA_real_, x)
+        function(x) if_else(parameter == "bp", NA_real_, x)
       ),
-      dplyr::across(where(is.numeric), function(x) round(x, 3))
+      across(where(is.numeric), function(x) round(x, result_digits))
     )
 }
 
@@ -392,6 +408,682 @@ posterior_param_legend <- function() {
     ),
     sep = "\n"
   ))
+}
+
+# -------------------------------------------------------------------
+# Upload checks (Add your data tab)
+# -------------------------------------------------------------------
+
+# Run a QC step, collecting its messages and warnings for the check log.
+# Returns list(value, messages, warnings); value is NULL if the step stopped
+# with an error, and the error text is added to the warnings.
+run_qc_step <- function(expr) {
+  msgs <- character()
+  warns <- character()
+  value <- tryCatch(
+    withCallingHandlers(
+      expr,
+      message = function(m) {
+        msgs <<- c(msgs, conditionMessage(m))
+        invokeRestart("muffleMessage")
+      },
+      warning = function(w) {
+        warns <<- c(warns, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      warns <<- c(warns, paste0("ERROR: ", conditionMessage(e)))
+      NULL
+    }
+  )
+  list(value = value, messages = msgs, warnings = warns)
+}
+
+# Messages and warnings from several QC steps, in order, as one
+# list(messages, warnings).
+combine_issues <- function(...) {
+  steps <- list(...)
+  list(
+    messages = c(character(), unlist(lapply(steps, `[[`, "messages"))),
+    warnings = c(character(), unlist(lapply(steps, `[[`, "warnings")))
+  )
+}
+
+# Text for a check log from list(messages, warnings).
+format_check_log <- function(issues) {
+  lines <- character()
+  if (length(issues$messages)) {
+    lines <- c(lines, "Messages:", paste0("  - ", trimws(issues$messages)), "")
+  }
+  if (length(issues$warnings)) {
+    lines <- c(lines, "Warnings / issues:", paste0("  - ", trimws(issues$warnings)))
+  }
+  if (!length(lines)) lines <- "No issues reported."
+  paste(lines, collapse = "\n")
+}
+
+# Legend breaks for whole-number counts: pretty() can return halves (for
+# example 1, 1.5, 2), which don't occur in count data.
+integer_breaks <- function(limits) {
+  breaks <- pretty(limits)
+  breaks[breaks == round(breaks)]
+}
+
+# -------------------------------------------------------------------
+# Model inputs and settings
+# -------------------------------------------------------------------
+
+# Which uploaded cameras use the default detection angle (Model settings):
+# those with no Camera Detection Angle, or one outside the range the upload
+# check accepts (the check warns about these but doesn't block the upload).
+camera_angle_uses_default <- function(out) {
+  if (!"Camera Detection Angle" %in% names(out)) {
+    return(rep(TRUE, nrow(out)))
+  }
+  theta <- suppressWarnings(as.numeric(out$`Camera Detection Angle`))
+  is.na(theta) | theta < camera_angle_min_deg | theta > camera_angle_max_deg
+}
+
+# Detection angle (degrees) for each uploaded camera.
+get_camera_angle_vector <- function(out, default_deg) {
+  uses_default <- camera_angle_uses_default(out)
+  theta <- rep(as.numeric(default_deg), nrow(out))
+  # Read the column only when some cameras have a valid angle: it may not
+  # exist, and a tibble warns about a missing column.
+  if (!all(uses_default)) {
+    theta[!uses_default] <- as.numeric(out$`Camera Detection Angle`[!uses_default])
+  }
+  theta
+}
+
+# Input-summary line describing the uploaded cameras' detection angles.
+summarize_camera_angle_source <- function(out, default_deg) {
+  theta <- get_camera_angle_vector(out, default_deg)
+  n_default <- sum(camera_angle_uses_default(out))
+  range_text <- paste0(
+    format_fixed(min(theta), 1), " to ", format_fixed(max(theta), 1), " degrees"
+  )
+  source_text <- if (n_default == nrow(out)) {
+    "(all cameras using the default angle from Model settings)"
+  } else if (n_default > 0) {
+    paste0("(", n_default, " camera(s) using the default angle from Model settings)")
+  } else {
+    "(from uploaded deployment data)"
+  }
+  paste("Camera detection angle:", range_text, source_text)
+}
+
+is_valid_buffer_m <- function(x) {
+  is.numeric(x) && length(x) == 1 && is.finite(x) && x > 0
+}
+uscr_buffer_problem <- "The state-space buffer (Model settings > Advanced > Priors: USCR) must be a positive number of meters."
+
+# Density prior specs come from Model settings: list(uniform = TRUE), or
+# list(uniform = FALSE, lo = , hi = ), a 95% interval in animals/km^2.
+density_prior_problem <- function(spec) {
+  if (isTRUE(spec$uniform)) return(NULL)
+  check_density_prior(spec$lo, spec$hi)
+}
+describe_density_prior_spec <- function(spec) {
+  if (isTRUE(spec$uniform)) return("uniform (default)")
+  paste0("informative, 95% interval ", spec$lo, " to ", spec$hi, " animals/km²")
+}
+
+# Starting upper limit on density (animals/km^2) for a REM or TTE run.
+encounter_start_D_max <- function(density_prior) {
+  if (isTRUE(density_prior$uniform)) {
+    rem_tte_start_D_max
+  } else {
+    encounter_prior_start_D_max(density_prior$hi)
+  }
+}
+
+# Starting M for a USCR run: mcmc_defaults$M_uscr, raised under an
+# informative density prior so the prior fits below it (run_USCR() raises it
+# the same way in later rounds if the state space grows).
+uscr_start_M <- function(out, buffer_m, density_prior) {
+  if (isTRUE(density_prior$uniform)) return(mcmc_defaults$M_uscr)
+  area_km2 <- uscr_state_space_and_area(out, buffer_m)$area_km2
+  max(mcmc_defaults$M_uscr, uscr_prior_start_M(density_prior$hi, area_km2))
+}
+
+noise_label <- function(on) {
+  if (isTRUE(on)) "on (Poisson-lognormal counts)" else "off (Poisson counts)"
+}
+
+# Input-summary lines for a model run: the data, model_lines (the model's own
+# settings), the starting MCMC settings (limit_setting is "M=..." for USCR or
+# "D_max=..." for REM and TTE), and how the adaptive reruns work.
+run_context_lines <- function(d, model, model_lines, limit_setting, max_adapt_rounds) {
+  is_uscr <- identical(model, "USCR")
+  c(
+    paste("Cameras:", nrow(d$out)),
+    paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
+    paste("Total camera-days:", format_fixed(sum(d$camera_days, na.rm = TRUE), 1)),
+    model_lines,
+    paste0(
+      "Initial MCMC settings: iter=", mcmc_defaults$iter,
+      ", burn-in=", mcmc_defaults$burnin,
+      ", thin=", mcmc_defaults$thin,
+      ", chains=", mcmc_defaults$n_chains,
+      ", ", limit_setting
+    ),
+    paste0(
+      model, " reruns automatically, up to ", max_adapt_rounds,
+      " rounds in all, at the same chain count shown above. ",
+      "Each check that fails triggers its own change: iterations, burn-in, and ",
+      "thinning double when the maximum Rhat is above ", adapt_checks$rhat_max, "; ",
+      if (is_uscr) "M" else "D_max",
+      " doubles when the posterior probability that ",
+      if (is_uscr) "N" else "D",
+      " exceeds ", 100 * adapt_checks$limit_fraction, "% of ",
+      if (is_uscr) "M" else "D_max",
+      " is above ", 100 * adapt_checks$limit_prob, "%",
+      if (is_uscr) {
+        paste0(
+          "; and the state-space buffer grows when it is less than ",
+          uscr_buffer_multiplier, "\u00d7 the ", 100 * uscr_buffer_p,
+          "% home-range radius at the largest posterior \u03c3"
+        )
+      },
+      "."
+    )
+  )
+}
+
+# -------------------------------------------------------------------
+# Model runs and run-status panels
+# -------------------------------------------------------------------
+
+# Starting state of a model's run-status panel. data_label is "simulated
+# data" or "uploaded data".
+make_model_debug <- function(model, data_label) {
+  list(
+    model = model,
+    data_source = data_label,
+    started_at = NULL,
+    finished_at = NULL,
+    guidance = "No run has been started yet.",
+    raw_error = NULL,
+    context = character(),
+    history = character()
+  )
+}
+
+# Update the run-status panel held in the reactiveVal rv, adding log_entry
+# (if given) to its log.
+update_model_debug <- function(rv,
+                               started_at = NULL,
+                               finished_at = NULL,
+                               guidance = NULL,
+                               raw_error = NULL,
+                               context = NULL,
+                               log_entry = NULL) {
+  state <- rv()
+  if (!is.null(started_at)) state$started_at <- started_at
+  if (!is.null(finished_at)) state$finished_at <- finished_at
+  if (!is.null(guidance)) state$guidance <- guidance
+  if (!is.null(raw_error)) state$raw_error <- raw_error
+  if (!is.null(context)) state$context <- context
+  if (!is.null(log_entry)) {
+    state$history <- c(
+      state$history,
+      paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", log_entry)
+    )
+  }
+  rv(state)
+  invisible(state)
+}
+
+friendly_model_error <- function(model, data_label, error_text) {
+  tips <- c(
+    paste0(model, " on ", data_label, " did not finish."),
+    "Read the raw error below, then try the model-specific guidance."
+  )
+
+  if (grepl("cannot allocate|vector memory|std::bad_alloc", error_text, ignore.case = TRUE)) {
+    tips <- c(tips, "This looks like a memory issue: the computer running the app ran out of memory. For USCR, memory use grows with M, which doubles in each adaptive round where the posterior for abundance presses against it. An informative density prior (Model settings > Advanced > Priors: Density (all models)) can keep M from growing, and a lower 'Maximum adaptive rounds' in Model settings limits how many times it can double.")
+  }
+  if (grepl("there is no package called", error_text, ignore.case = TRUE)) {
+    tips <- c(tips, "A required R package is missing in this session. Install the package named in the raw error, restart R, and rerun.")
+  }
+  if (grepl("\\b(NA|NaN|Inf)\\b", error_text, perl = TRUE)) {
+    tips <- c(tips, "Missing or invalid numeric values reached the model. Check detection distances, camera-days, timestamps, and coordinates on the Add your data and Data summary tabs.")
+  }
+
+  if (identical(model, "USCR")) {
+    tips <- c(tips, "USCR doubles iterations, burn-in, and thinning automatically when Rhat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior σ is larger than the buffer safely covers, so longer runs can be expected when any check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable). An informative density prior (Model settings > Advanced > Priors: Density (all models)) can also keep M, and so run time, from growing.")
+  }
+  if (model %in% c("REM", "TTE")) {
+    tips <- c(tips, paste0(model, " expects per-camera animals counted, camera-days, and detection distances."))
+    tips <- c(tips, paste0(model, " doubles iterations, burn-in, and thinning automatically when Rhat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable)."))
+  }
+
+  paste(tips, collapse = "\n")
+}
+
+# Status callback for a model run. The model engine calls it once per MCMC
+# round with the round number and this round's settings. From the second
+# round on (a rerun because a check failed), it also gets the previous
+# round's elapsed time and iterations, so the pop-up can show a rough time
+# estimate. USCR also passes M (its augmentation bound), the previous round's
+# M, and buffer_m (state-space buffer); REM/TTE pass D_max (their upper limit
+# on density) instead.
+#
+# The estimate scales the previous round's time by the change in
+# iterations and, for USCR, by (M / previous M)^2: each update to one
+# augmented individual recomputes every camera's expected count, a sum over
+# all M individuals, so the work per iteration grows roughly with M^2.
+make_model_status_callback <- function(rv, model_label, notification_id) {
+  function(round, iter, burnin, M = NULL, buffer_m = NULL, D_max = NULL,
+           prev_elapsed_min = NULL, prev_iter = NULL, prev_M = NULL) {
+    message <- paste0(model_label, ": ")
+    if (!is.null(M)) message <- paste0(message, "M=", M, ", ")
+    if (!is.null(D_max)) message <- paste0(message, "D_max=", format_fixed(D_max, 1), " animals/km², ")
+    if (!is.null(buffer_m)) message <- paste0(message, "buffer=", round(buffer_m), "m, ")
+    message <- paste0(message, iter, " iterations, ", burnin, " burn-in")
+    if (round > 1L && !is.null(prev_elapsed_min) && !is.null(prev_iter) && prev_iter > 0) {
+      est_min <- prev_elapsed_min * (iter / prev_iter)
+      if (!is.null(M) && !is.null(prev_M) && prev_M > 0) {
+        est_min <- est_min * (M / prev_M)^2
+      }
+      message <- paste0(message, " — approx. ", format(round(est_min, 1), nsmall = 1), " min")
+    }
+    showNotification(
+      message,
+      type = "message",
+      duration = NULL,
+      id = notification_id
+    )
+    update_model_debug(rv, log_entry = message)
+  }
+}
+
+# Posterior predictive check text for a fit (see ppc_summary()).
+ppc_text <- function(fit) {
+  ppc <- ppc_summary(fit, ppc_pass_range)
+  if (is.null(ppc)) return(NULL)
+  base <- paste0(
+    "Posterior predictive check: Bayesian p-value = ",
+    format_fixed(ppc$p, result_digits)
+  )
+  if (!ppc$fail) {
+    return(paste0(base, " (passes; values from ", ppc$lower, " to ", ppc$upper, " pass)."))
+  }
+  paste0(
+    base, ". FAILED (outside ", ppc$lower, " to ", ppc$upper, "): the observed counts vary ",
+    if (ppc$p < ppc$lower) "more" else "less",
+    " than the model expects, so its estimates and intervals may be unreliable.",
+    if (!isTRUE(fit$settings$camera_noise)) {
+      " Turning on camera-level noise (Model settings > Advanced > Priors: Camera-level noise) can often fix a failed check."
+    } else {
+      ""
+    }
+  )
+}
+
+notify_ppc <- function(fit, label) {
+  ppc <- ppc_summary(fit, ppc_pass_range)
+  if (!is.null(ppc) && isTRUE(ppc$fail)) {
+    showNotification(
+      paste0(
+        label, " failed its posterior predictive check (Bayesian p-value ",
+        format_fixed(ppc$p, result_digits), "). See the run-status panel."
+      ),
+      type = "warning", duration = NULL
+    )
+  }
+}
+
+# Run-status guidance for a completed fit. Flags fits that stopped at the
+# adaptive-round limit without passing every check.
+adaptive_limit_guidance <- function(fit, model, default_guidance) {
+  if (!isTRUE(fit$hit_max_adapt_rounds)) return(default_guidance)
+  paste0(
+    model, " stopped after ", fit$settings$max_adapt_rounds,
+    " adaptive rounds without passing these checks: ",
+    paste(fit$unmet_checks, collapse = ", "),
+    ". The results shown are from the last round and may not be reliable. ",
+    "To keep going, increase 'Maximum adaptive rounds' in Model settings and run ",
+    model, " again.",
+    if (any(c("M", "D_max") %in% fit$unmet_checks) && isTRUE(fit$density_prior$uniform)) {
+      paste0(
+        " The posterior kept pressing against the upper limit on ",
+        if ("M" %in% fit$unmet_checks) "abundance (M)" else "density (D_max)",
+        " under the uniform density prior. An informative density prior ",
+        "(Model settings > Advanced > Priors: Density (all models)) can rule out ",
+        "implausibly high densities and stop the limit from growing."
+      )
+    }
+  )
+}
+
+notify_adaptive_limit <- function(fit, label) {
+  if (isTRUE(fit$hit_max_adapt_rounds)) {
+    showNotification(
+      paste0(label, " stopped at the adaptive-round limit without passing all checks. See the run-status panel."),
+      type = "warning", duration = NULL
+    )
+  }
+}
+
+# Run one model fit, shared by the six Run buttons (USCR, REM, and TTE on
+# simulated and uploaded data). It clears the previous result in fit_rv,
+# restarts the run-status panel in debug_rv with the input summary
+# (context), shows progress pop-ups, and reports success or failure.
+# fit_model(status_callback) runs the model and returns the fit.
+# extra_warning(fit), if given, returns a warning to add to the guidance and
+# show as a pop-up, or NULL.
+run_model <- function(model,
+                      data_label,
+                      fit_rv,
+                      debug_rv,
+                      context,
+                      fit_model,
+                      extra_warning = NULL) {
+  label <- paste0(model, " (", data_label, ")")
+  notification_id <- paste0(tolower(model), "_", gsub(" ", "_", data_label), "_status")
+
+  fit_rv(NULL)
+  debug_rv(make_model_debug(model, data_label))
+  update_model_debug(
+    debug_rv,
+    started_at = Sys.time(),
+    context = context,
+    log_entry = paste0("Input checks passed. Starting ", model, " MCMC.")
+  )
+  showNotification(
+    paste0("Running ", model, " on ", data_label, "."),
+    type = "message",
+    duration = NULL,
+    id = notification_id
+  )
+
+  fit <- tryCatch(
+    fit_model(make_model_status_callback(debug_rv, model, notification_id)),
+    error = function(e) {
+      update_model_debug(
+        debug_rv,
+        finished_at = Sys.time(),
+        guidance = friendly_model_error(model, data_label, conditionMessage(e)),
+        raw_error = conditionMessage(e),
+        log_entry = paste(label, "failed:", conditionMessage(e))
+      )
+      showNotification(
+        paste(label, "failed:", conditionMessage(e)),
+        type = "error", duration = NULL
+      )
+      NULL
+    },
+    finally = removeNotification(notification_id)
+  )
+  fit_rv(fit)
+  if (is.null(fit)) return(invisible(NULL))
+
+  warning_text <- if (!is.null(extra_warning)) extra_warning(fit)
+  guidance <- adaptive_limit_guidance(
+    fit, model,
+    paste0(
+      model, " on ", data_label,
+      " completed successfully. Review the results above and the run history below."
+    )
+  )
+  if (!is.null(warning_text)) guidance <- paste(guidance, warning_text)
+  update_model_debug(
+    debug_rv,
+    finished_at = Sys.time(),
+    guidance = guidance,
+    log_entry = paste(label, "run completed.")
+  )
+  showNotification(paste0(label, " complete!"), type = "message")
+  if (!is.null(warning_text)) {
+    showNotification(paste0(label, ": ", warning_text), type = "warning", duration = NULL)
+  }
+  notify_adaptive_limit(fit, label)
+  notify_ppc(fit, label)
+  invisible(fit)
+}
+
+# Text for a run-status panel.
+format_model_debug <- function(state, fit = NULL) {
+  lines <- c(
+    paste("Model:", state$model),
+    paste("Data source:", state$data_source)
+  )
+
+  if (!is.null(state$started_at)) {
+    lines <- c(lines, paste("Started:", format(state$started_at, "%Y-%m-%d %H:%M:%S")))
+  }
+  if (!is.null(state$finished_at)) {
+    lines <- c(lines, paste("Finished:", format(state$finished_at, "%Y-%m-%d %H:%M:%S")))
+  }
+  if (!is.null(state$started_at) && !is.null(state$finished_at)) {
+    elapsed_min <- as.numeric(difftime(state$finished_at, state$started_at, units = "mins"))
+    lines <- c(lines, paste("Elapsed:", format_fixed(elapsed_min, 1), "minutes"))
+  }
+
+  lines <- c(lines, "", "Guidance:", state$guidance)
+
+  if (length(state$context)) {
+    lines <- c(lines, "", "Input summary:", paste0("- ", state$context))
+  }
+
+  if (!is.null(fit)) {
+    setting_lines <- c(
+      paste0("- Iterations: ", fit$settings$iter),
+      paste0("- Burn-in: ", fit$settings$burnin),
+      paste0("- Thinning: ", fit$settings$thin),
+      paste0("- Chains: ", fit$settings$n_chains)
+    )
+    if (!is.null(fit$settings$M)) {
+      setting_lines <- c(paste0("- M: ", fit$settings$M), setting_lines)
+    }
+    if (!is.null(fit$settings$buffer_m)) {
+      setting_lines <- c(setting_lines, paste0("- State-space buffer: ", round(fit$settings$buffer_m), " m"))
+    }
+    if (!is.null(fit$settings$D_max)) {
+      setting_lines <- c(setting_lines, paste0("- D_max: ", format_fixed(fit$settings$D_max, 1), " animals/km²"))
+    }
+    prior_text <- if (!is.null(fit$density_prior$M)) {
+      describe_uscr_density_prior(fit$density_prior)
+    } else {
+      describe_beta_density_prior(fit$density_prior)
+    }
+    setting_lines <- c(setting_lines, paste0("- Density prior: ", prior_text))
+    if (isTRUE(fit$density_prior$off_target)) {
+      setting_lines <- c(setting_lines, paste0(
+        "  (a bound of the prior's 95% interval differs from the target by more than ",
+        round(100 * fit$density_prior$miss_tolerance), "% of the interval's width)"
+      ))
+    }
+    setting_lines <- c(setting_lines, paste0("- Camera-level noise: ", noise_label(fit$settings$camera_noise)))
+    if (is.finite(fit$final_rhat_max)) {
+      setting_lines <- c(setting_lines, paste0("- Max Rhat: ", format_fixed(fit$final_rhat_max, result_digits)))
+    }
+    lines <- c(lines, "", "Final round:", setting_lines)
+    ppc_line <- ppc_text(fit)
+    if (!is.null(ppc_line)) {
+      lines <- c(lines, "", ppc_line)
+    }
+
+    # One line per round. USCR rounds have M, buffer_m, M_too_small, and
+    # buffer_too_small; REM and TTE rounds have D_max and D_too_small.
+    round_df <- fit$round_history
+    round_lines <- vapply(seq_len(nrow(round_df)), function(i) {
+      row <- round_df[i, ]
+      paste(c(
+        paste0("round ", row$round),
+        if (!is.null(row$M)) paste0("M=", row$M),
+        if (!is.null(row$D_max)) paste0("D_max=", format_fixed(row$D_max, 1)),
+        if (!is.null(row$buffer_m)) paste0("buffer=", round(row$buffer_m), "m"),
+        paste0("iter=", row$niter),
+        paste0("thin=", row$thin),
+        paste0("chains=", row$n_chains),
+        paste0("rhat=", format_fixed(row$rhat_max, result_digits)),
+        if (!is.null(row$D_too_small)) paste0("D_max_too_small=", row$D_too_small),
+        if (!is.null(row$M_too_small)) paste0("M_too_small=", row$M_too_small),
+        if (!is.null(row$buffer_too_small)) paste0("buffer_too_small=", row$buffer_too_small)
+      ), collapse = ", ")
+    }, character(1))
+    lines <- c(lines, "", paste0(state$model, " run history:"), paste0("- ", round_lines))
+  }
+
+  if (!is.null(state$raw_error)) {
+    lines <- c(lines, "", "Raw error:", state$raw_error)
+  }
+
+  if (length(state$history)) {
+    lines <- c(lines, "", "Recent log:", paste0("- ", tail(state$history, 8)))
+  }
+
+  paste(lines, collapse = "\n")
+}
+
+# Results printout for a model fit to uploaded data (a model tab).
+print_uploaded_result <- function(model, fit, debug) {
+  if (!is.null(debug$raw_error)) {
+    cat(model, " (uploaded data): the last run failed.\n", sep = "")
+    cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
+    return(invisible(NULL))
+  }
+  if (is.null(fit)) {
+    cat(model, " (uploaded data): not run yet. Click 'Run ", model, " on uploaded data'.", sep = "")
+    return(invisible(NULL))
+  }
+  s <- summarize_method(fit)
+  out <- list(
+    dataset = "Uploaded data",
+    mean_density_animals_per_km2 = round(s$mean_km2, result_digits),
+    median_density_animals_per_km2 = round(s$median_km2, result_digits),
+    CI95_km2 = round(c(s$q2.5_km2, s$q97.5_km2), result_digits)
+  )
+  if (is.finite(s$waic)) out$WAIC <- round(s$waic, result_digits)
+  ppc <- ppc_summary(fit, ppc_pass_range)
+  if (!is.null(ppc)) {
+    out$bayesian_p_value <- round(ppc$p, result_digits)
+    out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
+  }
+  out
+}
+
+# -------------------------------------------------------------------
+# Simulate data tab
+# -------------------------------------------------------------------
+
+# Simulated counts by camera, with each camera's point sized by its count.
+sim_count_plot <- function(sim, model, D_true) {
+  df <- sim$out |> mutate(count = sim$camera_counts)
+  ggplot(df, aes(x = x, y = y)) +
+    geom_point(
+      aes(size = count),
+      shape = 21, fill = redwood_colors[3], color = redwood_colors[1], alpha = 0.75
+    ) +
+    geom_label_repel(aes(label = `Site Name`), size = 3, max.overlaps = Inf) +
+    scale_size_area(name = "Animals counted", max_size = 14) +
+    coord_equal() +
+    theme_minimal() +
+    labs(
+      title = sprintf("%s simulated counts (true density: %.1f animals/km²)", model, D_true),
+      x = "m", y = "m"
+    )
+}
+
+# Table of a simulated dataset's cameras and counts.
+sim_camera_datatable <- function(sim) {
+  sim$out |>
+    transmute(
+      Camera = `Site Name`,
+      `x (m)` = x,
+      `y (m)` = y,
+      `Animals counted` = sim$camera_counts,
+      `Camera-days` = sim$camera_days
+    ) |>
+    datatable(rownames = FALSE, options = list(pageLength = 8))
+}
+
+# Input-summary lines giving the true values a simulated dataset (s) was
+# generated with.
+sim_truth_context <- function(s, model) {
+  st <- s$settings
+  c(
+    paste("True density:", st$D_true, "animals/km²"),
+    if (identical(model, "USCR")) {
+      c(
+        paste("True σ:", format_fixed(st$sigma_km, 3), "km"),
+        paste("True λ₀:", st$lambda0, "per camera-day"),
+        paste("Simulated activity centers:", s$uscr$N),
+        paste("Simulation buffer:", round(st$buffer_m), "m")
+      )
+    } else {
+      paste("True daily movement rate v:", st$v, "km/day")
+    },
+    if (isTRUE(st$camera_noise)) paste("True camera-level noise SD (σε):", st$sd_eps)
+  )
+}
+
+# True parameter values for a model's truth-vs-estimate table (see
+# summarize_vs_truth()), from a simulation's settings. sd_eps is included
+# only with camera-level noise on.
+sim_truth_values <- function(st, model) {
+  c(
+    list(D_km2 = st$D_true),
+    if (identical(model, "USCR")) {
+      list(sigma = st$sigma_km, lam_0 = st$lambda0)
+    } else {
+      list(v = st$v)
+    },
+    if (isTRUE(st$camera_noise)) list(sd_eps = st$sd_eps)
+  )
+}
+
+# Display version of a summarize_vs_truth() table: parameter symbols with
+# units instead of internal names, and Yes/No for coverage. The internal
+# names are still used to look up the posterior draws.
+pshared_truth_datatable <- function(tbl, fit) {
+  param_labels <- c(
+    D_km2 = "D (animals/km²)",
+    sigma = "σ (km)",
+    lam_0 = "λ₀ (per camera-day)",
+    v = "v (km/day)",
+    sd_eps = "σ<sub>ε</sub>"
+  )
+  tbl <- tbl |>
+    mutate(
+      Parameter = coalesce(unname(param_labels[Parameter]), Parameter),
+      Covered = if_else(Covered, "Yes", "No"),
+      across(where(is.numeric), function(x) round(x, result_digits))
+    )
+  # Posterior predictive check under the table (red when it fails).
+  ppc <- ppc_summary(fit, ppc_pass_range)
+  caption <- if (!is.null(ppc)) {
+    tags$caption(
+      style = paste0(
+        "caption-side: bottom; text-align: left; color: ",
+        if (ppc$fail) "firebrick" else "var(--muted)", ";"
+      ),
+      ppc_text(fit)
+    )
+  }
+  # escape = FALSE so the <sub> tag in the sigma_epsilon label renders.
+  datatable(
+    tbl,
+    caption = caption,
+    options = list(dom = "t", paging = FALSE),
+    rownames = FALSE,
+    escape = FALSE
+  )
+}
+
+# Warning for a USCR fit on simulated data whose state space reaches past
+# the region the activity centers were simulated in.
+sim_buffer_warning <- function(fit_buffer_m, sim_buffer_m) {
+  if (!is_valid_buffer_m(fit_buffer_m) || fit_buffer_m <= sim_buffer_m) return(NULL)
+  paste0(
+    "The USCR state-space buffer (", round(fit_buffer_m), " m) is larger than the simulation buffer (",
+    round(sim_buffer_m), " m), so part of the fit's state space has no simulated activity centers, ",
+    "and density will likely be underestimated. Increase the simulation buffer and click Simulate data again."
+  )
 }
 
 # -------------------------------------------------------------------
@@ -697,9 +1389,9 @@ ui <- page_fillable(
           tags$div(
             class = "about-card",
 
-            tags$h3("Step 1: Upload field data"),
+            tags$h3("Step 1: Upload your data"),
             tags$p(
-              "The main analysis workflow uses uploaded field data. The app fits ",
+              "The main analysis workflow uses uploaded data. The app fits ",
               tags$strong("Unmarked Spatial Capture-Recapture (USCR)", .noWS = "after"),
               ", ",
               tags$strong("Random Encounter Model (REM)", .noWS = "after"),
@@ -797,7 +1489,7 @@ ui <- page_fillable(
               " tab to:"
             ),
             tags$ul(
-              tags$li("Compare models fit to uploaded field data using WAIC, and combine their density estimates (model averaging)."),
+              tags$li("Compare models fit to uploaded data using WAIC, and combine their density estimates (model averaging)."),
               tags$li("Check each model's posterior predictive check (Bayesian p-value)."),
               tags$li("Download posterior summaries with parameter names, means, medians, and 95% credible intervals.")
             ),
@@ -1029,8 +1721,8 @@ ui <- page_fillable(
           "- `Camera Height`: Optional camera height (meters).",
           "- `Camera Orientation`: Optional cardinal direction (`N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, or `NW`) or 0-359 degrees.",
           "- **`Camera Functioning`**: Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted.",
-          "- **`Camera Malfunction Date`**: Leave blank for cameras that did not malfunction. If the camera failed (stopped working, or was knocked out of position but kept taking pictures), set Camera Functioning to `No` and enter the **first date whose data should be discarded** (`MM/DD/YYYY`). The camera's analysis window ends at midnight at the start of this date, so images from this date onward are excluded.",
-          "- **`Detection Distance`**: Effective detection radius in meters.",
+          "- **`Camera Malfunction Date`**: Leave blank for cameras that did not malfunction (a date entered while Camera Functioning is `Yes` is ignored, with a warning). If the camera failed (stopped working, or was knocked out of position but kept taking pictures), set Camera Functioning to `No` and enter the **first date whose data should be discarded** (`MM/DD/YYYY`). The camera's analysis window ends at midnight at the start of this date, so images from this date onward are excluded.",
+          "- **`Detection Distance`**: Effective detection radius in meters; a positive number for every camera. REM and TTE depend on it.",
           sep = "\n"
         ))
       ),
@@ -1060,6 +1752,7 @@ ui <- page_fillable(
           "  - Start Date or End Date is missing or not in `MM/DD/YYYY` format, or End Date is before Start Date.",
           "  - A camera's analysis window (below) has no time in it.",
           "  - Latitude or Longitude is missing, non-numeric, or zero.",
+          "  - Detection Distance is missing, non-numeric, or not positive.",
           "  - Camera Functioning is `No` and Camera Malfunction Date is missing, not in `MM/DD/YYYY` format, on or before Start Date, or after End Date.",
           "- **The images upload is blocked** if any of the following is true.",
           "  - No deployment file has been uploaded and checked.",
@@ -1068,7 +1761,8 @@ ui <- page_fillable(
           "  - A Timestamp is missing or can't be read.",
           "  - A row with a Species has a missing or non-numeric Sighting Count, or a missing Cluster ID.",
           "  - A row's Species and Sighting Count have different numbers of pipe-delimited values.",
-          "- Other problems, such as a missing Camera Functioning or Detection Distance value, or image dates outside a camera's deployment dates, are reported as warnings. REM and TTE won't run until every camera has a positive Detection Distance.",
+          "- Other problems, such as a missing Camera Functioning value, a Camera Malfunction Date on a camera marked as functioning, or image dates outside a camera's deployment dates, are reported as warnings.",
+          "- Completely blank rows (for example, rows of commas at the end of a CSV file) are removed from either file, and the check log notes which rows.",
           "- **Analysis window:** each camera contributes the time from its Start Date and Start Time to its End Date and End Time (or to midnight at the start of its Camera Malfunction Date), shortened by the trim if it's on. A detection event counts only if its first image is inside the window; the images check log lists events left out this way (other than by the trim), since they can point to a wrong Start or End Time. Camera effort is the length of the window in days, minus the time spent within detection events (from first to last image of each event).",
           "- Uploading a new deployment file clears the images file; upload the images file again afterward.",
           "- Anything that changes the data the models are fit to (uploading a file, the hemisphere settings, the species to analyze, or the deployment trim) clears existing model results on uploaded data, so results from different data are never compared or combined. Changing priors or other model settings doesn't.",
@@ -1093,7 +1787,8 @@ ui <- page_fillable(
       ),
       conditionalPanel(
         "input.apply_trim",
-        numericInput("trim_days", "Number of days to keep", value = 56, min = 1, step = 1)
+        numericInput("trim_days", "Number of days to keep", value = default_trim_days, min = 1, step = 1),
+        uiOutput("trim_days_problem")
       ),
       h3("Deployment check log"),
       verbatimTextOutput("deployment_check_log"),
@@ -1228,7 +1923,7 @@ ui <- page_fillable(
           " iterations, ", mcmc_defaults$burnin, " burn-in, and thin = ",
           mcmc_defaults$thin
         ),
-        "- **Convergence criteria**: R̂ ≤ 1.1 for all monitored parameters",
+        paste0("- **Convergence criteria**: R̂ ≤ ", adapt_checks$rhat_max, " for all monitored parameters"),
         paste0(
           "- **Maximum adaptive rounds**: ", mcmc_defaults$max_adapt_rounds,
           " by default. Only the settings tied to a failed check change between rounds: iterations, burn-in, and thinning double if R̂ fails; D<sub>max</sub> (REM, TTE) or M (USCR) doubles if the posterior presses against it; and for USCR the state-space buffer grows if it is too small. If a model reaches this limit without passing every check, increase it below."
@@ -1492,7 +2187,7 @@ ui <- page_fillable(
         </details>
       ')),
       hr(),
-      h3("Uploaded field data"),
+      h3("Uploaded data"),
       uiOutput("run_note_uscr_nps"),
       div(
         actionButton("run_uscr_nps", "Run USCR on uploaded data", class = "btn-primary"),
@@ -1543,7 +2238,7 @@ ui <- page_fillable(
         </details>
       ')),
       hr(),
-      h3("Uploaded field data"),
+      h3("Uploaded data"),
       uiOutput("run_note_rem_nps"),
       div(
         actionButton("run_rem_nps", "Run REM on uploaded data", class = "btn-primary"),
@@ -1600,7 +2295,7 @@ ui <- page_fillable(
         </details>
       ')),
       hr(),
-      h3("Uploaded field data"),
+      h3("Uploaded data"),
       uiOutput("run_note_tte_nps"),
       div(
         actionButton("run_tte_nps", "Run TTE on uploaded data", class = "btn-primary"),
@@ -1617,7 +2312,7 @@ ui <- page_fillable(
       "Compare & combine",
       HTML(paste0('
         <h2>Compare &amp; combine</h2>
-        <p><strong>The gist:</strong> Compares the models run on <strong>uploaded field data</strong> using <strong>WAIC</strong>, and combines their density estimates into <strong>model averages</strong>.</p>
+        <p><strong>The gist:</strong> Compares the models run on <strong>uploaded data</strong> using <strong>WAIC</strong>, and combines their density estimates into <strong>model averages</strong>.</p>
         <details>
           <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
           <div style="margin: 1rem 0; padding-left: 1rem;">
@@ -1635,13 +2330,13 @@ ui <- page_fillable(
               <li>The table summarizes whichever models have been run on uploaded data, and updates as each one finishes. Model averages need at least two models. The WAIC-weighted averages also need a WAIC for every model; otherwise only the unweighted quantile average is shown.</li>
               <li>A Bayesian p-value in red means that model failed its posterior predictive check (p-value below ', ppc_pass_range[1], ' or above ', ppc_pass_range[2], '), so its estimates and intervals may be unreliable.</li>
               <li>Results are cleared whenever the data the models were fit to change, so models are only compared and combined when fit to the same data.</li>
-              <li>WAIC isn\'t computed for simulated data, so this tab covers uploaded field data only.</li>
+              <li>WAIC isn\'t computed for simulated data, so this tab covers uploaded data only.</li>
             </ul>
           </div>
         </details>
       ')),
       hr(),
-      h3("Uploaded field data"),
+      h3("Uploaded data"),
       numericInput(
         "combo_density_threshold",
         "Density threshold (animals/km²)",
@@ -1976,24 +2671,6 @@ ui <- page_fillable(
 
 server <- function(input, output, session) {
 
-  # Starting state of a model's run-status panel. Defined first because the
-  # Simulate data section below creates its run-status reactiveVals with it,
-  # and reactiveVal() evaluates its initial value immediately (unlike
-  # observeEvent() and render blocks).
-  make_model_debug <- function(model, data_source) {
-    list(
-      model = model,
-      data_source = data_source,
-      status = "idle",
-      started_at = NULL,
-      finished_at = NULL,
-      guidance = "No run has been started yet.",
-      raw_error = NULL,
-      context = character(),
-      history = character()
-    )
-  }
-
   # ================================================================
   # SIMULATE DATA: simulation and model fits (USCR + REM + TTE)
   # ================================================================
@@ -2002,14 +2679,9 @@ server <- function(input, output, session) {
   pshared_uscr_fit <- reactiveVal(NULL)
   pshared_rem_fit <- reactiveVal(NULL)
   pshared_tte_fit <- reactiveVal(NULL)
-
-  # Starting run-status panel for each model on simulated data.
-  initial_sim_debug <- function(model) {
-    make_model_debug(model, "Simulated data")
-  }
-  pshared_uscr_debug <- reactiveVal(initial_sim_debug("USCR"))
-  pshared_rem_debug <- reactiveVal(initial_sim_debug("REM"))
-  pshared_tte_debug <- reactiveVal(initial_sim_debug("TTE"))
+  pshared_uscr_debug <- reactiveVal(make_model_debug("USCR", "simulated data"))
+  pshared_rem_debug <- reactiveVal(make_model_debug("REM", "simulated data"))
+  pshared_tte_debug <- reactiveVal(make_model_debug("TTE", "simulated data"))
 
   # The simulation's sigma (km), from the 95% home-range size.
   pshared_sigma_km <- reactive({
@@ -2036,8 +2708,9 @@ server <- function(input, output, session) {
   observeEvent(input$pshared_run_sim, {
     seed <- input$pshared_seed
     buffer_m <- input$pshared_buffer_m
-    problem <- if (!(is.numeric(seed) && length(seed) == 1 && is.finite(seed) &&
-                     seed == round(seed) && seed >= 1 && seed < .Machine$integer.max - 2)) {
+    valid_seed <- is.numeric(seed) && length(seed) == 1 && is.finite(seed) &&
+      seed == round(seed) && seed >= 1 && seed < .Machine$integer.max - 2
+    problem <- if (!valid_seed) {
       "The random seed must be a positive whole number."
     } else if (!is_valid_buffer_m(buffer_m)) {
       "The simulation buffer (USCR inputs) must be a positive number of meters."
@@ -2104,9 +2777,9 @@ server <- function(input, output, session) {
     pshared_uscr_fit(NULL)
     pshared_rem_fit(NULL)
     pshared_tte_fit(NULL)
-    pshared_uscr_debug(initial_sim_debug("USCR"))
-    pshared_rem_debug(initial_sim_debug("REM"))
-    pshared_tte_debug(initial_sim_debug("TTE"))
+    pshared_uscr_debug(make_model_debug("USCR", "simulated data"))
+    pshared_rem_debug(make_model_debug("REM", "simulated data"))
+    pshared_tte_debug(make_model_debug("TTE", "simulated data"))
   })
 
   # Which noise setting the current simulated dataset (and so its fits) uses.
@@ -2138,37 +2811,6 @@ server <- function(input, output, session) {
       }
     )
   })
-
-  # Simulated counts by camera, with each camera's point sized by its count.
-  sim_count_plot <- function(sim, model, D_true) {
-    df <- sim$out |> mutate(count = sim$camera_counts)
-    ggplot(df, aes(x = x, y = y)) +
-      geom_point(
-        aes(size = count),
-        shape = 21, fill = redwood_colors[3], color = redwood_colors[1], alpha = 0.75
-      ) +
-      geom_label_repel(aes(label = `Site Name`), size = 3, max.overlaps = Inf) +
-      scale_size_area(name = "Animals counted", max_size = 14) +
-      coord_equal() +
-      theme_minimal() +
-      labs(
-        title = sprintf("%s simulated counts (true density: %.1f animals/km\u00b2)", model, D_true),
-        x = "m", y = "m"
-      )
-  }
-
-  # Table of a simulated dataset's cameras and counts.
-  sim_camera_datatable <- function(sim) {
-    sim$out |>
-      transmute(
-        Camera = `Site Name`,
-        `x (m)` = x,
-        `y (m)` = y,
-        `Animals counted` = sim$camera_counts,
-        `Camera-days` = sim$camera_days
-      ) |>
-      datatable(rownames = FALSE, options = list(pageLength = 8))
-  }
 
   output$pshared_uscr_grid_plot <- renderPlot({
     s <- pshared_sim()
@@ -2257,11 +2899,8 @@ server <- function(input, output, session) {
   sim_run_inputs <- function(model) {
     problem <- if (is.null(pshared_sim())) {
       "Click Simulate data first."
-    } else if (identical(model, "USCR") && !is_valid_buffer_m(app_uscr_buffer_m())) {
-      uscr_buffer_problem
     } else {
-      prior_problem <- density_prior_problem()
-      if (!is.null(prior_problem)) paste("Density prior:", prior_problem)
+      model_settings_problem(model)
     }
     if (!is.null(problem)) {
       showNotification(paste(model, "not run.", problem), type = "error", duration = NULL)
@@ -2270,352 +2909,58 @@ server <- function(input, output, session) {
     pshared_sim()
   }
 
-  # Input-summary lines giving the true values a simulated dataset was
-  # generated with.
-  sim_truth_context <- function(s, model) {
-    st <- s$settings
-    c(
-      paste("True density:", st$D_true, "animals/km\u00b2"),
-      if (identical(model, "USCR")) {
-        c(
-          paste("True \u03c3:", format_num(st$sigma_km, 3), "km"),
-          paste("True \u03bb\u2080:", st$lambda0, "per camera-day"),
-          paste("Simulated activity centers:", s$uscr$N),
-          paste("Simulation buffer:", round(st$buffer_m), "m")
-        )
-      } else {
-        paste("True daily movement rate v:", st$v, "km/day")
-      },
-      if (isTRUE(st$camera_noise)) paste("True camera-level noise SD (\u03c3\u03b5):", st$sd_eps)
-    )
-  }
-
-  # ---- USCR ----
-  observeEvent(input$pshared_run_uscr, {
-    s <- sim_run_inputs("USCR")
+  # Run a model on the simulated data. Camera-level noise comes from the
+  # simulation; there is no WAIC for simulated data.
+  run_on_simulated <- function(model) {
+    s <- sim_run_inputs(model)
     if (is.null(s)) return()
-    M_start <- pshared_suggested_M(s, app_uscr_buffer_m())
+    camera_noise <- s$settings$camera_noise
 
-    pshared_uscr_fit(NULL)  # Clear previous results
-    pshared_uscr_debug(initial_sim_debug("USCR"))
-    update_model_debug(
-      pshared_uscr_debug,
-      started_at = Sys.time(),
-      context = c(
-        sim_truth_context(s, "USCR"),
-        summarize_uscr_context(
-          s$uscr,
-          buffer_m = app_uscr_buffer_m(),
-          M = M_start,
-          camera_noise = s$settings$camera_noise
-        )
-      ),
-      log_entry = "Input checks passed. Starting USCR MCMC."
-    )
-    showNotification(
-      "Running USCR on simulated data.",
-      type = "message",
-      duration = NULL,
-      id = "pshared_uscr_status"
-    )
-
-    fit <- tryCatch(
-      run_USCR(
-        out = s$uscr$out,
-        camera_counts = s$uscr$camera_counts,
-        camera_days = s$uscr$camera_days,
-        iter = mcmc_defaults$iter,
-        burnin = mcmc_defaults$burnin,
-        thin = mcmc_defaults$thin,
-        n_chains = mcmc_defaults$n_chains,
-        M = M_start,
-        log_sigma_mean = prior_input("log_sigma_mean"),
-        log_sigma_sd = prior_input("log_sigma_sd"),
-        log_lam0_mean = prior_input("log_lam0_mean"),
-        log_lam0_sd = prior_input("log_lam0_sd"),
-        sd_eps_shape = prior_input("sd_eps_shape"),
-        sd_eps_rate = prior_input("sd_eps_rate"),
-        buffer_m = app_uscr_buffer_m(),
-        max_adapt_rounds = app_max_adapt_rounds(),
-        density_prior = density_prior_spec(),
-        camera_noise = s$settings$camera_noise,
-        compute_WAIC = FALSE,
-        status_callback = make_model_status_callback(pshared_uscr_debug, "USCR", "pshared_uscr_status")
-      ),
-      error = function(e) {
-        update_model_debug(
-          pshared_uscr_debug,
-          finished_at = Sys.time(),
-          guidance = friendly_model_error("USCR", "simulated data", e$message),
-          raw_error = e$message,
-          log_entry = paste("Simulated-data USCR failed:", e$message)
-        )
-        showNotification(
-          paste("USCR (simulated data) failed:", e$message),
-          type = "error", duration = NULL
-        )
-        NULL
-      },
-      finally = removeNotification("pshared_uscr_status")
-    )
-    pshared_uscr_fit(fit)
-    if (!is.null(fit)) {
-      guidance <- adaptive_limit_guidance(fit, "USCR", "Simulated-data USCR completed successfully. Review the table above and the run history below.")
-      buffer_warning <- sim_buffer_warning(fit$settings$buffer_m, s$settings$buffer_m)
-      if (!is.null(buffer_warning)) guidance <- paste(guidance, buffer_warning)
-      update_model_debug(
-        pshared_uscr_debug,
-        finished_at = Sys.time(),
-        guidance = guidance,
-        log_entry = "Simulated-data USCR run completed."
-      )
-      showNotification("USCR (simulated data) complete!", type = "message")
-      if (!is.null(buffer_warning)) {
-        showNotification(paste("USCR (simulated data):", buffer_warning), type = "warning", duration = NULL)
+    if (identical(model, "USCR")) {
+      buffer_m <- app_uscr_buffer_m()
+      M <- uscr_start_M(s$uscr$out, buffer_m, density_prior_spec())
+      context <- summarize_uscr_context(s$uscr, buffer_m, M, camera_noise)
+      fit_model <- uscr_fitter(s$uscr, M, camera_noise, compute_WAIC = FALSE)
+      extra_warning <- function(fit) {
+        sim_buffer_warning(fit$settings$buffer_m, s$settings$buffer_m)
       }
-      notify_adaptive_limit(fit, "USCR (simulated data)")
-      notify_ppc(fit, "USCR (simulated data)")
+    } else {
+      d <- s[[tolower(model)]]
+      angle_summary <- paste("Camera detection angle:", s$settings$theta, "degrees")
+      context <- summarize_encounter_context(d, model, angle_summary, camera_noise)
+      fit_model <- encounter_fitter(model, d, s$settings$theta, camera_noise, compute_WAIC = FALSE)
+      extra_warning <- NULL
     }
-  })
 
-  # Display version of a summarize_vs_truth() table: parameter symbols with
-  # units instead of internal names, and Yes/No for coverage. The internal
-  # names are still used to look up the posterior draws.
-  pshared_truth_datatable <- function(tbl, fit) {
-    param_labels <- c(
-      D_km2 = "D (animals/km\u00b2)",
-      sigma = "\u03c3 (km)",
-      lam_0 = "\u03bb\u2080 (per camera-day)",
-      v = "v (km/day)",
-      sd_eps = "\u03c3<sub>\u03b5</sub>"
-    )
-    tbl <- tbl |>
-      mutate(
-        Parameter = coalesce(unname(param_labels[Parameter]), Parameter),
-        Covered = if_else(Covered, "Yes", "No"),
-        across(where(is.numeric), function(x) round(x, 3))
-      )
-    # Posterior predictive check under the table (red when it fails).
-    ppc <- ppc_summary(fit, ppc_pass_range)
-    caption <- if (!is.null(ppc)) {
-      tags$caption(
-        style = paste0(
-          "caption-side: bottom; text-align: left; color: ",
-          if (ppc$fail) "firebrick" else "var(--muted)", ";"
-        ),
-        ppc_text(fit)
-      )
-    }
-    # escape = FALSE so the <sub> tag in the sigma_epsilon label renders.
-    datatable(
-      tbl,
-      caption = caption,
-      options = list(dom = "t", paging = FALSE),
-      rownames = FALSE,
-      escape = FALSE
+    run_model(
+      model = model,
+      data_label = "simulated data",
+      fit_rv = list(USCR = pshared_uscr_fit, REM = pshared_rem_fit, TTE = pshared_tte_fit)[[model]],
+      debug_rv = list(USCR = pshared_uscr_debug, REM = pshared_rem_debug, TTE = pshared_tte_debug)[[model]],
+      context = c(sim_truth_context(s, model), context),
+      fit_model = fit_model,
+      extra_warning = extra_warning
     )
   }
 
-  output$pshared_uscr_table <- renderDT({
-    fit <- pshared_uscr_fit()
-    # req() rather than validate(): a validation message inside an empty
-    # DT widget has no height and overlaps the heading below it.
-    req(fit)
-    st <- pshared_sim()$settings
-    tbl <- summarize_vs_truth(fit, list(
-      D_km2 = st$D_true,
-      sigma = st$sigma_km,
-      lam_0 = st$lambda0,
-      sd_eps = if (isTRUE(st$camera_noise)) st$sd_eps  # row only with noise on
-    ))
-    pshared_truth_datatable(tbl, fit)
-  })
+  observeEvent(input$pshared_run_uscr, run_on_simulated("USCR"))
+  observeEvent(input$pshared_run_rem, run_on_simulated("REM"))
+  observeEvent(input$pshared_run_tte, run_on_simulated("TTE"))
 
-  # ---- REM ----
-  observeEvent(input$pshared_run_rem, {
-    s <- sim_run_inputs("REM")
-    if (is.null(s)) return()
-
-    pshared_rem_fit(NULL)  # Clear previous results
-    pshared_rem_debug(initial_sim_debug("REM"))
-    update_model_debug(
-      pshared_rem_debug,
-      started_at = Sys.time(),
-      context = c(
-        sim_truth_context(s, "REM"),
-        summarize_encounter_context(
-          s$rem,
-          "REM",
-          angle_summary = paste("Camera detection angle:", s$settings$theta, "degrees"),
-          camera_noise = s$settings$camera_noise
-        )
-      ),
-      log_entry = "Input checks passed. Starting REM MCMC."
-    )
-    showNotification(
-      "Running REM on simulated data.",
-      type = "message",
-      duration = NULL,
-      id = "pshared_rem_status"
-    )
-
-    fit <- tryCatch(
-      run_REM(
-        y = s$rem$camera_counts,
-        r_km = s$rem$out$`Detection Distance` / 1000,
-        camera_days = s$rem$camera_days,
-        theta_deg = s$settings$theta,
-        iter = mcmc_defaults$iter,
-        burnin = mcmc_defaults$burnin,
-        thin = mcmc_defaults$thin,
-        n_chains = mcmc_defaults$n_chains,
-        D_max = rem_tte_start_D_max,
-        log_v_mean = prior_input("log_v_mean"),
-        log_v_sd = prior_input("log_v_sd"),
-        sd_eps_shape = prior_input("sd_eps_shape"),
-        sd_eps_rate = prior_input("sd_eps_rate"),
-        max_adapt_rounds = app_max_adapt_rounds(),
-        density_prior = density_prior_spec(),
-        camera_noise = s$settings$camera_noise,
-        compute_WAIC = FALSE,
-        status_callback = make_model_status_callback(pshared_rem_debug, "REM", "pshared_rem_status")
-      ),
-      error = function(e) {
-        update_model_debug(
-          pshared_rem_debug,
-          finished_at = Sys.time(),
-          guidance = friendly_model_error("REM", "simulated data", e$message),
-          raw_error = e$message,
-          log_entry = paste("Simulated-data REM failed:", e$message)
-        )
-        showNotification(
-          paste("REM (simulated data) failed:", e$message),
-          type = "error", duration = NULL
-        )
-        NULL
-      },
-      finally = removeNotification("pshared_rem_status")
-    )
-    pshared_rem_fit(fit)
-    if (!is.null(fit)) {
-      update_model_debug(
-        pshared_rem_debug,
-        finished_at = Sys.time(),
-        guidance = adaptive_limit_guidance(fit, "REM", "Simulated-data REM completed successfully. Review the table above and the run history below."),
-        log_entry = "Simulated-data REM run completed."
-      )
-      showNotification("REM (simulated data) complete!", type = "message")
-      notify_adaptive_limit(fit, "REM (simulated data)")
-      notify_ppc(fit, "REM (simulated data)")
-    }
-  })
-
-  output$pshared_rem_table <- renderDT({
-    fit <- pshared_rem_fit()
-    # req() rather than validate(): a validation message inside an empty
-    # DT widget has no height and overlaps the heading below it.
-    req(fit)
-    st <- pshared_sim()$settings
-    tbl <- summarize_vs_truth(fit, list(
-      D_km2 = st$D_true,
-      v = st$v,
-      sd_eps = if (isTRUE(st$camera_noise)) st$sd_eps  # row only with noise on
-    ))
-    pshared_truth_datatable(tbl, fit)
-  })
-
-  # ---- TTE ----
-  observeEvent(input$pshared_run_tte, {
-    s <- sim_run_inputs("TTE")
-    if (is.null(s)) return()
-
-    pshared_tte_fit(NULL)  # Clear previous results
-    pshared_tte_debug(initial_sim_debug("TTE"))
-    update_model_debug(
-      pshared_tte_debug,
-      started_at = Sys.time(),
-      context = c(
-        sim_truth_context(s, "TTE"),
-        summarize_encounter_context(
-          s$tte,
-          "TTE",
-          angle_summary = paste("Camera detection angle:", s$settings$theta, "degrees"),
-          camera_noise = s$settings$camera_noise
-        )
-      ),
-      log_entry = "Input checks passed. Starting TTE MCMC."
-    )
-    showNotification(
-      "Running TTE on simulated data.",
-      type = "message",
-      duration = NULL,
-      id = "pshared_tte_status"
-    )
-
-    fit <- tryCatch(
-      run_TTE(
-        y = s$tte$camera_counts,
-        r_km = s$tte$out$`Detection Distance` / 1000,
-        camera_days = s$tte$camera_days,
-        theta_deg = s$settings$theta,
-        iter = mcmc_defaults$iter,
-        burnin = mcmc_defaults$burnin,
-        thin = mcmc_defaults$thin,
-        n_chains = mcmc_defaults$n_chains,
-        D_max = rem_tte_start_D_max,
-        log_v_mean = prior_input("log_v_mean"),
-        log_v_sd = prior_input("log_v_sd"),
-        sd_eps_shape = prior_input("sd_eps_shape"),
-        sd_eps_rate = prior_input("sd_eps_rate"),
-        max_adapt_rounds = app_max_adapt_rounds(),
-        density_prior = density_prior_spec(),
-        camera_noise = s$settings$camera_noise,
-        compute_WAIC = FALSE,
-        status_callback = make_model_status_callback(pshared_tte_debug, "TTE", "pshared_tte_status")
-      ),
-      error = function(e) {
-        update_model_debug(
-          pshared_tte_debug,
-          finished_at = Sys.time(),
-          guidance = friendly_model_error("TTE", "simulated data", e$message),
-          raw_error = e$message,
-          log_entry = paste("Simulated-data TTE failed:", e$message)
-        )
-        showNotification(
-          paste("TTE (simulated data) failed:", e$message),
-          type = "error", duration = NULL
-        )
-        NULL
-      },
-      finally = removeNotification("pshared_tte_status")
-    )
-    pshared_tte_fit(fit)
-    if (!is.null(fit)) {
-      update_model_debug(
-        pshared_tte_debug,
-        finished_at = Sys.time(),
-        guidance = adaptive_limit_guidance(fit, "TTE", "Simulated-data TTE completed successfully. Review the table above and the run history below."),
-        log_entry = "Simulated-data TTE run completed."
-      )
-      showNotification("TTE (simulated data) complete!", type = "message")
-      notify_adaptive_limit(fit, "TTE (simulated data)")
-      notify_ppc(fit, "TTE (simulated data)")
-    }
-  })
-
-  output$pshared_tte_table <- renderDT({
-    fit <- pshared_tte_fit()
-    # req() rather than validate(): a validation message inside an empty
-    # DT widget has no height and overlaps the heading below it.
-    req(fit)
-    st <- pshared_sim()$settings
-    tbl <- summarize_vs_truth(fit, list(
-      D_km2 = st$D_true,
-      v = st$v,
-      sd_eps = if (isTRUE(st$camera_noise)) st$sd_eps  # row only with noise on
-    ))
-    pshared_truth_datatable(tbl, fit)
-  })
+  # Truth-vs-estimate table for a model fit to the simulated data.
+  render_truth_table <- function(model, fit_rv) {
+    renderDT({
+      fit <- fit_rv()
+      # req() rather than validate(): a validation message inside an empty
+      # DT widget has no height and overlaps the heading below it.
+      req(fit)
+      tbl <- summarize_vs_truth(fit, sim_truth_values(pshared_sim()$settings, model))
+      pshared_truth_datatable(tbl, fit)
+    })
+  }
+  output$pshared_uscr_table <- render_truth_table("USCR", pshared_uscr_fit)
+  output$pshared_rem_table <- render_truth_table("REM", pshared_rem_fit)
+  output$pshared_tte_table <- render_truth_table("TTE", pshared_tte_fit)
 
   output$pshared_uscr_debug <- renderText({
     format_model_debug(pshared_uscr_debug(), pshared_uscr_fit())
@@ -2633,57 +2978,36 @@ server <- function(input, output, session) {
   # UPLOADED DATA: deployment + images QC (Add your data tab)
   # ================================================================
 
-  # Run a QC step, collecting its messages and warnings for the check log.
-  # Returns list(value, messages, warnings); value is NULL if the step stopped
-  # with an error, and the error text is added to the warnings.
-  run_qc_step <- function(expr) {
-    msgs <- character()
-    warns <- character()
-    value <- tryCatch(
-      withCallingHandlers(
-        expr,
-        message = function(m) {
-          msgs <<- c(msgs, conditionMessage(m))
-          invokeRestart("muffleMessage")
-        },
-        warning = function(w) {
-          warns <<- c(warns, conditionMessage(w))
-          invokeRestart("muffleWarning")
-        }
-      ),
-      error = function(e) {
-        warns <<- c(warns, paste0("ERROR: ", conditionMessage(e)))
-        NULL
-      }
-    )
-    list(value = value, messages = msgs, warnings = warns)
-  }
-
-  # Text for a check log from list(messages, warnings).
-  format_check_log <- function(issues) {
-    lines <- character()
-    if (length(issues$messages)) {
-      lines <- c(lines, "Messages:", paste0("  - ", trimws(issues$messages)), "")
-    }
-    if (length(issues$warnings)) {
-      lines <- c(lines, "Warnings / issues:", paste0("  - ", trimws(issues$warnings)))
-    }
-    if (!length(lines)) lines <- "No issues reported."
-    paste(lines, collapse = "\n")
-  }
-
-  # Deployment-length trim (days), or NULL when trimming is off.
-  app_trim_days <- function() {
+  # Deployment trim problem message, or NULL when the trim is off or valid.
+  trim_days_problem <- function() {
     if (!isTRUE(input$apply_trim)) return(NULL)
-    trim_days <- suppressWarnings(as.integer(input$trim_days))
-    if (length(trim_days) != 1 || is.na(trim_days)) trim_days <- 56L
-    max(1L, trim_days)
+    x <- input$trim_days
+    if (is.numeric(x) && length(x) == 1 && is.finite(x) && x >= 1 && x == round(x)) {
+      return(NULL)
+    }
+    "The number of days to keep must be a whole number, 1 or more."
   }
 
-  # Cleaned (pre-QC) uploads are kept so the checks can be re-run when the
-  # hemisphere settings change.
+  # Deployment trim (days), or NULL when trimming is off. While the trim
+  # entry is invalid, outputs that depend on it show the problem instead.
+  app_trim_days <- function() {
+    problem <- trim_days_problem()
+    validate(need(is.null(problem), problem))
+    if (isTRUE(input$apply_trim)) as.integer(input$trim_days)
+  }
+
+  output$trim_days_problem <- renderUI({
+    problem <- trim_days_problem()
+    if (!is.null(problem)) tags$p(class = "small", style = "color: firebrick;", problem)
+  })
+
+  # Cleaned (pre-QC) uploads are kept, with the messages from reading and
+  # cleaning them, so the checks can be re-run when the hemisphere settings
+  # change.
   deployment_raw <- reactiveVal(NULL)
+  deployment_import_issues <- reactiveVal(NULL)
   images_raw <- reactiveVal(NULL)
+  images_import_issues <- reactiveVal(NULL)
 
   deployment_checked <- reactiveVal(NULL)
   deployment_issues <- reactiveVal(NULL)
@@ -2691,7 +3015,11 @@ server <- function(input, output, session) {
   images_issues <- reactiveVal(NULL)
 
   run_deployment_check <- function() {
-    req(deployment_raw())
+    if (is.null(deployment_raw())) {
+      deployment_checked(NULL)
+      deployment_issues(deployment_import_issues())
+      return(invisible(NULL))
+    }
     res <- run_qc_step(
       check_deployments(
         deployment_raw(),
@@ -2700,11 +3028,15 @@ server <- function(input, output, session) {
       )
     )
     deployment_checked(res$value)
-    deployment_issues(res[c("messages", "warnings")])
+    deployment_issues(combine_issues(deployment_import_issues(), res))
   }
 
   run_images_check <- function() {
-    req(images_raw())
+    if (is.null(images_raw())) {
+      images_checked(NULL)
+      images_issues(images_import_issues())
+      return(invisible(NULL))
+    }
     if (is.null(deployment_checked())) {
       images_checked(NULL)
       images_issues(list(
@@ -2715,7 +3047,7 @@ server <- function(input, output, session) {
     }
     res <- run_qc_step(check_images(images = images_raw(), deployments = deployment_checked()))
     images_checked(res$value)
-    images_issues(res[c("messages", "warnings")])
+    images_issues(combine_issues(images_import_issues(), res))
   }
 
   # Model results on uploaded data are cleared whenever the data the models
@@ -2730,9 +3062,9 @@ server <- function(input, output, session) {
     uscr_nps_fit(NULL)
     rem_nps_fit(NULL)
     tte_nps_fit(NULL)
-    uscr_nps_debug(initial_nps_debug("USCR"))
-    rem_nps_debug(initial_nps_debug("REM"))
-    tte_nps_debug(initial_nps_debug("TTE"))
+    uscr_nps_debug(make_model_debug("USCR", "uploaded data"))
+    rem_nps_debug(make_model_debug("REM", "uploaded data"))
+    tte_nps_debug(make_model_debug("TTE", "uploaded data"))
     showModal(modalDialog(
       title = "Model results cleared",
       tags$p(
@@ -2755,13 +3087,18 @@ server <- function(input, output, session) {
   # previous deployment file.
   observeEvent(input$deployment_csv, {
     req(input$deployment_csv)
-    raw <- readr::read_csv(input$deployment_csv$datapath, show_col_types = FALSE)
-    deployment_raw(clean_deployment_import(raw))
+    imported <- run_qc_step(
+      read_csv(input$deployment_csv$datapath, show_col_types = FALSE) |>
+        clean_deployment_import()
+    )
+    deployment_raw(imported$value)
+    deployment_import_issues(imported[c("messages", "warnings")])
     run_deployment_check()
     clear_uploaded_fits("uploaded a new deployment file")
 
-    if (!is.null(images_raw()) || !is.null(images_checked())) {
+    if (!is.null(images_issues())) {
       images_raw(NULL)
+      images_import_issues(NULL)
       images_checked(NULL)
       images_issues(list(
         messages = "A new deployment file was uploaded, so the images file was cleared. Upload the images file again.",
@@ -2778,24 +3115,22 @@ server <- function(input, output, session) {
         "Please upload and check a deployment CSV before the images CSV.",
         type = "error"
       )
+      session$sendCustomMessage("reset_file_input", "images_csv")
       return(invisible(NULL))
     }
-    raw <- readr::read_csv(
-      input$images_csv$datapath,
-      show_col_types = FALSE,
-      col_types = readr::cols(
-        `Sighting Count` = readr::col_character(),
-        Species = readr::col_character()
-      )
+    imported <- run_qc_step(
+      read_csv(
+        input$images_csv$datapath,
+        show_col_types = FALSE,
+        col_types = cols(
+          `Sighting Count` = col_character(),
+          Species = col_character()
+        )
+      ) |>
+        clean_images_import()
     )
-    cleaned <- run_qc_step(clean_images_import(raw))
-    if (is.null(cleaned$value)) {
-      images_raw(NULL)
-      images_checked(NULL)
-      images_issues(cleaned[c("messages", "warnings")])
-      return(invisible(NULL))
-    }
-    images_raw(cleaned$value)
+    images_raw(imported$value)
+    images_import_issues(imported[c("messages", "warnings")])
     run_images_check()
     clear_uploaded_fits("uploaded a new images file")
   })
@@ -2810,28 +3145,35 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
 
   # Species and trim changes alter the counts and camera-days the models use.
-  # The trim is debounced so typing a number of days clears results once.
   observeEvent(input$species_to_analyze, {
     clear_uploaded_fits("changed the species to analyze")
   }, ignoreInit = TRUE)
 
-  trim_setting <- debounce(reactive(list(input$apply_trim, input$trim_days)), 1000)
-  observeEvent(trim_setting(), {
-    clear_uploaded_fits("changed the deployment trim")
-  }, ignoreInit = TRUE)
+  # Results are cleared only when the trim the models would use changes: not
+  # while the entry is invalid, and not when the number of days changes while
+  # the trim is off. Debounced so typing a number of days clears results once.
+  trim_days_used <- debounce(reactive(list(app_trim_days())), 1000)
+  last_trim_days <- NULL
+  observeEvent(trim_days_used(), {
+    trim <- trim_days_used()
+    if (!is.null(last_trim_days) && !identical(trim, last_trim_days)) {
+      clear_uploaded_fits("changed the deployment trim")
+    }
+    last_trim_days <<- trim
+  })
 
   output$deployment_check_log <- renderText({
     req(deployment_issues())
     format_check_log(deployment_issues())
   })
 
-  output$deployment_preview <- DT::renderDT({
+  output$deployment_preview <- renderDT({
     req(deployment_checked())
-    DT::datatable(deployment_checked(), options = list(pageLength = 10))
+    datatable(deployment_checked(), options = list(pageLength = 10))
   })
 
   # The analysis window each camera contributes (see analysis_windows()).
-  output$deployment_windows <- DT::renderDT({
+  output$deployment_windows <- renderDT({
     req(deployment_checked())
     win <- analysis_windows(deployment_checked(), max_days = app_trim_days())
     # What set each window's start and end; a trim overrides the end.
@@ -2850,7 +3192,7 @@ server <- function(input, output, session) {
       Notes = notes,
       check.names = FALSE
     )
-    DT::datatable(tbl, options = list(pageLength = 10), rownames = FALSE)
+    datatable(tbl, options = list(pageLength = 10), rownames = FALSE)
   })
 
   output$download_deployment_checked <- downloadHandler(
@@ -2859,7 +3201,7 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       req(deployment_checked())
-      readr::write_csv(deployment_checked(), file)
+      write_csv(deployment_checked(), file)
     }
   )
 
@@ -2868,9 +3210,9 @@ server <- function(input, output, session) {
     format_check_log(images_issues())
   })
 
-  output$images_preview <- DT::renderDT({
+  output$images_preview <- renderDT({
     req(images_checked())
-    DT::datatable(images_checked(), options = list(pageLength = 10))
+    datatable(images_checked(), options = list(pageLength = 10))
   })
 
   output$download_images_checked <- downloadHandler(
@@ -2879,7 +3221,7 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       req(images_checked())
-      readr::write_csv(images_checked(), file)
+      write_csv(images_checked(), file)
     }
   )
 
@@ -2891,13 +3233,6 @@ server <- function(input, output, session) {
     req(deployment_checked())
     summarize_deployments(deployment_checked(), max_days = app_trim_days())
   })
-
-  # Legend breaks for whole-number counts: pretty() can return halves (for
-  # example 1, 1.5, 2), which don't occur in count data.
-  integer_breaks <- function(limits) {
-    breaks <- pretty(limits)
-    breaks[breaks == round(breaks)]
-  }
 
   # Detection events in the uploaded images, counted the way the models count
   # them (see detection_events()).
@@ -2954,32 +3289,32 @@ server <- function(input, output, session) {
     )
   })
 
-  output$deploy_summary_table <- DT::renderDT({
+  output$deploy_summary_table <- renderDT({
     req(deploy_summary())
     summary_df <- deploy_summary() |>
-      dplyr::mutate(dplyr::across(c(mean_days, total_camera_days), \(x) round(x, 1))) |>
-      dplyr::rename(
+      mutate(across(c(mean_days, total_camera_days), \(x) round(x, 1))) |>
+      rename(
         `Number of Cameras` = n_cameras,
         `Mean Days per Camera` = mean_days,
         `Total Camera-Days` = total_camera_days
       )
-    DT::datatable(
+    datatable(
       summary_df,
       options = list(dom = "t", paging = FALSE, autoWidth = TRUE),
       rownames = FALSE
     )
   })
 
-  output$camera_map <- leaflet::renderLeaflet({
+  output$camera_map <- renderLeaflet({
     req(deployment_checked())
-    camera_icon <- leaflet::makeAwesomeIcon(
+    camera_icon <- makeAwesomeIcon(
       icon = "camera", markerColor = "green",
       library = "fa", iconColor = "black"
     )
 
-    leaflet::leaflet(deployment_checked()) |>
-      leaflet::addTiles() |>
-      leaflet::addAwesomeMarkers(
+    leaflet(deployment_checked()) |>
+      addTiles() |>
+      addAwesomeMarkers(
         lng   = ~Longitude,
         lat   = ~Latitude,
         icon  = camera_icon,
@@ -2988,16 +3323,16 @@ server <- function(input, output, session) {
       )
   })
 
-  output$image_summary_table <- DT::renderDT({
+  output$image_summary_table <- renderDT({
     req(image_summary())
     summary_df <- image_summary() |>
-      dplyr::rename(
+      rename(
         Images = n_images,
         `Detection Events` = n_events,
         `Animals Counted` = animals,
         `Cameras with Events` = cameras
       )
-    DT::datatable(
+    datatable(
       summary_df,
       options = list(pageLength = 10, autoWidth = TRUE, dom = "tp"),
       rownames = FALSE
@@ -3017,15 +3352,15 @@ server <- function(input, output, session) {
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
   })
 
-  output$species_site_table <- DT::renderDT({
+  output$species_site_table <- renderDT({
     species_df <- species_objects()$by_camera |>
-      dplyr::select(`Site Name`, n_images, n_events, animals) |>
-      dplyr::rename(
+      select(`Site Name`, n_images, n_events, animals) |>
+      rename(
         Images = n_images,
         `Detection Events` = n_events,
         `Animals Counted` = animals
       )
-    DT::datatable(
+    datatable(
       species_df,
       options = list(pageLength = 10, autoWidth = TRUE, dom = "tp"),
       rownames = FALSE
@@ -3039,7 +3374,7 @@ server <- function(input, output, session) {
     ggplot(dc, aes(x = Longitude, y = Latitude)) +
       geom_point(aes(size = animals),
                  color = redwood_colors[3], alpha = 0.7) +
-      ggrepel::geom_text_repel(
+      geom_text_repel(
         aes(label = `Site Name`),
         size = 3,
         max.overlaps = Inf
@@ -3086,344 +3421,11 @@ server <- function(input, output, session) {
   })
 
   # ================================================================
-  # MODEL FIT OBJECTS (reactiveVal) –  NPS PER MODEL
+  # MODEL SETTINGS
   # ================================================================
 
-  uscr_nps_fit <- reactiveVal(NULL)
-  rem_nps_fit  <- reactiveVal(NULL)
-  tte_nps_fit  <- reactiveVal(NULL)
-
-  update_model_debug <- function(rv,
-                                 status = NULL,
-                                 started_at = NULL,
-                                 finished_at = NULL,
-                                 guidance = NULL,
-                                 raw_error = NULL,
-                                 context = NULL,
-                                 log_entry = NULL) {
-    state <- rv()
-    if (is.null(state)) state <- list()
-
-    if (!is.null(status)) state$status <- status
-    if (!is.null(started_at)) state$started_at <- started_at
-    if (!is.null(finished_at)) state$finished_at <- finished_at
-    if (!is.null(guidance)) state$guidance <- guidance
-    if (!is.null(raw_error)) state$raw_error <- raw_error
-    if (!is.null(context)) state$context <- context
-    if (!is.null(log_entry)) {
-      state$history <- c(
-        state$history,
-        paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", log_entry)
-      )
-    }
-
-    rv(state)
-    invisible(state)
-  }
-
-  format_num <- function(x, digits = 2) {
-    if (length(x) != 1 || is.na(x) || !is.finite(x)) return("NA")
-    format(round(x, digits), nsmall = digits, trim = TRUE)
-  }
-
-  # Which uploaded cameras use the default detection angle (Model settings):
-  # those with no Camera Detection Angle, or one outside the range the upload
-  # check accepts (the check warns about these but doesn't block the upload).
-  camera_angle_uses_default <- function(out) {
-    if (!"Camera Detection Angle" %in% names(out)) {
-      return(rep(TRUE, nrow(out)))
-    }
-    theta <- suppressWarnings(as.numeric(out$`Camera Detection Angle`))
-    is.na(theta) | theta < camera_angle_min_deg | theta > camera_angle_max_deg
-  }
-
-  # Detection angle (degrees) for each uploaded camera.
-  get_camera_angle_vector <- function(out, default_deg) {
-    uses_default <- camera_angle_uses_default(out)
-    theta <- rep(as.numeric(default_deg), nrow(out))
-    # Read the column only when some cameras have a valid angle: it may not
-    # exist, and a tibble warns about a missing column.
-    if (!all(uses_default)) {
-      theta[!uses_default] <- as.numeric(out$`Camera Detection Angle`[!uses_default])
-    }
-    theta
-  }
-
-  summarize_camera_angle_source <- function(out, default_deg) {
-    theta <- get_camera_angle_vector(out, default_deg)
-    n_default <- sum(camera_angle_uses_default(out))
-    range_text <- paste0(
-      format_num(min(theta), 1), " to ", format_num(max(theta), 1), " degrees"
-    )
-    source_text <- if (n_default == nrow(out)) {
-      "(all cameras using the default angle from Model settings)"
-    } else if (n_default > 0) {
-      paste0("(", n_default, " camera(s) using the default angle from Model settings)")
-    } else {
-      "(from uploaded deployment data)"
-    }
-    paste("Camera detection angle:", range_text, source_text)
-  }
-
-  # Input summary for USCR runs. buffer_m, M, and camera_noise are the
-  # settings the run starts with.
-  summarize_uscr_context <- function(d, buffer_m, M, camera_noise) {
-    c(
-      paste("Cameras:", nrow(d$out)),
-      paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
-      paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
-      paste(
-        "Initial MCMC settings:",
-        paste0(
-          "iter=", mcmc_defaults$iter,
-          ", burn-in=", mcmc_defaults$burnin,
-          ", thin=", mcmc_defaults$thin,
-          ", chains=", mcmc_defaults$n_chains,
-          ", M=", M
-        )
-      ),
-      paste("USCR state-space buffer:", format_num(buffer_m, 0), "m"),
-      paste("USCR density prior:", describe_density_prior_spec(density_prior_spec())),
-      paste("Camera-level noise:", noise_label(camera_noise)),
-      paste0(
-        "USCR reruns automatically, up to ", app_max_adapt_rounds(), " rounds in all, at the same chain count shown above. ",
-        "Each check that fails triggers its own change: iterations, burn-in, and thinning double when the maximum Rhat is above 1.1; ",
-        "M doubles when the posterior probability that N exceeds 90% of M is above 1%; ",
-        "and the state-space buffer grows when it is less than ", uscr_buffer_multiplier, "\u00d7 the ",
-        100 * uscr_buffer_p, "% home-range radius at the largest posterior \u03c3."
-      )
-    )
-  }
-
-  # Input summary for REM and TTE runs. angle_summary describes the cameras'
-  # detection angles, and camera_noise is the run's noise setting.
-  summarize_encounter_context <- function(d, model, angle_summary, camera_noise) {
-    density_prior <- density_prior_spec()
-    start_D_max <- if (isTRUE(density_prior$uniform)) {
-      rem_tte_start_D_max
-    } else {
-      encounter_prior_start_D_max(density_prior$hi)
-    }
-    c(
-      paste("Cameras:", nrow(d$out)),
-      paste("Animals counted:", sum(d$camera_counts, na.rm = TRUE)),
-      paste("Total camera-days:", format_num(sum(d$camera_days, na.rm = TRUE), 1)),
-      paste(
-        "Detection distance range:",
-        paste0(
-          format_num(min(d$out$`Detection Distance`), 1),
-          " to ",
-          format_num(max(d$out$`Detection Distance`), 1),
-          " m"
-        )
-      ),
-      angle_summary,
-      paste(
-        "Initial MCMC settings:",
-        paste0(
-          "iter=", mcmc_defaults$iter,
-          ", burn-in=", mcmc_defaults$burnin,
-          ", thin=", mcmc_defaults$thin,
-          ", chains=", mcmc_defaults$n_chains,
-          ", D_max=", format_num(start_D_max, 1)
-        )
-      ),
-      paste(model, "density prior:", describe_density_prior_spec(density_prior)),
-      paste("Camera-level noise:", noise_label(camera_noise)),
-      paste0(
-        model, " reruns automatically, up to ", app_max_adapt_rounds(), " rounds in all, at the same chain count shown above. ",
-        "Each check that fails triggers its own change: iterations, burn-in, and thinning double when the maximum Rhat is above 1.1, ",
-        "and D_max doubles when the posterior probability that D exceeds 90% of D_max is above 1%."
-      )
-    )
-  }
-
-  friendly_model_error <- function(model, data_source, error_text) {
-    tips <- c(
-      paste0(model, " on ", data_source, " did not finish."),
-      "Read the raw error below, then try the model-specific guidance."
-    )
-
-    if (grepl("cannot allocate|vector memory|std::bad_alloc", error_text, ignore.case = TRUE)) {
-      tips <- c(tips, "This looks like a memory issue: the computer running the app ran out of memory. For USCR, memory use grows with M, which doubles in each adaptive round where the posterior for abundance presses against it. An informative density prior (Model settings > Advanced > Priors: Density (all models)) can keep M from growing, and a lower 'Maximum adaptive rounds' in Model settings limits how many times it can double.")
-    }
-    if (grepl("Package '.*' is required|there is no package called", error_text, ignore.case = TRUE)) {
-      tips <- c(tips, "A required R package is missing in this session. Install the package named in the raw error, restart R, and rerun.")
-    }
-    if (grepl("\\b(NA|NaN|Inf)\\b", error_text, perl = TRUE)) {
-      tips <- c(tips, "Missing or invalid numeric values reached the model. Check detection distances, camera-days, timestamps, and coordinates in the upload summary tabs.")
-    }
-
-    if (identical(model, "USCR")) {
-      tips <- c(tips, "USCR doubles iterations, burn-in, and thinning automatically when Rhat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior \u03c3 is larger than the buffer safely covers, so longer runs can be expected when any check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable). An informative density prior (Model settings > Advanced > Priors: Density (all models)) can also keep M, and so run time, from growing.")
-    }
-    if (model %in% c("REM", "TTE")) {
-      tips <- c(tips, paste0(model, " expects per-camera animals counted, camera-days, and detection distances."))
-      tips <- c(tips, paste0(model, " doubles iterations, burn-in, and thinning automatically when Rhat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable)."))
-    }
-
-    paste(tips, collapse = "\n")
-  }
-
-  # Single shared status callback used by all six run paths (USCR/REM/TTE x
-  # simulated/uploaded). The model engine calls this once per MCMC round with
-  # the round number and this round's settings. From the second round on (a
-  # rerun because a check failed), it also gets the previous round's elapsed
-  # time and iterations, so the pop-up can show a rough time estimate. USCR
-  # also passes M (its augmentation bound), the previous round's M, and
-  # buffer_m (state-space buffer); REM/TTE pass D_max (their upper limit on
-  # density) instead.
-  #
-  # The estimate scales the previous round's time by the change in
-  # iterations and, for USCR, by (M / previous M)^2: each update to one
-  # augmented individual recomputes every camera's expected count, a sum over
-  # all M individuals, so the work per iteration grows roughly with M^2.
-  make_model_status_callback <- function(rv, model_label, notification_id) {
-    function(round, iter, burnin, M = NULL, buffer_m = NULL, D_max = NULL,
-             prev_elapsed_min = NULL, prev_iter = NULL, prev_M = NULL) {
-      message <- paste0(model_label, ": ")
-      if (!is.null(M)) message <- paste0(message, "M=", M, ", ")
-      if (!is.null(D_max)) message <- paste0(message, "D_max=", format_num(D_max, 1), " animals/km\u00b2, ")
-      if (!is.null(buffer_m)) message <- paste0(message, "buffer=", round(buffer_m), "m, ")
-      message <- paste0(message, iter, " iterations, ", burnin, " burn-in")
-      if (round > 1L && !is.null(prev_elapsed_min) && !is.null(prev_iter) && prev_iter > 0) {
-        est_min <- prev_elapsed_min * (iter / prev_iter)
-        if (!is.null(M) && !is.null(prev_M) && prev_M > 0) {
-          est_min <- est_min * (M / prev_M)^2
-        }
-        message <- paste0(message, " — approx. ", format(round(est_min, 1), nsmall = 1), " min")
-      }
-      showNotification(
-        message,
-        type = "message",
-        duration = NULL,
-        id = notification_id
-      )
-      update_model_debug(rv, log_entry = message)
-    }
-  }
-
-  format_model_debug <- function(state, fit = NULL) {
-    lines <- c(
-      paste("Model:", state$model),
-      paste("Data source:", state$data_source)
-    )
-
-    if (!is.null(state$started_at)) {
-      lines <- c(lines, paste("Started:", format(state$started_at, "%Y-%m-%d %H:%M:%S")))
-    }
-    if (!is.null(state$finished_at)) {
-      lines <- c(lines, paste("Finished:", format(state$finished_at, "%Y-%m-%d %H:%M:%S")))
-    }
-    if (!is.null(state$started_at) && !is.null(state$finished_at)) {
-      elapsed_min <- as.numeric(difftime(state$finished_at, state$started_at, units = "mins"))
-      lines <- c(lines, paste("Elapsed:", format_num(elapsed_min, 1), "minutes"))
-    }
-
-    lines <- c(lines, "", "Guidance:", state$guidance)
-
-    if (length(state$context)) {
-      lines <- c(lines, "", "Input summary:", paste0("- ", state$context))
-    }
-
-    if (!is.null(fit) && !is.null(fit$settings)) {
-      setting_lines <- c(
-        paste0("- Iterations: ", fit$settings$iter),
-        paste0("- Burn-in: ", fit$settings$burnin),
-        paste0("- Thinning: ", fit$settings$thin),
-        paste0("- Chains: ", fit$settings$n_chains)
-      )
-      if (!is.null(fit$settings$M)) {
-        setting_lines <- c(paste0("- M: ", fit$settings$M), setting_lines)
-      }
-      if (!is.null(fit$settings$buffer_m)) {
-        setting_lines <- c(setting_lines, paste0("- State-space buffer: ", round(fit$settings$buffer_m), " m"))
-      }
-      if (!is.null(fit$settings$D_max)) {
-        setting_lines <- c(setting_lines, paste0("- D_max: ", format_num(fit$settings$D_max, 1), " animals/km\u00b2"))
-      }
-      if (!is.null(fit$density_prior)) {
-        prior_text <- if (!is.null(fit$density_prior$M)) {
-          describe_uscr_density_prior(fit$density_prior)
-        } else {
-          describe_beta_density_prior(fit$density_prior)
-        }
-        setting_lines <- c(setting_lines, paste0("- Density prior: ", prior_text))
-        if (isTRUE(fit$density_prior$off_target)) {
-          setting_lines <- c(setting_lines, "  (a bound of the prior's 95% interval differs from the target by more than 10% of the interval's width)")
-        }
-      }
-      if (!is.null(fit$settings$camera_noise)) {
-        setting_lines <- c(setting_lines, paste0("- Camera-level noise: ", noise_label(fit$settings$camera_noise)))
-      }
-      if (!is.null(fit$final_rhat_max) && is.finite(fit$final_rhat_max)) {
-        setting_lines <- c(setting_lines, paste0("- Max Rhat: ", format_num(fit$final_rhat_max, 3)))
-      }
-      lines <- c(lines, "", "Final round:", setting_lines)
-      ppc_line <- ppc_text(fit)
-      if (!is.null(ppc_line)) {
-        lines <- c(lines, "", ppc_line)
-      }
-    }
-
-    if (!is.null(fit) && !is.null(fit$round_history) && nrow(fit$round_history) > 0) {
-      round_df <- fit$round_history
-      round_lines <- apply(
-        round_df,
-        1,
-        function(row) {
-          parts <- c(
-            paste0("round ", row[["round"]]),
-            paste0("iter=", row[["niter"]]),
-            paste0("thin=", row[["thin"]]),
-            paste0("chains=", row[["n_chains"]]),
-            paste0("rhat=", format_num(as.numeric(row[["rhat_max"]]), 3))
-          )
-          if ("M" %in% names(round_df)) {
-            parts <- append(parts, paste0("M=", row[["M"]]), after = 1)
-          }
-          if ("buffer_m" %in% names(round_df)) {
-            parts <- append(parts, paste0("buffer=", round(as.numeric(row[["buffer_m"]])), "m"), after = 2)
-          }
-          if ("D_max" %in% names(round_df)) {
-            parts <- append(parts, paste0("D_max=", format_num(as.numeric(row[["D_max"]]), 1)), after = 1)
-          }
-          if ("D_too_small" %in% names(round_df)) {
-            parts <- c(parts, paste0("D_max_too_small=", row[["D_too_small"]] %in% c("TRUE", "1")))
-          }
-          if ("M_too_small" %in% names(round_df)) {
-            parts <- c(parts, paste0("M_too_small=", row[["M_too_small"]] %in% c("TRUE", "1")))
-          }
-          if ("buffer_too_small" %in% names(round_df)) {
-            parts <- c(parts, paste0("buffer_too_small=", row[["buffer_too_small"]] %in% c("TRUE", "1")))
-          }
-          paste(parts, collapse = ", ")
-        }
-      )
-      lines <- c(lines, "", paste0(state$model, " run history:"), paste0("- ", round_lines))
-    }
-
-    if (!is.null(state$raw_error)) {
-      lines <- c(lines, "", "Raw error:", state$raw_error)
-    }
-
-    if (length(state$history)) {
-      lines <- c(lines, "", "Recent log:", paste0("- ", tail(state$history, 8)))
-    }
-
-    paste(lines, collapse = "\n")
-  }
-
-  # Starting run-status panel for each model on uploaded data.
-  initial_nps_debug <- function(model) {
-    make_model_debug(model, "Uploaded field data")
-  }
-  uscr_nps_debug <- reactiveVal(initial_nps_debug("USCR"))
-  rem_nps_debug <- reactiveVal(initial_nps_debug("REM"))
-  tte_nps_debug <- reactiveVal(initial_nps_debug("TTE"))
-
   nps_model_inputs <- reactive({
-    req(deployment_checked(), images_checked(), !is.null(input$species_to_analyze))
+    req(deployment_checked(), images_checked(), input$species_to_analyze)
     build_nps_model_inputs(
       deployment_checked(),
       images_checked(),
@@ -3438,12 +3440,12 @@ server <- function(input, output, session) {
       category = c("Animals Counted", "Total Camera-Days"),
       result = c(
         as.character(sum(d$camera_counts)),
-        format_num(sum(d$camera_days), 1)
+        format_fixed(sum(d$camera_days), 1)
       )
     )
   }, colnames = FALSE)
 
-  # ---- Effective prior settings ----
+  # ---- Effective settings ----
   # Default mode always uses the default priors; Advanced mode uses the inputs.
   is_default_mode <- function() !identical(input$mode, "Advanced")
   prior_input <- function(id) {
@@ -3452,10 +3454,6 @@ server <- function(input, output, session) {
   app_uscr_buffer_m <- function() {
     if (is_default_mode()) default_uscr_buffer_m else input$uscr_buffer_m
   }
-  is_valid_buffer_m <- function(x) {
-    is.numeric(x) && length(x) == 1 && is.finite(x) && x > 0
-  }
-  uscr_buffer_problem <- "The state-space buffer (Model settings > Advanced > Priors: USCR) must be a positive number of meters."
 
   # Switching to Default resets every Advanced input to its default.
   observeEvent(input$mode, {
@@ -3483,45 +3481,171 @@ server <- function(input, output, session) {
       hi = input$D_prior_hi
     )
   }
-  density_prior_problem <- function(spec = density_prior_spec()) {
-    if (isTRUE(spec$uniform)) return(NULL)
-    check_density_prior(spec$lo, spec$hi)
-  }
-  describe_density_prior_spec <- function(spec) {
-    if (isTRUE(spec$uniform)) return("uniform (default)")
-    paste0("informative, 95% interval ", spec$lo, " to ", spec$hi, " animals/km\u00b2")
+
+  # Camera-level noise (Poisson-lognormal): off in Default mode and by default.
+  app_camera_noise <- function() {
+    !is_default_mode() && isTRUE(input$camera_noise)
   }
 
-  # Starting M for USCR runs on simulated data: about twice the abundance
-  # expected in the fit's state space (buffer_m) under the true density (the
-  # density prior can raise it further).
-  pshared_suggested_M <- function(s, buffer_m) {
-    area <- uscr_state_space_and_area(s$uscr$out, buffer_m)$area_km2
-    max(50, ceiling(2 * s$settings$D_true * area / 50) * 50)
+  app_max_adapt_rounds <- function() {
+    x <- suppressWarnings(as.integer(input$max_adapt_rounds))
+    if (length(x) != 1L || is.na(x) || x < 1L) mcmc_defaults$max_adapt_rounds else x
+  }
+
+  # Problem with the priors a model uses, or NULL. Means must be numbers;
+  # SDs and the gamma shape and rate must be positive.
+  prior_labels <- c(
+    log_v_mean = "log(v) mean",
+    log_v_sd = "log(v) SD",
+    log_sigma_mean = "log(σ) mean",
+    log_sigma_sd = "log(σ) SD",
+    log_lam0_mean = "log(λ₀) mean",
+    log_lam0_sd = "log(λ₀) SD",
+    sd_eps_shape = "σε gamma shape",
+    sd_eps_rate = "σε gamma rate"
+  )
+  prior_problem <- function(model) {
+    ids <- c(
+      if (identical(model, "USCR")) {
+        c("log_sigma_mean", "log_sigma_sd", "log_lam0_mean", "log_lam0_sd")
+      } else {
+        c("log_v_mean", "log_v_sd")
+      },
+      "sd_eps_shape", "sd_eps_rate"
+    )
+    valid <- vapply(ids, function(id) {
+      x <- prior_input(id)
+      is.numeric(x) && length(x) == 1 && is.finite(x) && (grepl("_mean$", id) || x > 0)
+    }, logical(1))
+    if (all(valid)) return(NULL)
+    paste0(
+      "Check the priors in Model settings > Advanced: ",
+      paste(prior_labels[ids[!valid]], collapse = ", "),
+      if (sum(!valid) == 1) " isn't" else " aren't",
+      " valid. Means must be numbers; SDs and the gamma shape and rate must be positive numbers."
+    )
+  }
+
+  # Problem with the Model settings a model uses, or NULL.
+  model_settings_problem <- function(model) {
+    if (identical(model, "USCR") && !is_valid_buffer_m(app_uscr_buffer_m())) {
+      return(uscr_buffer_problem)
+    }
+    problem <- prior_problem(model)
+    if (!is.null(problem)) return(problem)
+    problem <- density_prior_problem(density_prior_spec())
+    if (!is.null(problem)) paste("Density prior:", problem)
+  }
+
+  # Input summary for USCR runs. buffer_m, M, and camera_noise are the
+  # settings the run starts with.
+  summarize_uscr_context <- function(d, buffer_m, M, camera_noise) {
+    run_context_lines(
+      d,
+      "USCR",
+      model_lines = c(
+        paste("USCR state-space buffer:", format_fixed(buffer_m, 0), "m"),
+        paste("USCR density prior:", describe_density_prior_spec(density_prior_spec())),
+        paste("Camera-level noise:", noise_label(camera_noise))
+      ),
+      limit_setting = paste0("M=", M),
+      max_adapt_rounds = app_max_adapt_rounds()
+    )
+  }
+
+  # Input summary for REM and TTE runs. angle_summary describes the cameras'
+  # detection angles, and camera_noise is the run's noise setting.
+  summarize_encounter_context <- function(d, model, angle_summary, camera_noise) {
+    density_prior <- density_prior_spec()
+    distance_m <- d$out$`Detection Distance`
+    run_context_lines(
+      d,
+      model,
+      model_lines = c(
+        paste0(
+          "Detection distance range: ", format_fixed(min(distance_m), 1),
+          " to ", format_fixed(max(distance_m), 1), " m"
+        ),
+        angle_summary,
+        paste(model, "density prior:", describe_density_prior_spec(density_prior)),
+        paste("Camera-level noise:", noise_label(camera_noise))
+      ),
+      limit_setting = paste0("D_max=", format_fixed(encounter_start_D_max(density_prior), 1)),
+      max_adapt_rounds = app_max_adapt_rounds()
+    )
+  }
+
+  # Model calls shared by simulated and uploaded data, each returned as a
+  # function of the status callback for run_model(). d holds the cameras
+  # (out), camera_counts, and camera_days.
+  uscr_fitter <- function(d, M, camera_noise, compute_WAIC) {
+    function(status_callback) {
+      run_USCR(
+        out = d$out,
+        camera_counts = d$camera_counts,
+        camera_days = d$camera_days,
+        iter = mcmc_defaults$iter,
+        burnin = mcmc_defaults$burnin,
+        thin = mcmc_defaults$thin,
+        n_chains = mcmc_defaults$n_chains,
+        M = M,
+        log_sigma_mean = prior_input("log_sigma_mean"),
+        log_sigma_sd = prior_input("log_sigma_sd"),
+        log_lam0_mean = prior_input("log_lam0_mean"),
+        log_lam0_sd = prior_input("log_lam0_sd"),
+        sd_eps_shape = prior_input("sd_eps_shape"),
+        sd_eps_rate = prior_input("sd_eps_rate"),
+        buffer_m = app_uscr_buffer_m(),
+        density_prior = density_prior_spec(),
+        camera_noise = camera_noise,
+        max_adapt_rounds = app_max_adapt_rounds(),
+        adapt_checks = adapt_checks,
+        compute_WAIC = compute_WAIC,
+        status_callback = status_callback
+      )
+    }
+  }
+
+  # theta_deg is one detection angle for every camera, or one per camera.
+  encounter_fitter <- function(model, d, theta_deg, camera_noise, compute_WAIC) {
+    run_fn <- if (identical(model, "REM")) run_REM else run_TTE
+    function(status_callback) {
+      run_fn(
+        y = d$camera_counts,
+        r_km = d$out$`Detection Distance` / 1000,
+        camera_days = d$camera_days,
+        theta_deg = theta_deg,
+        iter = mcmc_defaults$iter,
+        burnin = mcmc_defaults$burnin,
+        thin = mcmc_defaults$thin,
+        n_chains = mcmc_defaults$n_chains,
+        D_max = encounter_start_D_max(density_prior_spec()),
+        log_v_mean = prior_input("log_v_mean"),
+        log_v_sd = prior_input("log_v_sd"),
+        sd_eps_shape = prior_input("sd_eps_shape"),
+        sd_eps_rate = prior_input("sd_eps_rate"),
+        density_prior = density_prior_spec(),
+        camera_noise = camera_noise,
+        max_adapt_rounds = app_max_adapt_rounds(),
+        adapt_checks = adapt_checks,
+        compute_WAIC = compute_WAIC,
+        status_callback = status_callback
+      )
+    }
   }
 
   # ---- Density prior preview (Model settings > Advanced > Priors: Density) ----
   # USCR's prior on density depends on the state-space area (and M), so its
-  # preview uses uploaded data if available, otherwise the current simulation.
+  # preview uses the cameras in the uploaded data if available, otherwise
+  # those in the current simulation.
   uscr_prior_preview_basis <- reactive({
     d <- tryCatch(nps_model_inputs(), error = function(e) NULL)
     if (!is.null(d) && nrow(d$out) >= 2) {
-      return(list(
-        label = "your uploaded field data",
-        out = d$out,
-        buffer_m = app_uscr_buffer_m(),
-        M_start = mcmc_defaults$M_uscr
-      ))
+      return(list(label = "your uploaded data", out = d$out))
     }
     s <- pshared_sim()
     if (!is.null(s)) {
-      return(list(
-        label = "the current simulation",
-        out = s$uscr$out,
-        buffer_m = app_uscr_buffer_m(),
-        # Checked below before use; an invalid buffer has no area.
-        M_start = if (is_valid_buffer_m(app_uscr_buffer_m())) pshared_suggested_M(s, app_uscr_buffer_m())
-      ))
+      return(list(label = "the current simulation", out = s$uscr$out))
     }
     NULL
   })
@@ -3537,7 +3661,7 @@ server <- function(input, output, session) {
     if (!is.null(problem)) return(list(message = problem))
 
     beta <- tryCatch(
-      design_beta_density_prior(spec$lo, spec$hi, encounter_prior_start_D_max(spec$hi)),
+      design_beta_density_prior(spec$lo, spec$hi, encounter_start_D_max(spec)),
       error = function(e) e
     )
     if (inherits(beta, "error")) {
@@ -3548,15 +3672,16 @@ server <- function(input, output, session) {
     # USCR's prior depends on the state-space area, so it needs camera data.
     basis <- uscr_prior_preview_basis()
     if (is.null(basis)) {
-      out$uscr_message <- "its prior depends on the size of the state space, so it appears here once you upload field data or simulate data."
+      out$uscr_message <- "its prior depends on the size of the state space, so it appears here once you upload data or simulate data."
       return(out)
     }
-    if (!is_valid_buffer_m(basis$buffer_m)) {
+    buffer_m <- app_uscr_buffer_m()
+    if (!is_valid_buffer_m(buffer_m)) {
       out$uscr_message <- uscr_buffer_problem
       return(out)
     }
-    area <- uscr_state_space_and_area(basis$out, buffer_m = basis$buffer_m)$area_km2
-    M <- max(basis$M_start, uscr_prior_start_M(spec$hi, area))
+    area <- uscr_state_space_and_area(basis$out, buffer_m = buffer_m)$area_km2
+    M <- uscr_start_M(basis$out, buffer_m, spec)
     uscr <- tryCatch(design_uscr_density_prior(spec$lo, spec$hi, area, M), error = function(e) e)
     if (inherits(uscr, "error")) {
       out$uscr_message <- conditionMessage(uscr)
@@ -3637,42 +3762,6 @@ server <- function(input, output, session) {
     plot_density_priors(pv$beta, pv[["uscr"]])
   }, res = 110)
 
-  # Camera-level noise (Poisson-lognormal): off in Default mode and by default.
-  app_camera_noise <- function() {
-    !is_default_mode() && isTRUE(input$camera_noise)
-  }
-  noise_label <- function(on) if (isTRUE(on)) "on (Poisson-lognormal counts)" else "off (Poisson counts)"
-
-  # Posterior predictive check text for a fit (see ppc_summary()).
-  ppc_text <- function(fit) {
-    ppc <- ppc_summary(fit, ppc_pass_range)
-    if (is.null(ppc)) return(NULL)
-    base <- sprintf("Posterior predictive check: Bayesian p-value = %.3f", ppc$p)
-    if (!ppc$fail) {
-      return(paste0(base, " (passes; values from ", ppc$lower, " to ", ppc$upper, " pass)."))
-    }
-    paste0(
-      base, ". FAILED (outside ", ppc$lower, " to ", ppc$upper, "): the observed counts vary ",
-      if (ppc$p < ppc$lower) "more" else "less",
-      " than the model expects, so its estimates and intervals may be unreliable.",
-      if (!isTRUE(fit$settings$camera_noise)) {
-        " Turning on camera-level noise (Model settings > Advanced > Priors: Camera-level noise) can often fix a failed check."
-      } else {
-        ""
-      }
-    )
-  }
-  notify_ppc <- function(fit, label) {
-    ppc <- ppc_summary(fit, ppc_pass_range)
-    if (!is.null(ppc) && isTRUE(ppc$fail)) {
-      showNotification(
-        paste0(label, " failed its posterior predictive check (Bayesian p-value ",
-               sprintf("%.3f", ppc$p), "). See the run-status panel."),
-        type = "warning", duration = NULL
-      )
-    }
-  }
-
   # ---- "Run with" notes next to each Run button ----
   # Lists what differs from the app defaults for the model that button runs.
   # On simulated data, camera-level noise comes from the simulation.
@@ -3682,10 +3771,13 @@ server <- function(input, output, session) {
       is.numeric(x) && length(x) == 1 && is.finite(x) && abs(x - default) > tol
     }
     diffs <- character(0)
-    add_prior <- function(id, label) {
+    add_prior <- function(id) {
       val <- prior_input(id)
       if (changed(val, advanced_prior_defaults[[id]])) {
-        diffs <<- c(diffs, paste0(label, ": ", fmt(val), " (default ", fmt(advanced_prior_defaults[[id]]), ")"))
+        diffs <<- c(diffs, paste0(
+          prior_labels[[id]], ": ", fmt(val),
+          " (default ", fmt(advanced_prior_defaults[[id]]), ")"
+        ))
       }
     }
 
@@ -3703,18 +3795,18 @@ server <- function(input, output, session) {
     }
 
     if (identical(model, "USCR")) {
-      add_prior("log_sigma_mean", "log(\u03c3) mean")
-      add_prior("log_sigma_sd", "log(\u03c3) SD")
-      add_prior("log_lam0_mean", "log(\u03bb\u2080) mean")
-      add_prior("log_lam0_sd", "log(\u03bb\u2080) SD")
+      add_prior("log_sigma_mean")
+      add_prior("log_sigma_sd")
+      add_prior("log_lam0_mean")
+      add_prior("log_lam0_sd")
       # Buffer: flag only a user override of the automatic default.
       auto <- round_buffer_m(uscr_default_buffer_m(prior_input("log_sigma_mean"), prior_input("log_sigma_sd")))
       if (changed(app_uscr_buffer_m(), auto)) {
         diffs <- c(diffs, paste0("State-space buffer: ", fmt(app_uscr_buffer_m()), " m (default ", fmt(auto), " m)"))
       }
     } else {
-      add_prior("log_v_mean", "log(v) mean")
-      add_prior("log_v_sd", "log(v) SD")
+      add_prior("log_v_mean")
+      add_prior("log_v_sd")
     }
 
     if (app_max_adapt_rounds() != mcmc_defaults$max_adapt_rounds) {
@@ -3738,8 +3830,9 @@ server <- function(input, output, session) {
     diffs <- character(0)
     add_mean <- function(id, label, true_value, true_label) {
       prior_mean <- prior_input(id)
-      if (is.numeric(prior_mean) && length(prior_mean) == 1 && is.finite(prior_mean) &&
-          abs(prior_mean - log(true_value)) > 0.01) {
+      differs <- is.numeric(prior_mean) && length(prior_mean) == 1 &&
+        is.finite(prior_mean) && abs(prior_mean - log(true_value)) > 0.01
+      if (differs) {
         diffs <<- c(diffs, paste0(
           label, " mean: ", fmt(prior_mean), " (data-generating value ", fmt(log(true_value)),
           ", from ", true_label, ")"
@@ -3753,17 +3846,6 @@ server <- function(input, output, session) {
       add_mean("log_v_mean", "log(v)", st$v, paste0("v = ", fmt(st$v), " km/day"))
     }
     diffs
-  }
-
-  # Warning for a USCR fit on simulated data whose state space reaches past
-  # the region the activity centers were simulated in.
-  sim_buffer_warning <- function(fit_buffer_m, sim_buffer_m) {
-    if (!is_valid_buffer_m(fit_buffer_m) || fit_buffer_m <= sim_buffer_m) return(NULL)
-    paste0(
-      "The USCR state-space buffer (", round(fit_buffer_m), " m) is larger than the simulation buffer (",
-      round(sim_buffer_m), " m), so part of the fit's state space has no simulated activity centers, ",
-      "and density will likely be underestimated. Increase the simulation buffer and click Simulate data again."
-    )
   }
 
   render_run_note <- function(model, shared = FALSE) {
@@ -3807,51 +3889,30 @@ server <- function(input, output, session) {
   output$run_note_rem_pshared  <- render_run_note("REM", shared = TRUE)
   output$run_note_tte_pshared  <- render_run_note("TTE", shared = TRUE)
 
-  app_max_adapt_rounds <- function() {
-    x <- suppressWarnings(as.integer(input$max_adapt_rounds))
-    if (length(x) != 1L || is.na(x) || x < 1L) mcmc_defaults$max_adapt_rounds else x
-  }
-
-  # Run-status guidance for a completed fit. Flags fits that stopped at the
-  # adaptive-round limit without passing every check.
-  adaptive_limit_guidance <- function(fit, model, default_guidance) {
-    if (!isTRUE(fit$hit_max_adapt_rounds)) return(default_guidance)
-    paste0(
-      model, " stopped after ", fit$settings$max_adapt_rounds,
-      " adaptive rounds without passing these checks: ",
-      paste(fit$unmet_checks, collapse = ", "),
-      ". The results shown are from the last round and may not be reliable. ",
-      "To keep going, increase 'Maximum adaptive rounds' in Model settings and run ",
-      model, " again.",
-      if (any(c("M", "D_max") %in% fit$unmet_checks) && isTRUE(fit$density_prior$uniform)) {
-        paste0(
-          " The posterior kept pressing against the upper limit on ",
-          if ("M" %in% fit$unmet_checks) "abundance (M)" else "density (D_max)",
-          " under the uniform density prior. An informative density prior ",
-          "(Model settings > Advanced > Priors: Density (all models)) can rule out ",
-          "implausibly high densities and stop the limit from growing."
-        )
-      }
-    )
-  }
-
-  notify_adaptive_limit <- function(fit, label) {
-    if (isTRUE(fit$hit_max_adapt_rounds)) {
-      showNotification(
-        paste0(label, " stopped at the adaptive-round limit without passing all checks. See the run-status panel."),
-        type = "warning", duration = NULL
-      )
-    }
-  }
-
-  # Keep the USCR buffer default in sync with the log(sigma) prior: the
-  # buffer should comfortably contain a 99% home range under that prior, so
-  # if the prior mean/SD change, recompute and refresh the displayed default.
+  # Keep the USCR state-space buffer at its automatic value (the rule in
+  # uscr_buffer_rule_text) whenever the log(sigma) prior mean or SD changes.
+  # A buffer the user types in stays until the log(sigma) prior changes
+  # again.
   observe({
-    req(is.numeric(input$log_sigma_mean), is.numeric(input$log_sigma_sd))
+    req(
+      is.finite(input$log_sigma_mean),
+      is.finite(input$log_sigma_sd),
+      input$log_sigma_sd > 0
+    )
     new_default <- uscr_default_buffer_m(input$log_sigma_mean, input$log_sigma_sd)
     updateNumericInput(session, "uscr_buffer_m", value = round_buffer_m(new_default))
   })
+
+  # ================================================================
+  # MODEL FITS ON UPLOADED DATA (USCR, REM, and TTE tabs)
+  # ================================================================
+
+  uscr_nps_fit <- reactiveVal(NULL)
+  rem_nps_fit <- reactiveVal(NULL)
+  tte_nps_fit <- reactiveVal(NULL)
+  uscr_nps_debug <- reactiveVal(make_model_debug("USCR", "uploaded data"))
+  rem_nps_debug <- reactiveVal(make_model_debug("REM", "uploaded data"))
+  tte_nps_debug <- reactiveVal(make_model_debug("TTE", "uploaded data"))
 
   # Checks shared by the uploaded-data runs. Returns the model inputs, or NULL
   # after a pop-up explaining why the model can't be run.
@@ -3864,6 +3925,8 @@ server <- function(input, output, session) {
       "Upload an images file on the Add your data tab first."
     } else if (is.null(images_checked())) {
       "The images file didn't pass its checks. See the Images check log on the Add your data tab."
+    } else if (!is.null(trim_days_problem())) {
+      paste(trim_days_problem(), "See the deployment trim on the Add your data tab.")
     } else if (!isTruthy(input$species_to_analyze)) {
       "Choose a species to analyze in Model settings."
     }
@@ -3873,18 +3936,12 @@ server <- function(input, output, session) {
     }
 
     d <- nps_model_inputs()
-    detection_m <- suppressWarnings(as.numeric(d$out$`Detection Distance`))
     problem <- if (nrow(d$out) < 2) {
       "The models need data from at least 2 cameras."
-    } else if (identical(model, "USCR") && !is_valid_buffer_m(app_uscr_buffer_m())) {
-      uscr_buffer_problem
-    } else if (model %in% c("REM", "TTE") && !all(is.finite(detection_m) & detection_m > 0)) {
-      paste(model, "needs a positive Detection Distance for every camera. Fix the deployment file and upload it again (see the Deployment check log on the Add your data tab).")
     } else if (!all(d$camera_days > 0)) {
       "Some cameras have zero or negative camera-days; check deployment dates, or check for overlapping/duplicate Cluster IDs at the same site (overlapping detection events can double-count time and drive camera-days to zero or below)."
     } else {
-      prior_problem <- density_prior_problem()
-      if (!is.null(prior_problem)) paste("Density prior:", prior_problem)
+      model_settings_problem(model)
     }
     if (!is.null(problem)) {
       showNotification(paste(model, "not run.", problem), type = "error", duration = NULL)
@@ -3893,355 +3950,60 @@ server <- function(input, output, session) {
     d
   }
 
-  # --- USCR: NPS ---
-
-  observeEvent(input$run_uscr_nps, {
-    d <- nps_run_inputs("USCR")
+  # Run a model on the uploaded data, with WAIC for the Compare & combine tab.
+  run_on_uploaded <- function(model) {
+    d <- nps_run_inputs(model)
     if (is.null(d)) return()
+    camera_noise <- app_camera_noise()
 
-    uscr_nps_fit(NULL)  # Clear previous results
-    uscr_nps_debug(initial_nps_debug("USCR"))
-    update_model_debug(
-      uscr_nps_debug,
-      started_at = Sys.time(),
-      context = summarize_uscr_context(
-        d,
-        buffer_m = app_uscr_buffer_m(),
-        M = mcmc_defaults$M_uscr,
-        camera_noise = app_camera_noise()
-      ),
-      log_entry = "Input checks passed. Starting USCR MCMC."
-    )
-    showNotification(
-      "Running USCR on uploaded data.",
-      type = "message",
-      duration = NULL,
-      id = "uscr_nps_status"
-    )
-
-    fit <- tryCatch(
-      {
-        status_callback <- make_model_status_callback(uscr_nps_debug, "USCR", "uscr_nps_status")
-
-        run_USCR(
-          out = d$out,
-          camera_counts = d$camera_counts,
-          camera_days = d$camera_days,
-          iter = mcmc_defaults$iter,
-          burnin = mcmc_defaults$burnin,
-          thin = mcmc_defaults$thin,
-          n_chains = mcmc_defaults$n_chains,
-          M = mcmc_defaults$M_uscr,
-          log_sigma_mean = prior_input("log_sigma_mean"),
-          log_sigma_sd = prior_input("log_sigma_sd"),
-          log_lam0_mean = prior_input("log_lam0_mean"),
-          log_lam0_sd = prior_input("log_lam0_sd"),
-          sd_eps_shape = prior_input("sd_eps_shape"),
-          sd_eps_rate = prior_input("sd_eps_rate"),
-          buffer_m = app_uscr_buffer_m(),
-          max_adapt_rounds = app_max_adapt_rounds(),
-          density_prior = density_prior_spec(),
-          camera_noise = app_camera_noise(),
-          compute_WAIC = TRUE,
-          status_callback = status_callback
-        )
-      },
-      error = function(e) {
-        update_model_debug(
-          uscr_nps_debug,
-          status = "error",
-          finished_at = Sys.time(),
-          guidance = friendly_model_error("USCR", "uploaded field data", e$message),
-          raw_error = e$message,
-          log_entry = paste("Uploaded-data USCR failed:", e$message)
-        )
-        showNotification(
-          paste("USCR (uploaded data) failed:", e$message),
-          type = "error", duration = NULL
-        )
-        NULL
-      },
-      finally = removeNotification("uscr_nps_status")
-    )
-    uscr_nps_fit(fit)
-    if (!is.null(fit)) {
-      update_model_debug(
-        uscr_nps_debug,
-        status = "success",
-        finished_at = Sys.time(),
-        guidance = adaptive_limit_guidance(fit, "USCR", "Uploaded-data USCR completed successfully. Review the summary above and the run history below."),
-        log_entry = "Uploaded-data USCR run completed."
-      )
-      showNotification("USCR (uploaded data) complete!", type = "message")
-      notify_adaptive_limit(fit, "USCR (uploaded data)")
-      notify_ppc(fit, "USCR (uploaded data)")
+    if (identical(model, "USCR")) {
+      buffer_m <- app_uscr_buffer_m()
+      M <- uscr_start_M(d$out, buffer_m, density_prior_spec())
+      context <- summarize_uscr_context(d, buffer_m, M, camera_noise)
+      fit_model <- uscr_fitter(d, M, camera_noise, compute_WAIC = TRUE)
+    } else {
+      angle_summary <- summarize_camera_angle_source(d$out, default_deg = input$theta)
+      context <- summarize_encounter_context(d, model, angle_summary, camera_noise)
+      theta_deg <- get_camera_angle_vector(d$out, default_deg = input$theta)
+      fit_model <- encounter_fitter(model, d, theta_deg, camera_noise, compute_WAIC = TRUE)
     }
-  })
 
-  # --- REM: NPS ---
-
-  observeEvent(input$run_rem_nps, {
-    d <- nps_run_inputs("REM")
-    if (is.null(d)) return()
-
-    rem_nps_fit(NULL)  # Clear previous results
-    rem_nps_debug(initial_nps_debug("REM"))
-    update_model_debug(
-      rem_nps_debug,
-      started_at = Sys.time(),
-      context = summarize_encounter_context(
-        d,
-        "REM",
-        angle_summary = summarize_camera_angle_source(d$out, default_deg = input$theta),
-        camera_noise = app_camera_noise()
-      ),
-      log_entry = "Input checks passed. Starting REM MCMC."
+    run_model(
+      model = model,
+      data_label = "uploaded data",
+      fit_rv = list(USCR = uscr_nps_fit, REM = rem_nps_fit, TTE = tte_nps_fit)[[model]],
+      debug_rv = list(USCR = uscr_nps_debug, REM = rem_nps_debug, TTE = tte_nps_debug)[[model]],
+      context = context,
+      fit_model = fit_model
     )
-    showNotification(
-      "Running REM on uploaded data.",
-      type = "message",
-      duration = NULL,
-      id = "rem_nps_status"
-    )
+  }
 
-    fit <- tryCatch(
-      {
-        status_callback <- make_model_status_callback(rem_nps_debug, "REM", "rem_nps_status")
-
-        run_REM(
-          y = d$camera_counts,
-          r_km = d$out$`Detection Distance` / 1000,
-          camera_days = d$camera_days,
-          theta_deg = get_camera_angle_vector(d$out, default_deg = input$theta),
-          iter = mcmc_defaults$iter,
-          burnin = mcmc_defaults$burnin,
-          thin = mcmc_defaults$thin,
-          n_chains = mcmc_defaults$n_chains,
-          D_max = rem_tte_start_D_max,
-          log_v_mean = prior_input("log_v_mean"),
-          log_v_sd = prior_input("log_v_sd"),
-          sd_eps_shape = prior_input("sd_eps_shape"),
-          sd_eps_rate = prior_input("sd_eps_rate"),
-          density_prior = density_prior_spec(),
-          camera_noise = app_camera_noise(),
-          max_adapt_rounds = app_max_adapt_rounds(),
-          compute_WAIC = TRUE,
-          status_callback = status_callback
-        )
-      },
-      error = function(e) {
-        update_model_debug(
-          rem_nps_debug,
-          status = "error",
-          finished_at = Sys.time(),
-          guidance = friendly_model_error("REM", "uploaded field data", e$message),
-          raw_error = e$message,
-          log_entry = paste("Uploaded-data REM failed:", e$message)
-        )
-        showNotification(
-          paste("REM (uploaded data) failed:", e$message),
-          type = "error", duration = NULL
-        )
-        NULL
-      },
-      finally = removeNotification("rem_nps_status")
-    )
-    rem_nps_fit(fit)
-    if (!is.null(fit)) {
-      update_model_debug(
-        rem_nps_debug,
-        status = "success",
-        finished_at = Sys.time(),
-        guidance = adaptive_limit_guidance(fit, "REM", "Uploaded-data REM completed successfully. Review the summary above and the run history below."),
-        log_entry = "Uploaded-data REM run completed."
-      )
-      showNotification("REM (uploaded data) complete!", type = "message")
-      notify_adaptive_limit(fit, "REM (uploaded data)")
-      notify_ppc(fit, "REM (uploaded data)")
-    }
-  })
-
-  # --- TTE: NPS ---
-
-  observeEvent(input$run_tte_nps, {
-    d <- nps_run_inputs("TTE")
-    if (is.null(d)) return()
-
-    tte_nps_fit(NULL)  # Clear previous results
-    tte_nps_debug(initial_nps_debug("TTE"))
-    update_model_debug(
-      tte_nps_debug,
-      started_at = Sys.time(),
-      context = summarize_encounter_context(
-        d,
-        "TTE",
-        angle_summary = summarize_camera_angle_source(d$out, default_deg = input$theta),
-        camera_noise = app_camera_noise()
-      ),
-      log_entry = "Input checks passed. Starting TTE MCMC."
-    )
-    showNotification(
-      "Running TTE on uploaded data.",
-      type = "message",
-      duration = NULL,
-      id = "tte_nps_status"
-    )
-
-    fit <- tryCatch(
-      {
-        status_callback <- make_model_status_callback(tte_nps_debug, "TTE", "tte_nps_status")
-
-        run_TTE(
-          y = d$camera_counts,
-          r_km = d$out$`Detection Distance` / 1000,
-          camera_days = d$camera_days,
-          theta_deg = get_camera_angle_vector(d$out, default_deg = input$theta),
-          iter = mcmc_defaults$iter,
-          burnin = mcmc_defaults$burnin,
-          thin = mcmc_defaults$thin,
-          n_chains = mcmc_defaults$n_chains,
-          D_max = rem_tte_start_D_max,
-          log_v_mean = prior_input("log_v_mean"),
-          log_v_sd = prior_input("log_v_sd"),
-          sd_eps_shape = prior_input("sd_eps_shape"),
-          sd_eps_rate = prior_input("sd_eps_rate"),
-          density_prior = density_prior_spec(),
-          camera_noise = app_camera_noise(),
-          max_adapt_rounds = app_max_adapt_rounds(),
-          compute_WAIC = TRUE,
-          status_callback = status_callback
-        )
-      },
-      error = function(e) {
-        update_model_debug(
-          tte_nps_debug,
-          status = "error",
-          finished_at = Sys.time(),
-          guidance = friendly_model_error("TTE", "uploaded field data", e$message),
-          raw_error = e$message,
-          log_entry = paste("Uploaded-data TTE failed:", e$message)
-        )
-        showNotification(
-          paste("TTE (uploaded data) failed:", e$message),
-          type = "error", duration = NULL
-        )
-        NULL
-      },
-      finally = removeNotification("tte_nps_status")
-    )
-    tte_nps_fit(fit)
-    if (!is.null(fit)) {
-      update_model_debug(
-        tte_nps_debug,
-        status = "success",
-        finished_at = Sys.time(),
-        guidance = adaptive_limit_guidance(fit, "TTE", "Uploaded-data TTE completed successfully. Review the summary above and the run history below."),
-        log_entry = "Uploaded-data TTE run completed."
-      )
-      showNotification("TTE (uploaded data) complete!", type = "message")
-      notify_adaptive_limit(fit, "TTE (uploaded data)")
-      notify_ppc(fit, "TTE (uploaded data)")
-    }
-  })
-
-  # ================================================================
-  # MODEL TAB OUTPUTS (USCR / REM / TTE)
-  # ================================================================
+  observeEvent(input$run_uscr_nps, run_on_uploaded("USCR"))
+  observeEvent(input$run_rem_nps, run_on_uploaded("REM"))
+  observeEvent(input$run_tte_nps, run_on_uploaded("TTE"))
 
   output$uscr_nps_text <- renderPrint({
-    if (identical(uscr_nps_debug()$status, "error")) {
-      cat("USCR (uploaded data): the last run failed.\n")
-      cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-      return(invisible(NULL))
-    }
-    fit <- uscr_nps_fit()
-    if (is.null(fit)) {
-      cat("USCR (uploaded data): not run yet. Click 'Run USCR on uploaded data'.")
-      return(invisible(NULL))
-    }
-    s <- summarize_method(fit)
-    out <- list(
-      dataset                   = "Uploaded field data",
-      mean_density_animals_per_km2 = round(s$mean_km2, 3),
-      median_density_animals_per_km2 = round(s$median_km2, 3),
-      CI95_km2                  = c(round(s$q2.5_km2, 3), round(s$q97.5_km2, 3))
-    )
-    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 3)
-    ppc <- ppc_summary(fit, ppc_pass_range)
-    if (!is.null(ppc)) {
-      out$bayesian_p_value <- round(ppc$p, 3)
-      out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
-    }
-    out
+    print_uploaded_result("USCR", uscr_nps_fit(), uscr_nps_debug())
   })
 
   output$rem_nps_text <- renderPrint({
-    if (identical(rem_nps_debug()$status, "error")) {
-      cat("REM (uploaded data): the last run failed.\n")
-      cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-      return(invisible(NULL))
-    }
-    fit <- rem_nps_fit()
-    if (is.null(fit)) {
-      cat("REM (uploaded data): not run yet. Click 'Run REM on uploaded data'.")
-      return(invisible(NULL))
-    }
-    s <- summarize_method(fit)
-    out <- list(
-      dataset                   = "Uploaded field data",
-      mean_density_animals_per_km2 = round(s$mean_km2, 3),
-      median_density_animals_per_km2 = round(s$median_km2, 3),
-      CI95_km2                  = c(round(s$q2.5_km2, 3), round(s$q97.5_km2, 3))
-    )
-    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 3)
-    ppc <- ppc_summary(fit, ppc_pass_range)
-    if (!is.null(ppc)) {
-      out$bayesian_p_value <- round(ppc$p, 3)
-      out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
-    }
-    out
+    print_uploaded_result("REM", rem_nps_fit(), rem_nps_debug())
   })
 
   output$tte_nps_text <- renderPrint({
-    if (identical(tte_nps_debug()$status, "error")) {
-      cat("TTE (uploaded data): the last run failed.\n")
-      cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-      return(invisible(NULL))
-    }
-    fit <- tte_nps_fit()
-    if (is.null(fit)) {
-      cat("TTE (uploaded data): not run yet. Click 'Run TTE on uploaded data'.")
-      return(invisible(NULL))
-    }
-    s <- summarize_method(fit)
-    out <- list(
-      dataset                   = "Uploaded field data",
-      mean_density_animals_per_km2 = round(s$mean_km2, 3),
-      median_density_animals_per_km2 = round(s$median_km2, 3),
-      CI95_km2                  = c(round(s$q2.5_km2, 3), round(s$q97.5_km2, 3))
-    )
-    if (is.finite(s$waic)) out$WAIC <- round(s$waic, 3)
-    ppc <- ppc_summary(fit, ppc_pass_range)
-    if (!is.null(ppc)) {
-      out$bayesian_p_value <- round(ppc$p, 3)
-      out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
-    }
-    out
+    print_uploaded_result("TTE", tte_nps_fit(), tte_nps_debug())
   })
 
   output$uscr_nps_debug <- renderText({
-    state <- uscr_nps_debug()
-    format_model_debug(state, uscr_nps_fit())
+    format_model_debug(uscr_nps_debug(), uscr_nps_fit())
   })
 
   output$rem_nps_debug <- renderText({
-    state <- rem_nps_debug()
-    format_model_debug(state, rem_nps_fit())
+    format_model_debug(rem_nps_debug(), rem_nps_fit())
   })
 
   output$tte_nps_debug <- renderText({
-    state <- tte_nps_debug()
-    format_model_debug(state, tte_nps_fit())
+    format_model_debug(tte_nps_debug(), tte_nps_fit())
   })
 
   # ================================================================
@@ -4261,7 +4023,7 @@ server <- function(input, output, session) {
     if (!is.null(combo_data)) {
       build_combo_interval_plot(
         combo_data,
-        title_text = "Uploaded field data: density estimates"
+        title_text = "Uploaded data: density estimates"
       )
     }
   })
@@ -4271,7 +4033,7 @@ server <- function(input, output, session) {
     if (!is.null(combo_data)) {
       build_combo_density_overlay_plot(
         combo_data,
-        title_text = "Uploaded field data: posterior distributions of density"
+        title_text = "Uploaded data: posterior distributions of density"
       )
     }
   })
@@ -4279,7 +4041,7 @@ server <- function(input, output, session) {
   output$nps_combo_table <- renderDT({
     combo_data <- nps_combo_data()
     if (is.null(combo_data)) {
-      return(DT::datatable(
+      return(datatable(
         data.frame(
           Note = "Run at least one model on uploaded data from its tab. The table updates as USCR, REM, and TTE finish."
         ),
@@ -4292,10 +4054,10 @@ server <- function(input, output, session) {
       density_threshold = input$combo_density_threshold,
       ppc_pass_range = ppc_pass_range
     ) |>
-      dplyr::mutate(dplyr::across(where(is.numeric), function(x) round(x, 3)))
+      mutate(across(where(is.numeric), function(x) round(x, result_digits)))
     # Bayesian p-values of models that failed their posterior predictive check
     # in bold red, set by the hidden failed_check column.
-    DT::datatable(
+    datatable(
       df,
       options = list(
         paging = FALSE,
@@ -4309,11 +4071,11 @@ server <- function(input, output, session) {
       ),
       rownames = FALSE
     ) |>
-      DT::formatStyle(
+      formatStyle(
         "Bayesian p-value",
         valueColumns = "failed_check",
-        color = DT::styleEqual(TRUE, "firebrick"),
-        fontWeight = DT::styleEqual(TRUE, "bold")
+        color = styleEqual(TRUE, "firebrick"),
+        fontWeight = styleEqual(TRUE, "bold")
       )
   })
 
@@ -4336,7 +4098,7 @@ server <- function(input, output, session) {
     content = function(file) {
       p <- nps_combo_interval_plot_obj()
       req(p)
-      ggplot2::ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
+      ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
     }
   )
 
@@ -4347,7 +4109,7 @@ server <- function(input, output, session) {
     content = function(file) {
       p <- nps_combo_density_plot_obj()
       req(p)
-      ggplot2::ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
+      ggsave(file, plot = p, width = 8.5, height = 4.5, dpi = 300, bg = "white")
     }
   )
 
@@ -4358,11 +4120,11 @@ server <- function(input, output, session) {
     content = function(file) {
       combo_data <- nps_combo_data()
       req(combo_data)
-      purrr::imap(combo_data$fits, function(fit, model) {
-        dplyr::mutate(posterior_summary_df(fit), model = model, .before = 1)
+      imap(combo_data$fits, function(fit, model) {
+        mutate(posterior_summary_df(fit), model = model, .before = 1)
       }) |>
-        dplyr::bind_rows() |>
-        readr::write_csv(file)
+        bind_rows() |>
+        write_csv(file)
     }
   )
 }

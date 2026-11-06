@@ -1,17 +1,6 @@
 ## R/sim_and_models.R
 ## Simulation helpers, model inputs for uploaded data, and the USCR, REM,
-## and TTE models (which follow Camera_Unmarked_Analyses_updated.Rmd, with
-## adaptive reruns for app use).
-
-# -------------------------------------------------------------------
-# Package checks (loaded lazily where needed)
-# -------------------------------------------------------------------
-
-quiet_require <- function(pkg) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    stop("Package '", pkg, "' is required but not installed.", call. = FALSE)
-  }
-}
+## and TTE models, with adaptive reruns.
 
 # -------------------------------------------------------------------
 # 1. Simulation helpers (Simulate data tab)
@@ -37,10 +26,10 @@ build_sim_camera_grid <- function(n_side, spacing_m) {
   coords <- coords[order(coords$y, coords$x), , drop = FALSE]
 
   coords |>
-    dplyr::mutate(
+    mutate(
       x = x - mean(range(x)),
       y = y - mean(range(y)),
-      `Site Name` = paste0("C", dplyr::row_number()),
+      `Site Name` = paste0("C", row_number()),
       utm_e = x / 1000,
       utm_n = y / 1000
     )
@@ -84,10 +73,10 @@ simulate_camera_counts <- function(n_side,
   # buffer of at least one camera.
   xlim <- range(cam[, 1]) + c(-1, 1) * buffer_km
   ylim <- range(cam[, 2]) + c(-1, 1) * buffer_km
-  N_rect <- stats::rpois(1, D_per_km2 * diff(xlim) * diff(ylim))
+  N_rect <- rpois(1, D_per_km2 * diff(xlim) * diff(ylim))
   ac <- cbind(
-    stats::runif(N_rect, xlim[1], xlim[2]),
-    stats::runif(N_rect, ylim[1], ylim[2])
+    runif(N_rect, xlim[1], xlim[2]),
+    runif(N_rect, ylim[1], ylim[2])
   )
   dist2 <- outer(ac[, 1], cam[, 1], "-")^2 + outer(ac[, 2], cam[, 2], "-")^2
   keep <- if (N_rect > 0) apply(dist2, 1, min) < buffer_km^2 else logical(0)
@@ -97,13 +86,13 @@ simulate_camera_counts <- function(n_side,
   # Counts.
   camera_days <- rep(as.numeric(days), J)
   Lambda <- colSums(lambda0 * exp(-dist2 / (2 * sigma_km^2)))  # per camera-day
-  eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
+  eps <- rnorm(J, mean = 0, sd = sd_eps)
   use_eps <- as.numeric(isTRUE(camera_noise))
   mu <- camera_days * Lambda * exp(use_eps * eps)
 
   list(
     out = out,
-    camera_counts = stats::rpois(J, mu),
+    camera_counts = rpois(J, mu),
     camera_days = camera_days,
     activity_centers = data.frame(x = ac[, 1] * 1000, y = ac[, 2] * 1000),
     state_space_outline = uscr_buffered_outline(cam, buffer_km, scale = 1000),
@@ -139,11 +128,11 @@ simulate_encounter_counts <- function(model,
   set.seed(seed)
 
   out <- build_sim_camera_grid(n_side, spacing_m) |>
-    dplyr::mutate(`Detection Distance` = detection_radius_m)
+    mutate(`Detection Distance` = detection_radius_m)
   J <- nrow(out)
   camera_days <- rep(as.numeric(days), J)
   r_km <- detection_radius_m / 1000
-  eps <- stats::rnorm(J, mean = 0, sd = sd_eps)
+  eps <- rnorm(J, mean = 0, sd = sd_eps)
   use_eps <- as.numeric(isTRUE(camera_noise))
 
   per_day <- if (identical(model, "REM")) {
@@ -157,7 +146,7 @@ simulate_encounter_counts <- function(model,
 
   list(
     out = out,
-    camera_counts = stats::rpois(J, mu),
+    camera_counts = rpois(J, mu),
     camera_days = camera_days
   )
 }
@@ -165,21 +154,16 @@ simulate_encounter_counts <- function(model,
 # -------------------------------------------------------------------
 # 2. Uploaded data: per-camera counts and effort for the models
 # -------------------------------------------------------------------
-build_nps_model_inputs <- function(
-    deployments,
-    images,
-    species_to_analyze,
-    max_days = NULL
-    ) {
-  quiet_require("dplyr")
-  quiet_require("sf")
-
+build_nps_model_inputs <- function(deployments,
+                                   images,
+                                   species_to_analyze,
+                                   max_days) {
   # Each camera's analysis window (start/end date-times, optional trim) comes
   # from analysis_windows() in R/data_checks.R; check_deployments() has
   # already blocked any window with no time in it.
   windows <- analysis_windows(deployments, max_days = max_days)
   deps <- deployments |>
-    dplyr::mutate(
+    mutate(
       window_start = windows$window_start,
       window_end   = windows$window_end,
       window_days  = windows$days
@@ -189,19 +173,18 @@ build_nps_model_inputs <- function(
   # Latitude/Longitude are validated in check_deployments(), but may still be
   # character columns from the CSV import.
   deps <- deps |>
-    dplyr::mutate(
+    mutate(
       Longitude = as.numeric(Longitude),
       Latitude  = as.numeric(Latitude)
     )
 
   # UTM conversion and centering. Longitude/Latitude are treated as WGS84
   # (EPSG:4326, the standard GPS datum) and projected into the matching
-  # WGS84 UTM zone, so this works for deployments anywhere in the world
-  # rather than assuming North America. The UTM zone comes from the mean
-  # longitude and the hemisphere (for choosing the Northern- vs.
-  # Southern-Hemisphere EPSG series) comes from the mean latitude; as
-  # before, this assumes all cameras in a single dataset fall within one
-  # UTM zone, which holds for a spatially clustered deployment/array.
+  # WGS84 UTM zone, so this works for deployments anywhere in the world. The
+  # UTM zone comes from the mean longitude and the hemisphere (for choosing
+  # the Northern- vs. Southern-Hemisphere EPSG series) comes from the mean
+  # latitude. This assumes all cameras in a dataset fall within one UTM zone,
+  # which holds for a spatially clustered camera array.
   mean_lon  <- mean(deps$Longitude, na.rm = TRUE)
   mean_lat  <- mean(deps$Latitude, na.rm = TRUE)
   utm_zone  <- floor((mean_lon + 180) / 6) + 1
@@ -209,12 +192,12 @@ build_nps_model_inputs <- function(
   epsg_code <- if (mean_lat >= 0) 32600 + utm_zone else 32700 + utm_zone
 
   utm_coords <- deps |>
-    sf::st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) |>
-    sf::st_transform(crs = epsg_code) |>
-    sf::st_coordinates()
+    st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) |>
+    st_transform(crs = epsg_code) |>
+    st_coordinates()
 
   deps <- deps |>
-    dplyr::mutate(
+    mutate(
       utm_e = (utm_coords[, "X"] -
                  mean(range(utm_coords[, "X"], na.rm = TRUE))) / 1000,
       utm_n = (utm_coords[, "Y"] -
@@ -225,23 +208,23 @@ build_nps_model_inputs <- function(
   # counts if its first image is inside the camera's analysis window, and the
   # part of its duration inside the window is removed from the camera's effort.
   events <- detection_events(images, deployments, max_days = max_days) |>
-    dplyr::filter(Species == species_to_analyze, in_window) |>
-    dplyr::group_by(`Site Name`) |>
-    dplyr::summarize(
+    filter(Species == species_to_analyze, in_window) |>
+    group_by(`Site Name`) |>
+    summarize(
       events_count = sum(count),
       event_days   = sum(days_in_window),
       .groups      = "drop"
     )
 
   out <- deps |>
-    dplyr::left_join(events, by = "Site Name") |>
-    dplyr::mutate(
-      events_count = dplyr::coalesce(events_count, 0),
-      event_days   = dplyr::coalesce(event_days, 0)
+    left_join(events, by = "Site Name") |>
+    mutate(
+      events_count = coalesce(events_count, 0),
+      event_days   = coalesce(event_days, 0)
     )
 
   list(
-    out           = dplyr::select(out, -events_count, -event_days),
+    out           = select(out, -events_count, -event_days),
     camera_counts = out$events_count,
     camera_days   = out$window_days - out$event_days
   )
@@ -261,7 +244,9 @@ normalize_nimble_output <- function(x) {
 }
 
 # Runs the chains in parallel worker processes (one per chain, up to the
-# number of cores minus one). make_inits(constants), if given, returns each
+# number of cores minus one). If the number of cores can't be determined, or
+# there's only one, the chains run one after another in a single worker.
+# make_inits(constants), if given, returns each
 # chain's initial values (USCR uses it to start activity centers near
 # cameras); otherwise nimble chooses initial values itself.
 run_nimble_chains <- function(code,
@@ -274,9 +259,9 @@ run_nimble_chains <- function(code,
                               n_chains,
                               compute_WAIC,
                               make_inits = NULL) {
-  quiet_require("parallel")
-
-  cl_size <- min(n_chains, max(1L, parallel::detectCores() - 1L))
+  n_cores <- parallel::detectCores()
+  if (is.na(n_cores)) n_cores <- 1L
+  cl_size <- min(n_chains, max(1L, n_cores - 1L))
   cl <- parallel::makeCluster(cl_size)
   on.exit(parallel::stopCluster(cl), add = TRUE)
 
@@ -306,7 +291,7 @@ run_nimble_chains <- function(code,
       if (!is.null(make_inits)) {
         mcmc_args$inits <- make_inits(constants)
       }
-      normalize(do.call(nimble::nimbleMCMC, mcmc_args, quote = TRUE))
+      normalize(do.call(nimbleMCMC, mcmc_args, quote = TRUE))
     },
     code = code,
     constants = constants,
@@ -327,9 +312,15 @@ run_nimble_chains <- function(code,
 
 # Fits REM or TTE (model code and constants from run_REM() or run_TTE()), then
 # reruns it while any check fails, up to max_adapt_rounds rounds: iterations,
-# burn-in, and thinning double if Rhat is above rhat_target, and D_max doubles
-# if the posterior for D presses against it. The checks' thresholds keep their
-# defaults.
+# burn-in, and thinning double if the largest Rhat is above
+# adapt_checks$rhat_max, and D_max doubles if the posterior probability that
+# D exceeds adapt_checks$limit_fraction of D_max is above
+# adapt_checks$limit_prob.
+#
+# density_prior is list(uniform = TRUE) for D ~ Uniform(0, D_max), or
+# list(uniform = FALSE, lo = , hi = ), a 95% interval in animals/km^2 that is
+# re-solved every round so it holds as D_max grows. D_max is the starting
+# upper limit on density, chosen by the app.
 run_encounter_rate_model <- function(method,
                                      code,
                                      constants,
@@ -342,43 +333,20 @@ run_encounter_rate_model <- function(method,
                                      D_max,
                                      density_prior,
                                      max_adapt_rounds,
+                                     adapt_checks,
                                      compute_WAIC,
-                                     status_callback,
-                                     rhat_target = 1.1,
-                                     D_check_fraction = 0.9,
-                                     D_check_prob = 0.01) {
-  iter <- as.integer(iter)
-  burnin <- as.integer(burnin)
-  thin <- as.integer(max(1, thin))
-  n_chains <- as.integer(max(1, n_chains))
-  max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
-
-  # density_prior: list(uniform = TRUE) for D ~ Uniform(0, D_max), or
-  # list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2 (the
-  # app checks the interval before running). D_max is the starting upper
-  # limit under the uniform prior; an informative prior starts it at twice
-  # the interval's upper bound instead.
+                                     status_callback) {
   informative_prior <- identical(density_prior$uniform, FALSE)
-  current_D_max <- if (informative_prior) {
-    encounter_prior_start_D_max(density_prior$hi)
-  } else {
-    as.numeric(D_max)
-  }
-
+  current_D_max <- D_max
   current_iter <- iter
   current_burnin <- burnin
   current_thin <- thin
   round_i <- 0L
-  current_rhat <- Inf
   round_log <- list()
   hit_max_adapt_rounds <- FALSE
   unmet_checks <- character(0)
-  prior_design <- NULL
   prev_elapsed_min <- NULL
   prev_iter <- NULL
-  fit <- NULL
-  samples_list <- NULL
-  samples_all <- NULL
 
   repeat {
     round_i <- round_i + 1L
@@ -393,8 +361,6 @@ run_encounter_rate_model <- function(method,
     )
     round_started <- Sys.time()
 
-    # Re-solve the density prior for this round's D_max, so the requested
-    # interval holds as D_max grows.
     prior_design <- if (informative_prior) {
       design_beta_density_prior(density_prior$lo, density_prior$hi, current_D_max)
     } else {
@@ -419,24 +385,22 @@ run_encounter_rate_model <- function(method,
     samples_list <- lapply(fit, `[[`, "samples")
     samples_all <- do.call(rbind, samples_list)
     current_rhat <- safe_rhat_max(samples_list)
-    converged <- is.na(current_rhat) || current_rhat <= rhat_target
+    converged <- is.na(current_rhat) || current_rhat <= adapt_checks$rhat_max
 
     # D_max is too small if the posterior for D presses against it.
-    D_post <- samples_all[, "D"]
-    D_too_small <- mean(D_post > D_check_fraction * current_D_max, na.rm = TRUE) > D_check_prob
+    D_too_small <- mean(
+      samples_all[, "D"] > adapt_checks$limit_fraction * current_D_max,
+      na.rm = TRUE
+    ) > adapt_checks$limit_prob
 
     round_log[[round_i]] <- data.frame(
       round = round_i,
       D_max = current_D_max,
-      D_a = prior_design$a,
-      D_b = prior_design$b,
       niter = current_iter,
-      nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
       rhat_max = current_rhat,
-      D_too_small = D_too_small,
-      stringsAsFactors = FALSE
+      D_too_small = D_too_small
     )
 
     prev_elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
@@ -472,11 +436,8 @@ run_encounter_rate_model <- function(method,
   }
 
   list(
-    method = method,
-    samples_list = samples_list,
     samples_all = samples_all,
     waic = extract_waic_mean(fit),
-    fit_objects = fit,
     round_history = do.call(rbind, round_log),
     final_rhat_max = current_rhat,
     hit_max_adapt_rounds = hit_max_adapt_rounds,
@@ -488,10 +449,7 @@ run_encounter_rate_model <- function(method,
       thin = current_thin,
       n_chains = n_chains,
       max_adapt_rounds = max_adapt_rounds,
-      rhat_target = rhat_target,
-      D_max = current_D_max,
-      D_check_fraction = D_check_fraction,
-      D_check_prob = D_check_prob
+      D_max = current_D_max
     )
   )
 }
@@ -502,9 +460,9 @@ run_encounter_rate_model <- function(method,
 # Random encounter model (Rowcliffe et al. 2008): the expected count at camera
 # j is D * days_j * v * r_j * (2 + theta_j) / pi, with theta_j in radians.
 
-# The app supplies every setting without a default here (its constants live
-# in app.R) and checks the inputs before running. theta_deg is one detection
-# angle for every camera (simulated data) or one per camera (uploaded data).
+# The app supplies every setting (its constants live in app.R) and checks the
+# inputs before running. theta_deg is one detection angle for every camera
+# (simulated data) or one per camera (uploaded data).
 run_REM <- function(y,
                     r_km,
                     camera_days,
@@ -521,14 +479,13 @@ run_REM <- function(y,
                     density_prior,
                     camera_noise,
                     max_adapt_rounds,
+                    adapt_checks,
                     compute_WAIC,
                     status_callback) {
-  quiet_require("nimble")
-
   J <- length(y)
   theta_deg <- rep_len(as.numeric(theta_deg), J)
 
-  code <- nimble::nimbleCode({
+  code <- nimbleCode({
     p_D ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
     D <- D_max * p_D
     log_v ~ dnorm(log_v_mean, sd = log_v_sd)
@@ -574,8 +531,7 @@ run_REM <- function(y,
   data_list <- list(y = as.numeric(y))
 
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
-  monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
-                "bp", "sum_obs", "sum_sim")
+  monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps", "bp")
 
   fit <- run_encounter_rate_model(
     method = "REM",
@@ -590,6 +546,7 @@ run_REM <- function(y,
     D_max = D_max,
     density_prior = density_prior,
     max_adapt_rounds = max_adapt_rounds,
+    adapt_checks = adapt_checks,
     compute_WAIC = compute_WAIC,
     status_callback = status_callback
   )
@@ -606,9 +563,9 @@ run_REM <- function(y,
 # day, f() is tte_path_length_multiplier(), A_j = pi * r_j^2 * theta_j / 360
 # is the viewshed area, and theta_j is in degrees.
 
-# The app supplies every setting without a default here (its constants live
-# in app.R) and checks the inputs before running. theta_deg is one detection
-# angle for every camera (simulated data) or one per camera (uploaded data).
+# The app supplies every setting (its constants live in app.R) and checks the
+# inputs before running. theta_deg is one detection angle for every camera
+# (simulated data) or one per camera (uploaded data).
 run_TTE <- function(y,
                     r_km,
                     camera_days,
@@ -625,15 +582,14 @@ run_TTE <- function(y,
                     density_prior,
                     camera_noise,
                     max_adapt_rounds,
+                    adapt_checks,
                     compute_WAIC,
                     status_callback) {
-  quiet_require("nimble")
-
   J <- length(y)
   r_km <- as.numeric(r_km)
   theta_deg <- rep_len(as.numeric(theta_deg), J)
 
-  code <- nimble::nimbleCode({
+  code <- nimbleCode({
     p_D ~ dbeta(D_a, D_b)  # density prior: D = D_max * p_D; Beta(1, 1) = Uniform(0, D_max)
     D <- D_max * p_D
     log_v ~ dnorm(log_v_mean, sd = log_v_sd)
@@ -679,8 +635,7 @@ run_TTE <- function(y,
   data_list <- list(y = as.numeric(y))
 
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
-  monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps",
-                "bp", "sum_obs", "sum_sim")
+  monitors <- c("D", "v", if (isTRUE(camera_noise)) "sd_eps", "bp")
 
   fit <- run_encounter_rate_model(
     method = "TTE",
@@ -695,6 +650,7 @@ run_TTE <- function(y,
     D_max = D_max,
     density_prior = density_prior,
     max_adapt_rounds = max_adapt_rounds,
+    adapt_checks = adapt_checks,
     compute_WAIC = compute_WAIC,
     status_callback = status_callback
   )
@@ -717,13 +673,13 @@ uscr_buffer_safety_factor <- 1.01
 # Circular home-range radius (km) containing proportion p of an animal's
 # activity, for a given sigma (km).
 uscr_home_range_radius_km <- function(sigma_km, p = uscr_buffer_p) {
-  sigma_km * sqrt(stats::qchisq(p, df = 2))
+  sigma_km * sqrt(qchisq(p, df = 2))
 }
 
 # The inverse: sigma (km) for a circular home range of area home_range_km2
 # (km^2) containing proportion p of an animal's activity.
 uscr_sigma_km_from_home_range <- function(home_range_km2, p) {
-  sqrt(home_range_km2 / pi) / sqrt(stats::qchisq(p, df = 2))
+  sqrt(home_range_km2 / pi) / sqrt(qchisq(p, df = 2))
 }
 
 # Suggested state-space buffer (m), given a sigma value (km) and a safety
@@ -741,7 +697,7 @@ uscr_buffer_from_sigma_km <- function(sigma_km, p = uscr_buffer_p,
 # sigma, then sizes the buffer from that guess via uscr_buffer_from_sigma_km().
 uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = uscr_buffer_p,
                                   multiplier = uscr_buffer_multiplier) {
-  sigma_q <- exp(log_sigma_mean + log_sigma_sd * stats::qnorm(p))
+  sigma_q <- exp(log_sigma_mean + log_sigma_sd * qnorm(p))
   uscr_buffer_from_sigma_km(sigma_q, p = p, multiplier = multiplier)
 }
 
@@ -753,22 +709,21 @@ uscr_default_buffer_m <- function(log_sigma_mean, log_sigma_sd, p = uscr_buffer_
 # of planar coordinates in km). This is the USCR state space implied by the
 # in_ss constraint in build_uscr_code(). Planar sf geometry, no CRS needed.
 uscr_buffered_union <- function(cam, buffer_km) {
-  quiet_require("sf")
-  pts <- sf::st_as_sf(
+  pts <- st_as_sf(
     data.frame(x = cam[, 1], y = cam[, 2]),
     coords = c("x", "y")
   )
-  sf::st_union(sf::st_buffer(pts, dist = buffer_km))
+  st_union(st_buffer(pts, dist = buffer_km))
 }
 
 uscr_buffered_area_km2 <- function(cam, buffer_km) {
-  as.numeric(sf::st_area(uscr_buffered_union(cam, buffer_km)))
+  as.numeric(st_area(uscr_buffered_union(cam, buffer_km)))
 }
 
 # Outline of the buffered state space as a data frame (x, y, group) for
 # plotting; `scale` converts km to the plot's units (1000 for meters).
 uscr_buffered_outline <- function(cam, buffer_km, scale = 1) {
-  xy <- sf::st_coordinates(uscr_buffered_union(cam, buffer_km))
+  xy <- st_coordinates(uscr_buffered_union(cam, buffer_km))
   grp_cols <- intersect(c("L1", "L2", "L3"), colnames(xy))
   data.frame(
     x = xy[, "X"] * scale,
@@ -802,9 +757,9 @@ uscr_state_space_and_area <- function(out, buffer_m) {
 # An informative prior is specified as a 95% interval for density
 # (animals/km^2). Beta(a, b) has two parameters, so both bounds can usually be
 # matched exactly; the prior's mean and median follow from the interval and
-# are reported back. Because M and the
-# state-space area can change between adaptive rounds, run_USCR() re-solves
-# the prior every round so the prior on density stays the same.
+# are reported back. Because M and the state-space area can change between
+# adaptive rounds, run_USCR() re-solves the prior every round so the prior on
+# density stays the same.
 #
 # Adapted from dbbinom(), bb_summary() and design_psi_prior() in the
 # Poisson_Lognormal_USCR_Simulation project, with these changes: the target is
@@ -813,25 +768,29 @@ uscr_state_space_and_area <- function(out, buffer_m) {
 # search is smooth (exact integer quantiles are piecewise constant); and misses
 # are measured as fractions of the interval's width.
 
+# A solved informative prior (USCR or REM/TTE) is flagged as off target when
+# either bound of its 95% interval misses the requested bound by more than
+# this fraction of the requested interval's width.
+density_prior_miss_tolerance <- 0.10
+
 # Beta-Binomial(M, a, b) probability mass function
 dbbinom <- function(k, M, a, b) {
   exp(lchoose(M, k) + lbeta(k + a, M - k + b) - lbeta(a, b))
 }
 
-# Mean, median, SD and (interpolated) 95% interval of Beta-Binomial(M, a, b)
+# Mean, median, and (interpolated) 95% interval of Beta-Binomial(M, a, b)
 bb_summary <- function(M, a, b) {
   k <- 0:M
   p <- dbbinom(k, M, a, b)
   p <- p / sum(p)
   cdf <- cumsum(p)
   q <- function(prob) {
-    stats::approx(cdf, k, xout = prob, ties = min, rule = 2)$y
+    approx(cdf, k, xout = prob, ties = min, rule = 2)$y
   }
   mean_N <- sum(k * p)
   list(
     mean   = mean_N,
     median = q(0.5),
-    sd     = sqrt(sum((k - mean_N)^2 * p)),
     ci     = c(lo = q(0.025), hi = q(0.975))
   )
 }
@@ -868,8 +827,7 @@ uscr_uniform_density_prior <- function(M, area_km2) {
 # bounds can usually be matched exactly; the prior's mean and median then
 # follow from the interval (for strongly skewed intervals they may not be
 # where a user expects, so they are reported back).
-design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M,
-                                      miss_tolerance = 0.10) {
+design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M) {
   msg <- check_density_prior(D_lo, D_hi)
   if (!is.null(msg)) stop(msg, call. = FALSE)
   M <- as.integer(M)
@@ -879,10 +837,17 @@ design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M,
 
   # N can never exceed M, so the upper bound must sit below M.
   if (N_hi >= M) {
-    stop(sprintf(paste0(
-      "The density prior's upper bound (%.3g animals/km² over a %.2f km² ",
-      "state space, about %.0f animals) needs M above %d. Increase M or lower ",
-      "the upper bound."), D_hi, area_km2, N_hi, M), call. = FALSE)
+    stop(
+      sprintf(
+        paste0(
+          "The density prior's upper bound (%.3g animals/km² over a %.2f km² ",
+          "state space, about %.0f animals) needs M above %d. Increase M or ",
+          "lower the upper bound."
+        ),
+        D_hi, area_km2, N_hi, M
+      ),
+      call. = FALSE
+    )
   }
 
   # Misses are measured as fractions of the interval's width, matching the
@@ -896,18 +861,21 @@ design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M,
   # scale). Start from the interval midpoint with the best concentration for
   # that mean, then search both together.
   p_start <- min(max(((N_lo + N_hi) / 2) / M, 1e-6), 1 - 1e-6)
-  k_start <- exp(stats::optimize(function(lk) {
+  k_start <- exp(optimize(function(lk) {
     miss_fn(bb_summary(M, p_start * exp(lk), (1 - p_start) * exp(lk)))
   }, interval = log(c(0.01, 1e6)))$minimum)
   obj <- function(par) {
-    p <- stats::plogis(par[1])
+    p <- plogis(par[1])
     k <- exp(par[2])
     miss_fn(bb_summary(M, p * k, (1 - p) * k))
   }
-  opt <- stats::optim(c(stats::qlogis(p_start), log(k_start)), obj,
-                      method = "Nelder-Mead",
-                      control = list(maxit = 2000, reltol = 1e-12))
-  p <- stats::plogis(opt$par[1])
+  opt <- optim(
+    c(qlogis(p_start), log(k_start)),
+    obj,
+    method = "Nelder-Mead",
+    control = list(maxit = 2000, reltol = 1e-12)
+  )
+  p <- plogis(opt$par[1])
   k <- exp(opt$par[2])
   a <- p * k
   b <- (1 - p) * k
@@ -935,8 +903,8 @@ design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M,
     target = c(lo = D_lo, hi = D_hi),
     achieved = achieved,
     miss = miss,
-    off_target = any(miss > miss_tolerance),
-    miss_tolerance = miss_tolerance
+    off_target = any(miss > density_prior_miss_tolerance),
+    miss_tolerance = density_prior_miss_tolerance
   )
 }
 
@@ -946,14 +914,17 @@ describe_uscr_density_prior <- function(design) {
   if (isTRUE(design$uniform)) {
     return(sprintf("Uniform (psi ~ Beta(1, 1); N uniform on 0 to M = %d)", design$M))
   }
-  sprintf(paste0(
-    "Informative. Target 95%% interval %.3g to %.3g animals/km²; achieved ",
-    "%.3g to %.3g (mean %.3g, median %.3g) with psi ~ Beta(%.3g, %.3g), M = %d, ",
-    "state-space area %.2f km²"),
+  sprintf(
+    paste0(
+      "Informative. Target 95%% interval %.3g to %.3g animals/km²; achieved ",
+      "%.3g to %.3g (mean %.3g, median %.3g) with psi ~ Beta(%.3g, %.3g), M = %d, ",
+      "state-space area %.2f km²"
+    ),
     design$target[["lo"]], design$target[["hi"]],
     design$achieved[["lo"]], design$achieved[["hi"]],
     design$achieved[["mean"]], design$achieved[["median"]],
-    design$a, design$b, design$M, design$area_km2)
+    design$a, design$b, design$M, design$area_km2
+  )
 }
 
 # -------------------------------------------------------------------
@@ -962,11 +933,10 @@ describe_uscr_density_prior <- function(design) {
 # This is the continuous counterpart of the USCR prior above (where N / M has
 # a Beta prior), so an informative interval gives all three models nearly the
 # same prior on density. a = b = 1 is D ~ Uniform(0, D_max). D_max is an
-# upper limit on density: it starts at 200 animals/km^2 under the uniform
-# prior, or at 2x the interval's upper bound under an informative prior, and
-# run_encounter_rate_model() doubles it (re-solving the prior) whenever the
-# posterior for D presses against it.
+# upper limit on density, and run_encounter_rate_model() doubles it
+# (re-solving the prior) whenever the posterior for D presses against it.
 
+# Starting D_max under an informative prior: twice the interval's upper bound.
 encounter_prior_start_D_max <- function(D_hi) {
   2 * D_hi
 }
@@ -978,28 +948,35 @@ uniform_beta_density_prior <- function(D_max) {
 # Solve for p_D ~ Beta(a, b) so that D = D_max * p_D has the requested 95%
 # interval. Both bounds can usually be matched exactly; the mean and median
 # follow from the interval and are reported back.
-design_beta_density_prior <- function(D_lo, D_hi, D_max, miss_tolerance = 0.10) {
+design_beta_density_prior <- function(D_lo, D_hi, D_max) {
   msg <- check_density_prior(D_lo, D_hi)
   if (!is.null(msg)) stop(msg, call. = FALSE)
   if (D_hi >= D_max) {
-    stop(sprintf("The density prior's upper bound (%.3g animals/km²) must be below D_max (%.3g).",
-                 D_hi, D_max), call. = FALSE)
+    stop(
+      sprintf(
+        "The density prior's upper bound (%.3g animals/km²) must be below D_max (%.3g).",
+        D_hi, D_max
+      ),
+      call. = FALSE
+    )
   }
 
   width <- D_hi - D_lo
-  q_of <- function(p, k) D_max * stats::qbeta(c(0.025, 0.975), p * k, (1 - p) * k)
+  q_of <- function(p, k) D_max * qbeta(c(0.025, 0.975), p * k, (1 - p) * k)
   miss_fn <- function(q) ((q[1] - D_lo) / width)^2 + ((q[2] - D_hi) / width)^2
 
   p_start <- min(max(((D_lo + D_hi) / 2) / D_max, 1e-6), 1 - 1e-6)
-  k_start <- exp(stats::optimize(function(lk) miss_fn(q_of(p_start, exp(lk))),
-                                 interval = log(c(0.01, 1e6)))$minimum)
-  opt <- stats::optim(
-    c(stats::qlogis(p_start), log(k_start)),
-    function(par) miss_fn(q_of(stats::plogis(par[1]), exp(par[2]))),
+  k_start <- exp(optimize(
+    function(lk) miss_fn(q_of(p_start, exp(lk))),
+    interval = log(c(0.01, 1e6))
+  )$minimum)
+  opt <- optim(
+    c(qlogis(p_start), log(k_start)),
+    function(par) miss_fn(q_of(plogis(par[1]), exp(par[2]))),
     method = "Nelder-Mead",
     control = list(maxit = 2000, reltol = 1e-12)
   )
-  p <- stats::plogis(opt$par[1])
+  p <- plogis(opt$par[1])
   k <- exp(opt$par[2])
   a <- p * k
   b <- (1 - p) * k
@@ -1009,7 +986,7 @@ design_beta_density_prior <- function(D_lo, D_hi, D_max, miss_tolerance = 0.10) 
     lo     = q[1],
     hi     = q[2],
     mean   = D_max * p,
-    median = D_max * stats::qbeta(0.5, a, b)
+    median = D_max * qbeta(0.5, a, b)
   )
   miss <- c(lo = abs(q[1] - D_lo) / width, hi = abs(q[2] - D_hi) / width)
 
@@ -1021,8 +998,8 @@ design_beta_density_prior <- function(D_lo, D_hi, D_max, miss_tolerance = 0.10) 
     target = c(lo = D_lo, hi = D_hi),
     achieved = achieved,
     miss = miss,
-    off_target = any(miss > miss_tolerance),
-    miss_tolerance = miss_tolerance
+    off_target = any(miss > density_prior_miss_tolerance),
+    miss_tolerance = density_prior_miss_tolerance
   )
 }
 
@@ -1031,14 +1008,17 @@ describe_beta_density_prior <- function(design) {
   if (isTRUE(design$uniform)) {
     return(sprintf("Uniform (D ~ Uniform(0, D_max), D_max = %.3g animals/km²)", design$D_max))
   }
-  sprintf(paste0(
-    "Informative. Target 95%% interval %.3g to %.3g animals/km²; achieved ",
-    "%.3g to %.3g (mean %.3g, median %.3g) with D = D_max * Beta(%.3g, %.3g), ",
-    "D_max = %.3g"),
+  sprintf(
+    paste0(
+      "Informative. Target 95%% interval %.3g to %.3g animals/km²; achieved ",
+      "%.3g to %.3g (mean %.3g, median %.3g) with D = D_max * Beta(%.3g, %.3g), ",
+      "D_max = %.3g"
+    ),
     design$target[["lo"]], design$target[["hi"]],
     design$achieved[["lo"]], design$achieved[["hi"]],
     design$achieved[["mean"]], design$achieved[["median"]],
-    design$a, design$b, design$D_max)
+    design$a, design$b, design$D_max
+  )
 }
 
 # Plot the density priors for REM/TTE (curve) and, if available, USCR (bars:
@@ -1046,9 +1026,7 @@ describe_beta_density_prior <- function(design) {
 # animals/km^2 so both are on the same scale), with the target 95% interval
 # (dashed lines).
 plot_density_priors <- function(beta_design, uscr_design = NULL) {
-  quiet_require("ggplot2")
-
-  x_max <- beta_design$D_max * stats::qbeta(0.9995, beta_design$a, beta_design$b)
+  x_max <- beta_design$D_max * qbeta(0.9995, beta_design$a, beta_design$b)
   if (!is.null(uscr_design)) {
     k <- 0:uscr_design$M
     p <- dbbinom(k, uscr_design$M, uscr_design$a, uscr_design$b)
@@ -1064,37 +1042,40 @@ plot_density_priors <- function(beta_design, uscr_design = NULL) {
   x <- seq(0, x_max, length.out = 400)
   beta_df <- data.frame(
     D = x,
-    dens = stats::dbeta(x / beta_design$D_max, beta_design$a, beta_design$b) / beta_design$D_max,
+    dens = dbeta(x / beta_design$D_max, beta_design$a, beta_design$b) / beta_design$D_max,
     model = "REM & TTE"
   )
   beta_df <- beta_df[is.finite(beta_df$dens), ]
 
   colors <- c("REM & TTE" = "#8C4F2D", "USCR" = "#4F6FA3")
-  fig <- ggplot2::ggplot()
+  fig <- ggplot()
   if (!is.null(uscr_design)) {
     fig <- fig +
-      ggplot2::geom_col(
+      geom_col(
         data = uscr_df,
-        ggplot2::aes(x = D, y = dens, fill = model),
+        aes(x = D, y = dens, fill = model),
         width = 1.02 / uscr_design$area_km2,  # slight overlap avoids hairline gaps
         position = "identity"
       ) +
-      ggplot2::scale_fill_manual(values = c("USCR" = "#B9C6DF"), name = NULL)
+      scale_fill_manual(values = c("USCR" = "#B9C6DF"), name = NULL)
   }
   fig <- fig +
-    ggplot2::geom_line(data = beta_df, ggplot2::aes(x = D, y = dens, color = model), linewidth = 1) +
-    ggplot2::scale_color_manual(values = colors, name = NULL) +
-    ggplot2::theme_minimal() +
-    ggplot2::theme(legend.position = "top") +
-    ggplot2::labs(
+    geom_line(data = beta_df, aes(x = D, y = dens, color = model), linewidth = 1) +
+    scale_color_manual(values = colors, name = NULL) +
+    theme_minimal() +
+    theme(legend.position = "top") +
+    labs(
       x = "Density (animals/km²)",
       y = "Prior density",
       title = "Prior on density implied by your interval",
       subtitle = "Dashed lines: your 95% interval."
     )
   if (!is.null(beta_design$target)) {
-    fig <- fig + ggplot2::geom_vline(xintercept = beta_design$target[c("lo", "hi")],
-                                     color = "firebrick", linetype = "dashed")
+    fig <- fig + geom_vline(
+      xintercept = beta_design$target[c("lo", "hi")],
+      color = "firebrick",
+      linetype = "dashed"
+    )
   }
   fig
 }
@@ -1107,9 +1088,7 @@ plot_density_priors <- function(beta_design, uscr_design = NULL) {
 # with distance) is estimated from spatial contrast in detections across
 # cameras at different locations, so a single camera can't identify it.
 build_uscr_code <- function() {
-  quiet_require("nimble")
-
-  nimble::nimbleCode({
+  nimbleCode({
     log_sigma ~ dnorm(log_sigma_mean, sd = log_sigma_sd)
     log_lam_0 ~ dnorm(log_lam0_mean, sd = log_lam0_sd)
     psi ~ dbeta(psi_a, psi_b)  # prior on N (and density); Beta(1, 1) = uniform
@@ -1210,8 +1189,8 @@ make_uscr_inits <- function(constants) {
 
   idx <- sample.int(Jloc, Mloc, replace = TRUE)
   hrc <- cbind(
-    cam[idx, 1] + stats::runif(Mloc, -0.01, 0.01),
-    cam[idx, 2] + stats::runif(Mloc, -0.01, 0.01)
+    cam[idx, 1] + runif(Mloc, -0.01, 0.01),
+    cam[idx, 2] + runif(Mloc, -0.01, 0.01)
   )
 
   list(hrc = hrc)
@@ -1222,7 +1201,6 @@ safe_rhat_max <- function(samples_list) {
     return(NA_real_)
   }
 
-  quiet_require("MCMCvis")
   diag <- tryCatch(
     MCMCvis::MCMCsummary(samples_list),
     error = function(e) NULL
@@ -1304,14 +1282,14 @@ summarize_vs_truth <- function(fit, truth) {
     draws <- extract_param_draws(fit$samples_all, param_name)
     if (is.null(draws) || !length(draws)) return(NULL)
 
-    q <- stats::quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+    q <- quantile(draws, c(0.025, 0.975), na.rm = TRUE)
     data.frame(
       Parameter    = param_name,
       Truth        = true_val,
       Mean         = mean(draws, na.rm = TRUE),
-      Median       = stats::median(draws, na.rm = TRUE),
+      Median       = median(draws, na.rm = TRUE),
       `Lower 2.5%` = q[[1]],
-      `Upper 97.5%`= q[[2]],
+      `Upper 97.5%` = q[[2]],
       Covered      = true_val >= q[[1]] && true_val <= q[[2]],
       check.names  = FALSE
     )
@@ -1324,12 +1302,17 @@ summarize_vs_truth <- function(fit, truth) {
 # Main USCR wrapper
 # -------------------------------------------------------------------
 # Fits USCR, then reruns it while any check fails, up to max_adapt_rounds
-# rounds: iterations, burn-in, and thinning double if Rhat is above
-# rhat_target; M doubles if the posterior for N presses against it; and the
-# state-space buffer grows if it is too small for the largest posterior sigma.
-
-# The app supplies every setting without a default here (its constants live
-# in app.R). The checks' thresholds and the buffer rule keep their defaults.
+# rounds: iterations, burn-in, and thinning double if the largest Rhat is
+# above adapt_checks$rhat_max; M doubles if the posterior probability that N
+# exceeds adapt_checks$limit_fraction of M is above adapt_checks$limit_prob;
+# and the state-space buffer grows if it is too small for the largest
+# posterior sigma (the buffer rule at the top of the USCR section).
+#
+# The app supplies every setting (its constants live in app.R). M is the
+# starting M; under an informative density prior, each round raises M if
+# needed so the prior fits below it (see uscr_prior_start_M()).
+# density_prior is list(uniform = TRUE) for the default uniform prior, or
+# list(uniform = FALSE, lo = , hi = ), a 95% interval in animals/km^2.
 run_USCR <- function(out,
                      camera_counts,
                      camera_days,
@@ -1348,79 +1331,15 @@ run_USCR <- function(out,
                      density_prior,
                      camera_noise,
                      max_adapt_rounds,
+                     adapt_checks,
                      compute_WAIC,
-                     status_callback,
-                     rhat_target = 1.1,
-                     M_check_fraction = 0.9,
-                     M_check_prob = 0.01,
-                     buffer_p = uscr_buffer_p,
-                     buffer_multiplier = uscr_buffer_multiplier,
-                     buffer_safety_factor = uscr_buffer_safety_factor) {
-
-  quiet_require("nimble")
-
-  build_uscr_result <- function(fit_objects,
-                                samples_list,
-                                samples_all,
-                                round_history,
-                                final_rhat_max,
-                                settings_M,
-                                settings_iter,
-                                settings_burnin,
-                                settings_thin,
-                                settings_buffer_m,
-                                area_km2 = NA_real_) {
-    list(
-      method = "USCR",
-      samples_list = samples_list,
-      samples_all = samples_all,
-      waic = extract_waic_mean(fit_objects),
-      fit_objects = fit_objects,
-      round_history = round_history,
-      final_rhat_max = final_rhat_max,
-      settings = list(
-        M = settings_M,
-        iter = settings_iter,
-        burnin = settings_burnin,
-        thin = settings_thin,
-        n_chains = n_chains,
-        compute_WAIC = compute_WAIC,
-        max_adapt_rounds = max_adapt_rounds,
-        rhat_target = rhat_target,
-        M_check_fraction = M_check_fraction,
-        M_check_prob = M_check_prob,
-        buffer_m = settings_buffer_m,
-        buffer_p = buffer_p,
-        buffer_multiplier = buffer_multiplier,
-        area_km2 = area_km2,
-        log_sigma_mean = log_sigma_mean,
-        log_sigma_sd = log_sigma_sd,
-        log_lam0_mean = log_lam0_mean,
-        log_lam0_sd = log_lam0_sd,
-        sd_eps_shape = sd_eps_shape,
-        sd_eps_rate = sd_eps_rate,
-        camera_noise = isTRUE(camera_noise)
-      )
-    )
-  }
-
-  iter <- as.integer(iter)
-  burnin <- as.integer(burnin)
-  thin <- as.integer(max(1, thin))
-  n_chains <- as.integer(max(1, n_chains))
-  M <- as.integer(max(1, M))
-
-  # density_prior: list(uniform = TRUE) for the default uniform prior, or
-  # list(uniform = FALSE, lo = , hi = ): a 95% interval in animals/km^2 (the
-  # app checks the interval before running).
+                     status_callback) {
   informative_prior <- identical(density_prior$uniform, FALSE)
-  prior_design <- NULL
 
   # sd_eps is only meaningful (and only monitored) with camera-level noise on.
   monitors <- c(
     "log_sigma", "log_lam_0", "psi", if (isTRUE(camera_noise)) "sd_eps",
-    "sigma", "lam_0", "N", "D",
-    "sum_obs", "sum_sim", "bp"
+    "sigma", "lam_0", "N", "D", "bp"
   )
 
   code <- build_uscr_code()
@@ -1429,20 +1348,14 @@ run_USCR <- function(out,
   current_iter <- iter
   current_burnin <- burnin
   current_thin <- thin
-  current_buffer_m <- as.numeric(buffer_m)
-  round_log <- list()
-  current_rhat <- Inf
+  current_buffer_m <- buffer_m
   round_i <- 0L
+  round_log <- list()
   hit_max_adapt_rounds <- FALSE
   unmet_checks <- character(0)
-  max_adapt_rounds <- as.integer(max(1, max_adapt_rounds))
   prev_elapsed_min <- NULL
   prev_iter <- NULL
   prev_M <- NULL
-  fit <- NULL
-  samples_list <- NULL
-  samples_all <- NULL
-  const <- NULL
 
   repeat {
     round_i <- round_i + 1L
@@ -1510,31 +1423,29 @@ run_USCR <- function(out,
 
     samples_list <- lapply(fit, `[[`, "samples")
     samples_all <- do.call(rbind, samples_list)
-    N_post <- samples_all[, "N"]
-    sigma_post_max <- max(samples_all[, "sigma"], na.rm = TRUE)
 
     current_rhat <- safe_rhat_max(samples_list)
-    # M is too small if the posterior for N presses against it.
-    M_too_small <- mean(N_post > M_check_fraction * const$M, na.rm = TRUE) > M_check_prob
-    converged <- is.na(current_rhat) || current_rhat <= rhat_target
+    converged <- is.na(current_rhat) || current_rhat <= adapt_checks$rhat_max
 
-    required_buffer_m <- uscr_buffer_from_sigma_km(sigma_post_max, p = buffer_p, multiplier = buffer_multiplier)
+    # M is too small if the posterior for N presses against it.
+    M_too_small <- mean(
+      samples_all[, "N"] > adapt_checks$limit_fraction * const$M,
+      na.rm = TRUE
+    ) > adapt_checks$limit_prob
+
+    required_buffer_m <- uscr_buffer_from_sigma_km(max(samples_all[, "sigma"], na.rm = TRUE))
     buffer_too_small <- is.finite(required_buffer_m) && current_buffer_m < required_buffer_m
 
     round_log[[round_i]] <- data.frame(
       round = round_i,
       M = const$M,
       buffer_m = current_buffer_m,
-      psi_a = prior_design$a,
-      psi_b = prior_design$b,
       niter = current_iter,
-      nburnin = current_burnin,
       thin = current_thin,
       n_chains = n_chains,
       rhat_max = current_rhat,
       M_too_small = M_too_small,
-      buffer_too_small = buffer_too_small,
-      stringsAsFactors = FALSE
+      buffer_too_small = buffer_too_small
     )
 
     prev_elapsed_min <- as.numeric(difftime(Sys.time(), round_started, units = "mins"))
@@ -1569,31 +1480,31 @@ run_USCR <- function(out,
       current_burnin <- current_burnin * 2L
       current_thin <- current_thin * 2L
     }
-
     if (M_too_small) {
       current_M <- current_M * 2L
     }
-
     if (buffer_too_small) {
-      current_buffer_m <- required_buffer_m * buffer_safety_factor
+      current_buffer_m <- required_buffer_m * uscr_buffer_safety_factor
     }
   }
 
-  result <- build_uscr_result(
-    fit_objects = fit,
-    samples_list = samples_list,
+  list(
     samples_all = samples_all,
+    waic = extract_waic_mean(fit),
     round_history = do.call(rbind, round_log),
     final_rhat_max = current_rhat,
-    settings_M = const$M,
-    settings_iter = current_iter,
-    settings_burnin = current_burnin,
-    settings_thin = current_thin,
-    settings_buffer_m = current_buffer_m,
-    area_km2 = const$area_km2
+    hit_max_adapt_rounds = hit_max_adapt_rounds,
+    unmet_checks = unmet_checks,
+    density_prior = prior_design,  # the prior used in the final round
+    settings = list(
+      M = const$M,
+      iter = current_iter,
+      burnin = current_burnin,
+      thin = current_thin,
+      n_chains = n_chains,
+      max_adapt_rounds = max_adapt_rounds,
+      buffer_m = current_buffer_m,
+      camera_noise = isTRUE(camera_noise)
+    )
   )
-  result$hit_max_adapt_rounds <- hit_max_adapt_rounds
-  result$unmet_checks <- unmet_checks
-  result$density_prior <- prior_design  # the prior used in the final round
-  result
 }

@@ -35,9 +35,7 @@ parse_timestamp_robust <- function(x, tz = "UTC") {
       orders = c(
         "Ymd HMS", "Ymd HM", "Ymd",
         "mdY HMS", "mdY HM", "mdY",
-        "mdy HMS", "mdy HM", "mdy",
-        "m/d/y HMS", "m/d/y HM", "m/d/y",
-        "m/d/Y HMS", "m/d/Y HM", "m/d/Y"
+        "mdy HMS", "mdy HM", "mdy"
       ),
       tz = tz,
       quiet = TRUE
@@ -63,6 +61,26 @@ parse_mdY_strict <- function(x) {
   out <- rep(as.Date(NA), length(x))
   out[ok] <- as.Date(x[ok], format = "%m/%d/%Y")
   out
+}
+
+# Rows of an uploaded table in which every column is blank (for example, rows
+# of commas that a spreadsheet can leave at the end of a CSV file).
+blank_rows <- function(df) {
+  blank <- rep(TRUE, nrow(df))
+  for (x in df) {
+    blank <- blank & (is.na(x) | trimws(as.character(x)) == "")
+  }
+  blank
+}
+
+# Check-log note about the blank rows removed from an uploaded file.
+blank_rows_note <- function(blank) {
+  rows <- which(blank)
+  paste0(
+    "ℹ️ Removed ", length(rows), " blank row(s): row(s) ",
+    paste(head(rows, 10), collapse = ", "),
+    if (length(rows) > 10) ", ..." else "", "."
+  )
 }
 
 # -------------------------------------------------------------------
@@ -110,8 +128,20 @@ clean_images_import <- function(images) {
   if (is.null(images) || !is.data.frame(images)) {
     stop("The images file could not be read as a table.", call. = FALSE)
   }
+
+  # Remove blank rows, keeping each row's position in the file so problems
+  # found below (including after multi-species rows are split) are reported
+  # by file row.
+  blank <- blank_rows(images)
+  images$.row <- seq_len(nrow(images))
+  if (any(blank)) {
+    message(blank_rows_note(blank))
+    images <- images[!blank, , drop = FALSE]
+  }
+
   if (nrow(images) == 0) {
     warning("⚠️ The images file has no rows.")
+    images$.row <- NULL
     return(images)
   }
   if (length(names(images)) == 0) {
@@ -143,7 +173,7 @@ clean_images_import <- function(images) {
   if (all(c("Species", "Sighting Count") %in% names(images))) {
     images$`Sighting Count` <- as.character(images$`Sighting Count`)
 
-    # tidyr::separate_rows() fails with an unhelpful message if a row's
+    # separate_rows() fails with an unhelpful message if a row's
     # Species and Sighting Count split into different numbers of pieces, so
     # check rows that use the pipe-delimited format first.
     has_pipe <- grepl("|", images$Species, fixed = TRUE) |
@@ -152,7 +182,7 @@ clean_images_import <- function(images) {
     if (any(has_pipe)) {
       species_n <- lengths(strsplit(images$Species[has_pipe], "|", fixed = TRUE))
       count_n <- lengths(strsplit(images$`Sighting Count`[has_pipe], "|", fixed = TRUE))
-      mismatch_rows <- which(has_pipe)[species_n != count_n]
+      mismatch_rows <- images$.row[has_pipe][species_n != count_n]
       if (length(mismatch_rows) > 0) {
         stop(
           "❌ Species and Sighting Count have a different number of ",
@@ -164,10 +194,7 @@ clean_images_import <- function(images) {
       }
     }
 
-    # Keep each row's position in the file so problems found after the split
-    # are reported by file row.
-    images$.row <- seq_len(nrow(images))
-    images <- tidyr::separate_rows(images, Species, `Sighting Count`, sep = "\\|")
+    images <- separate_rows(images, Species, `Sighting Count`, sep = "\\|")
 
     # Every row with a Species needs a numeric Sighting Count and a Cluster ID,
     # since each event's count is the largest Sighting Count among its images.
@@ -186,7 +213,7 @@ clean_images_import <- function(images) {
     rows_with <- function(flag) {
       rows <- unique(images$.row[has_species & flag])
       paste0(
-        paste(utils::head(rows, 10), collapse = ", "),
+        paste(head(rows, 10), collapse = ", "),
         if (length(rows) > 10) ", ..." else ""
       )
     }
@@ -197,7 +224,7 @@ clean_images_import <- function(images) {
       if (any(has_species & count_bad)) {
         paste0(
           "Sighting Count isn't a number in row(s) ", rows_with(count_bad), " (",
-          paste(utils::head(unique(count_text[has_species & count_bad]), 5), collapse = ", "),
+          paste(head(unique(count_text[has_species & count_bad]), 5), collapse = ", "),
           ")."
         )
       },
@@ -215,10 +242,10 @@ clean_images_import <- function(images) {
       )
     }
 
-    images$.row <- NULL
     images$`Sighting Count` <- as.numeric(count_text)
   }
 
+  images$.row <- NULL
   images
 }
 
@@ -234,9 +261,11 @@ check_deployments <- function(deployment, hemisphere = "Western",
 
   # Problems that block the upload are collected here and reported together
   # after the per-row checks: a missing Site Name; a missing, badly formatted,
-  # or reversed Start Date/End Date; a missing or zero Latitude/Longitude; and
-  # any Camera Malfunction Date problem. Every model depends on these fields:
-  # they set each camera's analysis window and location.
+  # or reversed Start Date/End Date; a missing or zero Latitude/Longitude; any
+  # Camera Malfunction Date problem; and a missing, non-numeric, or
+  # non-positive Detection Distance. Every model depends on the dates and
+  # coordinates, which set each camera's analysis window and location; REM
+  # and TTE also depend on Detection Distance.
   blocking_issues <- character()
 
   # ---- Column presence (hard stop) ----
@@ -278,14 +307,15 @@ check_deployments <- function(deployment, hemisphere = "Western",
     )
   }
 
+  # ---- Blank rows (removed) ----
+  # Rows in which every column is blank are skipped below and removed from
+  # the checked data. Row numbers in the messages are rows of the file.
+  blank <- blank_rows(deployment)
+  if (any(blank)) message(blank_rows_note(blank))
+
   # ---- Per-row checks ----
-  deployment_cols <- setdiff(required_cols, "Site Name")
-
   for (i in seq_len(nrow(deployment))) {
-    row_values <- deployment[i, deployment_cols]
-
-    # Skip rows where every required column other than Site Name is blank.
-    if (all(is.na(row_values) | row_values == "")) next
+    if (blank[i]) next
 
     # --- Site Name (blocking) ---
     # Any naming scheme is accepted, but a row with deployment data and no
@@ -362,6 +392,15 @@ check_deployments <- function(deployment, hemisphere = "Western",
         issues <- c(issues, msg)
         blocking_issues <- c(blocking_issues, msg)
       }
+    } else if (!is.na(cam_func) && tolower(cam_func) == "yes") {
+      val <- deployment$`Camera Malfunction Date`[i]
+      if (!is.na(val) && val != "") {
+        issues <- c(issues, paste0(
+          "⚠️ Camera Malfunction Date given in row ", i, " (", val,
+          ") but Camera Functioning = Yes, so the date is ignored. If the camera ",
+          "malfunctioned, set Camera Functioning = No."
+        ))
+      }
     }
 
     # --- Times (warning) ---
@@ -382,13 +421,23 @@ check_deployments <- function(deployment, hemisphere = "Western",
       }
     }
 
-    # --- Numeric fields (warning) ---
+    # --- Detection Distance (blocking) ---
+    # REM and TTE need a positive detection radius for every camera.
     dd_val <- deployment$`Detection Distance`[i]
-    if (is.na(dd_val) || dd_val == "") {
-      issues <- c(issues, paste("⚠️ Detection Distance missing in row", i))
-    } else if (is.na(suppressWarnings(as.numeric(dd_val)))) {
-      issues <- c(issues, paste0("⚠️ Non-numeric value in Detection Distance row ", i, ": ", dd_val))
+    dd_num <- suppressWarnings(as.numeric(dd_val))
+    msg <- if (is.na(dd_val) || dd_val == "") {
+      paste("❌ Detection Distance missing in row", i)
+    } else if (is.na(dd_num)) {
+      paste0("❌ Detection Distance isn't a number in row ", i, ": ", dd_val)
+    } else if (dd_num <= 0) {
+      paste0("❌ Detection Distance isn't positive in row ", i, ": ", dd_val)
     }
+    if (!is.null(msg)) {
+      issues <- c(issues, msg)
+      blocking_issues <- c(blocking_issues, msg)
+    }
+
+    # --- Other numeric fields (warning) ---
 
     if ("Camera Detection Angle" %in% names(deployment)) {
       theta_val <- deployment$`Camera Detection Angle`[i]
@@ -523,6 +572,8 @@ check_deployments <- function(deployment, hemisphere = "Western",
       "present and non-zero for every row; they're used to project camera locations ",
       "for every model. When Camera Functioning = No, Camera Malfunction Date must be ",
       "an MM/DD/YYYY date after Start Date and no later than End Date. ",
+      "Detection Distance must be a positive number (meters) for every row; REM and ",
+      "TTE depend on it. ",
       "After fixing the file, re-upload it.",
       call. = FALSE
     )
@@ -534,6 +585,9 @@ check_deployments <- function(deployment, hemisphere = "Western",
   } else {
     warning("⚠️ Issues found in deployments file:\n", paste(issues, collapse = "\n"))
   }
+
+  deployment <- deployment[!blank, , drop = FALSE]
+  deployment$`Detection Distance` <- suppressWarnings(as.numeric(deployment$`Detection Distance`))
   deployment
 }
 
@@ -576,27 +630,26 @@ check_images <- function(images, deployments) {
   # Cluster ID may be any format, and multiple rows legitimately share one
   # (e.g. burst photos, or a multi-species image split into one row per
   # species). It should, however, identify detections at a single camera.
-  # build_nps_model_inputs() groups by Site Name and Cluster ID together, so
-  # such clusters are kept separate per camera, but this usually signals a
-  # problem with how Cluster IDs were assigned upstream.
+  # detection_events() groups by Site Name and Cluster ID together, so such
+  # clusters are kept separate per camera, but this usually signals a problem
+  # with how Cluster IDs were assigned upstream.
   cluster_site_counts <- images |>
-    dplyr::filter(!is.na(`Cluster ID`) & `Cluster ID` != "") |>
-    dplyr::group_by(`Cluster ID`) |>
-    dplyr::summarize(n_sites = dplyr::n_distinct(`Site Name`), .groups = "drop")
+    filter(!is.na(`Cluster ID`) & `Cluster ID` != "") |>
+    group_by(`Cluster ID`) |>
+    summarize(n_sites = n_distinct(`Site Name`), .groups = "drop")
   bad_clusters <- cluster_site_counts$`Cluster ID`[cluster_site_counts$n_sites > 1]
   if (length(bad_clusters) > 0) {
     issues <- c(issues, paste0(
       "⚠️ ", length(bad_clusters), " Cluster ID value(s) appear at more than one Site Name: ",
-      paste(utils::head(bad_clusters, 10), collapse = ", "),
+      paste(head(bad_clusters, 10), collapse = ", "),
       if (length(bad_clusters) > 10) ", ..." else ""
     ))
   }
 
   # ---- Site Names must match the deployment file (hard stop) ----
-  # build_nps_model_inputs() joins image detections to deployment metadata by
-  # Site Name, so an image Site Name with no matching deployment row would
-  # pick up missing dates and coordinates and fail confusingly inside the
-  # model. Blank Site Names are reported separately.
+  # detection_events() matches images to cameras' analysis windows by Site
+  # Name, so images whose Site Name has no deployment row would be left out
+  # of the counts without notice. Blank Site Names are reported separately.
   missing_site_idx <- which(is.na(images$`Site Name`) | images$`Site Name` == "")
   bad_site_match <- setdiff(
     which(!images$`Site Name` %in% deployments$`Site Name`),
@@ -609,7 +662,7 @@ check_images <- function(images, deployments) {
       if (length(missing_site_idx) > 0) {
         paste0(
           "Images file has ", length(missing_site_idx), " row(s) with a blank Site Name ",
-          "(first few rows: ", paste(utils::head(missing_site_idx, 10), collapse = ", "), "). "
+          "(first few rows: ", paste(head(missing_site_idx, 10), collapse = ", "), "). "
         )
       } else {
         ""
@@ -617,7 +670,7 @@ check_images <- function(images, deployments) {
       if (length(bad_site_match) > 0) {
         paste0(
           "Images file has ", length(bad_site_match), " row(s) with Site Name value(s) not found ",
-          "in the deployment file: ", paste(utils::head(bad_site_names, 10), collapse = ", "),
+          "in the deployment file: ", paste(head(bad_site_names, 10), collapse = ", "),
           if (length(bad_site_names) > 10) ", ..." else "", ". "
         )
       } else {
@@ -644,7 +697,7 @@ check_images <- function(images, deployments) {
     sites_of <- function(idx) {
       sites <- unique(images$`Site Name`[idx])
       paste0(
-        paste(utils::head(sites, 10), collapse = ", "),
+        paste(head(sites, 10), collapse = ", "),
         if (length(sites) > 10) ", ..." else ""
       )
     }
@@ -663,7 +716,7 @@ check_images <- function(images, deployments) {
         paste0(
           "Timestamp can't be read in ", length(bad_ts_idx), " image(s) (Site Name: ",
           sites_of(bad_ts_idx), "; value(s): ",
-          paste(utils::head(bad_values, 5), collapse = ", "),
+          paste(head(bad_values, 5), collapse = ", "),
           if (length(bad_values) > 5) ", ..." else "", "). "
         )
       } else {
@@ -709,18 +762,18 @@ check_images <- function(images, deployments) {
 
   # Calendar date as shown on the timestamp (no time-zone shifting).
   img_dates <- images |>
-    dplyr::transmute(`Site Name`, img_date = as.Date(format(Timestamp, "%Y-%m-%d")))
+    transmute(`Site Name`, img_date = as.Date(format(Timestamp, "%Y-%m-%d")))
 
   window_check <- img_dates |>
-    dplyr::inner_join(deployment_windows, by = "Site Name") |>
-    dplyr::group_by(`Site Name`) |>
-    dplyr::summarize(
-      dep_start = dplyr::first(dep_start),
-      dep_end = dplyr::first(dep_end),
-      malfunction_date = dplyr::first(malfunction_date),
+    inner_join(deployment_windows, by = "Site Name") |>
+    group_by(`Site Name`) |>
+    summarize(
+      dep_start = first(dep_start),
+      dep_end = first(dep_end),
+      malfunction_date = first(malfunction_date),
       first_image = min(img_date),
       last_image = max(img_date),
-      n_images = dplyr::n(),
+      n_images = n(),
       n_before = sum(img_date < dep_start - grace_days, na.rm = TRUE),
       n_after = sum(img_date > dep_end + grace_days, na.rm = TRUE),
       # Images on or after the malfunction date but not past pickup (+ grace):
@@ -773,18 +826,18 @@ check_images <- function(images, deployments) {
   # Date, are reported there instead. The optional trim isn't applied here.
   windows <- analysis_windows(deployments)
   outside <- images |>
-    dplyr::filter(!is.na(Species), Species != "") |>
-    dplyr::group_by(`Site Name`, `Cluster ID`) |>
-    dplyr::summarize(start = min(Timestamp), .groups = "drop") |>
-    dplyr::inner_join(windows, by = "Site Name") |>
-    dplyr::inner_join(deployment_windows, by = "Site Name") |>
-    dplyr::mutate(start_date = as.Date(format(start, "%Y-%m-%d"))) |>
-    dplyr::filter(
+    filter(!is.na(Species), Species != "") |>
+    group_by(`Site Name`, `Cluster ID`) |>
+    summarize(start = min(Timestamp), .groups = "drop") |>
+    inner_join(windows, by = "Site Name") |>
+    inner_join(deployment_windows, by = "Site Name") |>
+    mutate(start_date = as.Date(format(start, "%Y-%m-%d"))) |>
+    filter(
       start_date >= dep_start - grace_days,
       start_date <= dep_end + grace_days
     ) |>
-    dplyr::group_by(`Site Name`, window_start, window_end) |>
-    dplyr::summarize(
+    group_by(`Site Name`, window_start, window_end) |>
+    summarize(
       n_early = sum(start < window_start),
       n_late = sum(start > window_end & !malfunction),
       .groups = "drop"
@@ -892,22 +945,22 @@ analysis_windows <- function(deployments, max_days = NULL) {
 # Species aren't events.
 detection_events <- function(images, deployments, max_days = NULL) {
   windows <- analysis_windows(deployments, max_days = max_days) |>
-    dplyr::select(`Site Name`, window_start, window_end)
+    select(`Site Name`, window_start, window_end)
 
   images |>
-    dplyr::filter(!is.na(Species), Species != "") |>
-    dplyr::group_by(`Site Name`, `Cluster ID`, Species) |>
-    dplyr::summarize(
-      n_images = dplyr::n(),
+    filter(!is.na(Species), Species != "") |>
+    group_by(`Site Name`, `Cluster ID`, Species) |>
+    summarize(
+      n_images = n(),
       count    = max(`Sighting Count`),
       start    = min(Timestamp),
       end      = max(Timestamp),
       .groups  = "drop"
     ) |>
-    dplyr::inner_join(windows, by = "Site Name") |>
-    dplyr::mutate(
+    inner_join(windows, by = "Site Name") |>
+    mutate(
       in_window = start >= window_start & start <= window_end,
-      days_in_window = dplyr::if_else(
+      days_in_window = if_else(
         in_window,
         as.numeric(difftime(pmin(end, window_end), start, units = "days")),
         0
@@ -925,8 +978,8 @@ detection_events <- function(images, deployments, max_days = NULL) {
 # subtracted here.
 summarize_deployments <- function(deployments, max_days = NULL) {
   analysis_windows(deployments, max_days = max_days) |>
-    dplyr::summarize(
-      n_cameras         = dplyr::n(),
+    summarize(
+      n_cameras         = n(),
       mean_days         = mean(days),
       total_camera_days = sum(days)
     )
@@ -937,23 +990,23 @@ summarize_deployments <- function(deployments, max_days = NULL) {
 # all as the models count them.
 summarize_species <- function(images, events) {
   image_counts <- images |>
-    dplyr::filter(!is.na(Species), Species != "") |>
-    dplyr::count(Species, name = "n_images")
+    filter(!is.na(Species), Species != "") |>
+    count(Species, name = "n_images")
 
   event_counts <- events |>
-    dplyr::filter(in_window) |>
-    dplyr::group_by(Species) |>
-    dplyr::summarize(
-      n_events = dplyr::n(),
+    filter(in_window) |>
+    group_by(Species) |>
+    summarize(
+      n_events = n(),
       animals  = sum(count),
-      cameras  = dplyr::n_distinct(`Site Name`),
+      cameras  = n_distinct(`Site Name`),
       .groups  = "drop"
     )
 
   image_counts |>
-    dplyr::left_join(event_counts, by = "Species") |>
-    dplyr::mutate(dplyr::across(c(n_events, animals, cameras), \(x) dplyr::coalesce(x, 0))) |>
-    dplyr::arrange(dplyr::desc(animals), Species)
+    left_join(event_counts, by = "Species") |>
+    mutate(across(c(n_events, animals, cameras), \(x) coalesce(x, 0))) |>
+    arrange(desc(animals), Species)
 }
 
 # Per camera, for one species: images in the file, plus detection events and
@@ -961,31 +1014,31 @@ summarize_species <- function(images, events) {
 # with zeros where the species wasn't detected.
 species_by_camera <- function(images, events, deployments, species_name) {
   image_counts <- images |>
-    dplyr::filter(Species == species_name) |>
-    dplyr::count(`Site Name`, name = "n_images")
+    filter(Species == species_name) |>
+    count(`Site Name`, name = "n_images")
 
   event_counts <- events |>
-    dplyr::filter(Species == species_name, in_window) |>
-    dplyr::group_by(`Site Name`) |>
-    dplyr::summarize(n_events = dplyr::n(), animals = sum(count), .groups = "drop")
+    filter(Species == species_name, in_window) |>
+    group_by(`Site Name`) |>
+    summarize(n_events = n(), animals = sum(count), .groups = "drop")
 
   deployments |>
-    dplyr::transmute(
+    transmute(
       `Site Name`,
       Latitude  = as.numeric(Latitude),
       Longitude = as.numeric(Longitude)
     ) |>
-    dplyr::left_join(image_counts, by = "Site Name") |>
-    dplyr::left_join(event_counts, by = "Site Name") |>
-    dplyr::mutate(dplyr::across(c(n_images, n_events, animals), \(x) dplyr::coalesce(x, 0)))
+    left_join(image_counts, by = "Site Name") |>
+    left_join(event_counts, by = "Site Name") |>
+    mutate(across(c(n_images, n_events, animals), \(x) coalesce(x, 0)))
 }
 
 # Animals counted per camera per day, for one species, by the date of each
 # event's first image (events inside the analysis windows only).
 species_by_day <- function(events, species_name) {
   events |>
-    dplyr::filter(Species == species_name, in_window) |>
-    dplyr::mutate(Date = as.Date(format(start, "%Y-%m-%d"))) |>
-    dplyr::group_by(`Site Name`, Date) |>
-    dplyr::summarize(animals = sum(count), .groups = "drop")
+    filter(Species == species_name, in_window) |>
+    mutate(Date = as.Date(format(start, "%Y-%m-%d"))) |>
+    group_by(`Site Name`, Date) |>
+    summarize(animals = sum(count), .groups = "drop")
 }

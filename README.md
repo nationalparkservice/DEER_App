@@ -39,7 +39,7 @@ When the app starts, it installs any missing packages. You can also install them
 ```r
 install.packages(c(
   "shiny", "bslib", "DT", "ggplot2", "dplyr", "tidyr",
-  "readr", "purrr", "stringr", "data.table",
+  "readr", "purrr",
   "leaflet", "ggrepel",
   "nimble", "MCMCvis", "lubridate", "sf", "tibble"
 ))
@@ -146,7 +146,7 @@ Required columns:
 - **Latitude / Longitude**: decimal degrees, WGS84 (standard GPS coordinates). Signs are corrected to match the hemispheres set in **Model settings**.
 - **Camera Functioning**: `Yes`/`No` (`TRUE`/`FALSE`, `T`/`F`, and `1`/`0` are also accepted).
 - **Camera Malfunction Date**: blank for cameras that didn't malfunction. If Camera Functioning is `No`, the first date whose data should be discarded (`MM/DD/YYYY`).
-- **Detection Distance**: effective detection radius (meters). REM and TTE need a positive value for every camera.
+- **Detection Distance**: effective detection radius (meters), a positive number for every camera. REM and TTE depend on it, so a missing, non-numeric, or non-positive value blocks the upload.
 
 Optional columns:
 
@@ -189,7 +189,6 @@ With camera-level noise turned on, each model adds a camera-level random effect,
 **A model won't run:**
 - Check that both uploads passed their checks on **Add your data**.
 - Check that a species is selected in **Model settings** and that data come from at least 2 cameras.
-- For REM and TTE, check that every camera has a positive Detection Distance.
 
 **A model reaches the adaptive-round limit without passing every check:**
 - Increase **Maximum adaptive rounds** in **Model settings** and rerun. The run-status panel shows which check failed.
