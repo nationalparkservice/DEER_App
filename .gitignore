@@ -2,3 +2,6 @@
 *.RData
 *.Rhistory
 *.DS_Store
+.Rproj.user/
+.Ruserdata
+rsconnect/
