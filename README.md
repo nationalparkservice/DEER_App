@@ -14,8 +14,8 @@ The DEER App fits three Bayesian models (USCR, REM, and TTE) to camera-trap data
 
 - **Three Bayesian models.** The app fits three models with NIMBLE:
   - **USCR** (Unmarked Spatial Capture-Recapture) estimates density from where and how many animals are counted across a camera array.
-  - **REM** (Random Encounter Model) converts how often animals pass a camera into density, correcting for movement speed and camera view geometry.
-  - **TTE** (Time-to-Event) converts how many animals each camera counts into density, using movement speed to measure camera time in viewshed-crossing time units and correcting for viewshed area.
+  - **REM** (Random Encounter Model) converts how often animals pass a camera into density, correcting for movement rate and camera view geometry.
+  - **TTE** (Time-to-Event) converts how many animals each camera counts into density, using movement rate to measure camera time in viewshed-crossing time units and correcting for viewshed area.
 - **Data checks.** Uploaded deployment and images files are checked for required columns, formats, and consistency. Errors and warnings are clearly described.
 - **Priors.** All priors are fully customizable, including informative prior distributions on density.
 - **Adaptive runs.** Each run checks convergence and reruns with adjusted settings until every check passes or the adaptive-round limit is reached.
@@ -80,7 +80,7 @@ The app's tabs are **About**, **Add your data**, **Data summary**, **Model setti
 
 ### Step 1: Add your data
 
-On the **Add your data** tab, upload a deployment CSV, then an images CSV (see [Data format requirements](#data-format-requirements)). Each upload is checked, and its check log lists any problems. By default, each camera's analysis window is trimmed to 56 days (24-hour periods) from its start date and time; you can change the number of days or turn the trim off. Cleaned copies of both files can be downloaded.
+On the **Add your data** tab, upload a deployment CSV, then an images CSV (see [Data format requirements](#data-format-requirements)). Each upload is checked, and its check log lists any problems. You can also trim each camera's analysis window to a set number of days (24-hour periods) from its start date and time; the trim is off by default and keeps 56 days when turned on. Cleaned copies of both files can be downloaded. To try the app, use the [example data](#example-data).
 
 ### Step 2: Review the data summary
 
@@ -90,7 +90,7 @@ The **Data summary** tab summarizes the uploaded data: camera-days and a map of 
 
 On the **Model settings** tab:
 
-- Choose the **species to analyze**.
+- Choose the **species to analyze**. Until you choose one, the app selects the first species in alphabetical order.
 - Set the **default detection angle**, used for cameras without a valid `Camera Detection Angle`, and the hemispheres used to correct Latitude and Longitude signs.
 - Set the **maximum adaptive rounds** per model run (6 by default).
 - Review the **priors**. The default priors are calibrated for white-tailed deer (*Odocoileus virginianus*), and results can be sensitive to them, so think about whether they suit your species and site. Switch to **Advanced** to set an informative density prior (a 95% interval shared by all three models), turn on camera-level noise, or change the other priors and the USCR state-space buffer.
@@ -103,9 +103,9 @@ Anything that changes the data the models are fit to (a new upload, the hemisphe
 
 ### Step 5: Compare and combine results
 
-The **Compare & combine** tab summarizes whichever models have been run on the uploaded data: posterior mean, median, and 95% credible interval of density, the probability that density exceeds a threshold you set, WAIC weights, and each model's posterior predictive check (failed checks are highlighted). With two or more models, it also shows model-averaged density. Download the plots (PNG) and posterior summaries for every parameter (CSV) from the same tab.
+The **Compare & combine** tab summarizes whichever models have been run on the uploaded data: posterior mean, median, and 95% credible interval of density, the probability that density exceeds a threshold you set, WAIC weights, and each model's posterior predictive check (failed checks are highlighted). With two or more models, it also shows model-averaged density. Download the plots (PNG) and posterior summaries for every parameter (CSV) from the same tab. The table, plot titles, and CSV name the species analyzed.
 
-<!-- TODO: add a screenshot of the Compare & combine tab (results table and interval plot) after running all three models on the example data. -->
+![The Compare & combine tab after fitting all three models to the example data, with camera-level noise turned on](images/compare_combine.png)
 
 ### Simulate data
 
@@ -116,25 +116,36 @@ The **Simulate data** tab is a study-design tool. Choose a camera grid, spacing,
 - WAIC isn't computed for simulated data, so simulations don't appear on **Compare & combine**.
 - Each click simulates one dataset per model, so try several random seeds before drawing conclusions about a design.
 
+## Example data
+
+The `example_dataset/` folder has a deployment file (`SAGA_2026_Deployments.csv`) and an images file (`SAGA_2026_Images.csv`) for trying the app. They come from [Saint-Gaudens National Historical Park](https://www.nps.gov/saga/) (park code SAGA) in Cornish, New Hampshire. The park preserves the home, studios, and gardens of the sculptor Augustus Saint-Gaudens (1848–1907), once the center of the Cornish Art Colony, along with natural areas that visitors explore on its hiking trails.
+
+The survey ran 16 cameras from December 8, 2025, to March 26, 2026. Upload the deployment file, then the images file, on **Add your data**, and choose **Deer** as the species to analyze in **Model settings**. Three cameras malfunctioned before they were picked up, so the check logs also show how the app handles a Camera Malfunction Date.
+
 ## File structure
 
 ```
 DEER_App/
-├── app.R                    # Main Shiny app (UI and server)
+├── app.R                           # Main Shiny app (UI and server)
 ├── R/
-│   ├── sim_and_models.R     # Simulation and model functions (USCR, REM, TTE)
-│   └── data_checks.R        # Data checks and summary functions
+│   ├── sim_and_models.R            # Simulation and model functions (USCR, REM, TTE)
+│   └── data_checks.R               # Data checks and summary functions
+├── example_dataset/
+│   ├── SAGA_2026_Deployments.csv   # Example deployment file
+│   └── SAGA_2026_Images.csv        # Example images file
+├── images/
+│   └── compare_combine.png         # Screenshot of the Compare & combine tab, for this README
 ├── www/
-│   └── deer_app_banner.png  # Banner shown at the top of the app and this README
-├── README.md                # This file
-└── deer_app_v2.Rproj        # RStudio project file
+│   └── deer_app_banner.png         # Banner shown at the top of the app and this README
+├── README.md                       # This file
+└── deer_app.Rproj                  # RStudio project file
 ```
 
 ## Data format requirements
 
 The app expects data formatted following [TrapTagger](https://wildeyeconservation.org/traptagger/), with the exact column names below. Files from other tagging workflows can usually be renamed to match. The **Add your data** tab has full details, including the checks that block an upload.
 
-<!-- TODO: add example deployment and images CSVs (e.g., in an example_data/ folder), describe them here, and add the folder to the file structure. -->
+The [example data](#example-data) follow this format.
 
 ### Deployment file
 
@@ -152,7 +163,7 @@ Optional columns:
 
 - **Site**, **Camera ID**, **SD Card ID**, **Camera Model**: for recordkeeping.
 - **Camera Detection Angle**: full detection angle in degrees, from 5 to 90. A blank or out-of-range value uses the default angle from **Model settings**, with a warning.
-- **Camera Height**: meters.
+- **Camera Height**: in any unit (the models don't use it).
 - **Camera Orientation**: cardinal direction (`N`, `NE`, …) or 0–359 degrees.
 
 ### Images file
@@ -180,7 +191,7 @@ With camera-level noise turned on, each model adds a camera-level random effect,
 
 ## Performance notes
 
-- Runs are adaptive. After each round, iterations, burn-in, and thinning double if R̂ is above 1.1. M (USCR) or D<sub>max</sub> (REM, TTE) doubles if the posterior presses against it. For USCR, the state-space buffer grows if it is too small. A run stops when every check passes or the adaptive-round limit is reached.
+- Runs are adaptive. After each round, iterations, burn-in, and thinning double if $\hat{R}$ is above 1.1. M (USCR) or D<sub>max</sub> (REM, TTE) doubles if the posterior presses against it. For USCR, the state-space buffer grows if it is too small. A run stops when every check passes or the adaptive-round limit is reached.
 - USCR is the slowest model, especially at high density or with many cameras, since its run time grows roughly with the square of M. REM and TTE are usually much faster.
 - MCMC settings (2 chains; starting iterations, burn-in, and thinning) are fixed. Only the maximum adaptive rounds can be changed.
 
@@ -194,7 +205,8 @@ With camera-level noise turned on, each model adds a camera-level random effect,
 - Increase **Maximum adaptive rounds** in **Model settings** and rerun. The run-status panel shows which check failed.
 
 **A posterior predictive check fails:**
-- Try turning on camera-level noise (**Model settings > Advanced > Priors: Camera-level noise**).
+- If the Bayesian p-value is low (the counts vary more than the model expects), try turning on camera-level noise (**Model settings > Advanced > Priors: Camera-level noise (all models)**).
+- If it is high (the counts vary less than the model expects), camera-level noise won't help; interpret that model's estimates with caution.
 
 **Memory issues:**
 - Use a smaller dataset or simulation for quick checks.

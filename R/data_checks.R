@@ -63,6 +63,24 @@ parse_mdY_strict <- function(x) {
   out
 }
 
+# Standardize uploaded column names: drop trailing dots, trim leading and
+# trailing whitespace (including non-breaking spaces), and collapse internal
+# runs of whitespace to one space. Used for both uploaded files.
+clean_column_names <- function(nm) {
+  nm <- gsub("\\.+$", "", nm)
+  nm <- gsub("^[\\s\\p{Z}]+|[\\s\\p{Z}]+$", "", nm, perl = TRUE)
+  gsub("[\\s\\p{Z}]+", " ", nm, perl = TRUE)
+}
+
+# Drop columns that have no name and no values, such as the empty columns a
+# spreadsheet can leave at the right edge of a CSV file. read_csv() names an
+# unnamed column "...<position>".
+drop_blank_unnamed_columns <- function(df) {
+  unnamed <- grepl("^\\.\\.\\.[0-9]+$", names(df))
+  empty <- vapply(df, \(x) all(is.na(x) | trimws(as.character(x)) == ""), logical(1))
+  df[, !(unnamed & empty), drop = FALSE]
+}
+
 # Rows of an uploaded table in which every column is blank (for example, rows
 # of commas that a spreadsheet can leave at the end of a CSV file).
 blank_rows <- function(df) {
@@ -88,14 +106,8 @@ blank_rows_note <- function(blank) {
 # -------------------------------------------------------------------
 
 clean_deployment_import <- function(deployments) {
-  # Standardize column names: drop trailing dots, trim whitespace (including
-  # non-breaking spaces), and collapse internal runs of whitespace.
-  nm <- names(deployments)
-  nm <- gsub("\\.+$", "", nm)
-  nm <- gsub("[\\s\\p{Z}]+$", "", nm, perl = TRUE)
-  nm <- gsub("^[\\s\\p{Z}]+", "", nm, perl = TRUE)
-  nm <- gsub("[\\s\\p{Z}]+", " ", nm, perl = TRUE)
-  names(deployments) <- trimws(nm)
+  deployments <- drop_blank_unnamed_columns(deployments)
+  names(deployments) <- clean_column_names(names(deployments))
 
   # Trim leading/trailing whitespace from all character columns.
   deployments[] <- lapply(deployments, function(x) {
@@ -128,6 +140,7 @@ clean_images_import <- function(images) {
   if (is.null(images) || !is.data.frame(images)) {
     stop("The images file could not be read as a table.", call. = FALSE)
   }
+  images <- drop_blank_unnamed_columns(images)
 
   # Remove blank rows, keeping each row's position in the file so problems
   # found below (including after multi-species rows are split) are reported
@@ -148,8 +161,7 @@ clean_images_import <- function(images) {
     stop("The images file has no column names.", call. = FALSE)
   }
 
-  # Standardize column names.
-  names(images) <- trimws(gsub("\\.+$", "", names(images)))
+  names(images) <- clean_column_names(names(images))
 
   # Parse Timestamp (dropping an explicit " UTC" suffix). The column is only
   # converted when every non-blank value parses; otherwise it is left as text
@@ -581,9 +593,9 @@ check_deployments <- function(deployment, hemisphere = "Western",
 
   # ---- Output ----
   if (length(issues) == 0) {
-    message("✅ Deployments file is formatted correctly!")
+    message("✅ Deployment file is formatted correctly!")
   } else {
-    warning("⚠️ Issues found in deployments file:\n", paste(issues, collapse = "\n"))
+    warning("⚠️ Issues found in deployment file:\n", paste(issues, collapse = "\n"))
   }
 
   deployment <- deployment[!blank, , drop = FALSE]
@@ -864,7 +876,7 @@ check_images <- function(images, deployments) {
 
   # ---- Output ----
   if (length(issues) == 0) {
-    message("✅ Images file is formatted correctly and all Site Names match deployments!")
+    message("✅ Images file is formatted correctly and all Site Names match the deployment file!")
   } else {
     warning("⚠️ Issues found in images file:\n", paste(issues, collapse = "\n"))
   }

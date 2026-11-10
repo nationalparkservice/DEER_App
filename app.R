@@ -1,5 +1,3 @@
-# Models run via run_USCR(), run_REM(), run_TTE() in R/sim_and_models.R
-
 # -------------------------------------------------------------------
 # Packages
 # -------------------------------------------------------------------
@@ -89,13 +87,14 @@ adapt_checks <- list(
 )
 
 # -------------------------------------------------------------------
-# Default priors (used for the Advanced inputs' starting values, and always
-# used in Default mode)
+# Defaults
 # -------------------------------------------------------------------
 # REM/TTE upper limit on density under the uniform prior (animals/km^2). Not
 # user-facing: the app doubles it if the posterior for D presses against it.
 rem_tte_start_D_max <- 200
 
+# Default priors: the Advanced inputs' starting values, always used in
+# Default mode.
 advanced_prior_defaults <- list(
   log_v_mean     = 1.130,
   log_v_sd       = 0.3372,
@@ -111,7 +110,8 @@ advanced_prior_defaults <- list(
 # Camera Detection Angle value.
 default_theta_deg <- 55
 
-# Default deployment trim (days).
+# Number of days to keep when the deployment trim is turned on (the trim is
+# off by default).
 default_trim_days <- 56
 
 # Bayesian p-values (posterior predictive check) inside this range pass; a
@@ -121,11 +121,26 @@ ppc_pass_range <- c(0.05, 0.95)
 # Decimal places for model results.
 result_digits <- 3
 
+# Starting density threshold (animals/km²) for P(D > threshold) on the
+# Compare & combine tab.
+default_density_threshold <- 8
+
+# R-hat for MathJax inside markdown(): markdown turns "\\(" into "\(", which
+# MathJax then renders.
+rhat_md <- "\\\\(\\hat{R}\\\\)"
+
 # Format a number with a fixed number of decimal places ("NA" if it is
 # missing or not finite).
 format_fixed <- function(x, digits = 2) {
   if (length(x) != 1 || !is.finite(x)) return("NA")
   format(round(x, digits), nsmall = digits, trim = TRUE)
+}
+
+# Show every number in a results table (a datatable() of df) with
+# result_digits decimal places. Unlike round(), this keeps trailing zeros
+# (31.470, not 31.47); missing values stay blank.
+format_result_columns <- function(dt, df) {
+  formatRound(dt, names(df)[vapply(df, is.numeric, logical(1))], digits = result_digits)
 }
 
 # Round a USCR state-space buffer (m) up to the nearest 50 m.
@@ -171,19 +186,6 @@ default_v_interval_km_day <- exp(
 # Model summaries and model averaging
 # -------------------------------------------------------------------
 
-# Posterior summary of density (animals/km²) and WAIC, for a model tab.
-summarize_method <- function(fit) {
-  D_km2 <- fit$samples_all[, "D"]
-
-  list(
-    mean_km2   = mean(D_km2),
-    median_km2 = median(D_km2),
-    q2.5_km2   = quantile(D_km2, 0.025),
-    q97.5_km2  = quantile(D_km2, 0.975),
-    waic       = fit$waic
-  )
-}
-
 # Mixture of the models' posteriors: each draw comes from model (column) k
 # with probability weights[k], as a random posterior draw from that model.
 sample_mixture <- function(draws, weights) {
@@ -196,16 +198,17 @@ sample_mixture <- function(draws, weights) {
 
 # Combines posterior draws of density across the models in `fits`, a named
 # list in which models not run yet are NULL. Returns NULL if no model has been
-# run; otherwise the fits that have been, their WAIC weights (NA if any
-# model's WAIC is missing), and a matrix of density draws with one column per
-# model followed by one column per model average.
+# run; otherwise the fits that have been, the species they were fit to
+# (results are cleared when the species changes, so the fits share one), their
+# WAIC weights (NA if any model's WAIC is missing), and a matrix of density
+# draws with one column per model followed by one column per model average.
 prepare_combo_density_data <- function(fits) {
   fits <- compact(fits)
   if (!length(fits)) return(NULL)
 
   # WAIC weights: w_k = exp(-delta_k / 2) / sum_j exp(-delta_j / 2), where
   # delta_k = WAIC_k - min(WAIC).
-  waic <- vapply(fits, function(fit) fit$waic, numeric(1))
+  waic <- vapply(fits, \(fit) fit$waic, numeric(1))
   weights <- if (length(fits) == 1L) {
     1
   } else if (all(is.finite(waic))) {
@@ -220,7 +223,7 @@ prepare_combo_density_data <- function(fits) {
   # every model, which holds because all three models start from the same
   # MCMC settings, and adaptive reruns double iterations, burn-in, and
   # thinning together, leaving (iterations - burn-in) / thinning unchanged.
-  draws <- lapply(fits, function(fit) sort(fit$samples_all[, "D"]))
+  draws <- lapply(fits, \(fit) sort(fit$samples_all[, "D"]))
   stopifnot(length(unique(lengths(draws))) == 1L)
   draws <- do.call(cbind, draws)
 
@@ -239,7 +242,12 @@ prepare_combo_density_data <- function(fits) {
     }
   }
 
-  list(fits = fits, weights = weights, density_est = density_est)
+  list(
+    fits = fits,
+    species = fits[[1]]$species,
+    weights = weights,
+    density_est = density_est
+  )
 }
 
 # Density estimates, P(D > density_threshold), WAIC weights, and Bayesian
@@ -263,14 +271,14 @@ build_combo_table <- function(combo_data, density_threshold, ppc_pass_range) {
     `Median density (animals/km²)` = column_stat(median),
     `Lower 2.5%` = column_stat(quantile, probs = 0.025),
     `Upper 97.5%` = column_stat(quantile, probs = 0.975),
-    !!threshold_label := column_stat(function(x) mean(x > density_threshold)),
+    !!threshold_label := column_stat(\(x) mean(x > density_threshold)),
     `WAIC weight` = c(combo_data$weights, rep(NA_real_, n_averages)),
     `Bayesian p-value` = c(
-      vapply(ppc, function(x) x$p, numeric(1), USE.NAMES = FALSE),
+      vapply(ppc, \(x) x$p, numeric(1), USE.NAMES = FALSE),
       rep(NA_real_, n_averages)
     ),
     failed_check = c(
-      vapply(ppc, function(x) x$fail, logical(1), USE.NAMES = FALSE),
+      vapply(ppc, \(x) x$fail, logical(1), USE.NAMES = FALSE),
       rep(FALSE, n_averages)
     )
   )
@@ -383,20 +391,20 @@ posterior_summary_df <- function(fit) {
     mutate(
       across(
         c(median, q025, q975),
-        function(x) if_else(parameter == "bp", NA_real_, x)
+        \(x) if_else(parameter == "bp", NA_real_, x)
       ),
-      across(where(is.numeric), function(x) round(x, result_digits))
+      across(where(is.numeric), \(x) round(x, result_digits))
     )
 }
 
 # Explains the posterior summary CSV, below its download button.
 posterior_param_legend <- function() {
   markdown(paste(
-    "**Posterior summary CSV:** one row per model and parameter, with the posterior mean, median, and 2.5% and 97.5% quantiles (`q025`, `q975`).",
+    "**Posterior summary CSV:** one row per model and parameter, with the species analyzed and the posterior mean, median, and 2.5% and 97.5% quantiles (`q025`, `q975`).",
     "",
     "- `D_km2` — density (animals/km²).",
     "- `v` — REM and TTE only: daily movement rate (km/day).",
-    "- `sd_eps` (σ<sub>ε</sub>) — standard deviation of the camera-level random effects. Only included when camera-level noise is turned on (**Model settings > Advanced > Priors: Camera-level noise**).",
+    "- `sd_eps` (σ<sub>ε</sub>) — standard deviation of the camera-level random effects. Only included when camera-level noise is turned on (**Model settings > Advanced > Priors: Camera-level noise (all models)**).",
     "- `N` — USCR only: abundance, the number of animals in the state space.",
     "- `psi` (ψ) — USCR only: probability that an augmented individual is part of the real population. Its prior sets the prior on abundance and density.",
     "- `sigma` (σ) — USCR only: spatial scale parameter (km), related to home-range size and how quickly detection falls with distance.",
@@ -573,7 +581,7 @@ run_context_lines <- function(d, model, model_lines, limit_setting, max_adapt_ro
       model, " reruns automatically, up to ", max_adapt_rounds,
       " rounds in all, at the same chain count shown above. ",
       "Each check that fails triggers its own change: iterations, burn-in, and ",
-      "thinning double when the maximum Rhat is above ", adapt_checks$rhat_max, "; ",
+      "thinning double when the maximum R-hat is above ", adapt_checks$rhat_max, "; ",
       if (is_uscr) "M" else "D_max",
       " doubles when the posterior probability that ",
       if (is_uscr) "N" else "D",
@@ -583,8 +591,8 @@ run_context_lines <- function(d, model, model_lines, limit_setting, max_adapt_ro
       if (is_uscr) {
         paste0(
           "; and the state-space buffer grows when it is less than ",
-          uscr_buffer_multiplier, "\u00d7 the ", 100 * uscr_buffer_p,
-          "% home-range radius at the largest posterior \u03c3"
+          uscr_buffer_multiplier, "× the ", 100 * uscr_buffer_p,
+          "% home-range radius at the largest posterior σ"
         )
       },
       "."
@@ -653,11 +661,11 @@ friendly_model_error <- function(model, data_label, error_text) {
   }
 
   if (identical(model, "USCR")) {
-    tips <- c(tips, "USCR doubles iterations, burn-in, and thinning automatically when Rhat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior σ is larger than the buffer safely covers, so longer runs can be expected when any check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable). An informative density prior (Model settings > Advanced > Priors: Density (all models)) can also keep M, and so run time, from growing.")
+    tips <- c(tips, "USCR doubles iterations, burn-in, and thinning automatically when R-hat is too high, doubles M when the posterior for abundance presses against it, and grows the state-space buffer when the posterior σ is larger than the buffer safely covers, so longer runs can be expected when any check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable). An informative density prior (Model settings > Advanced > Priors: Density (all models)) can also keep M, and so run time, from growing.")
   }
   if (model %in% c("REM", "TTE")) {
     tips <- c(tips, paste0(model, " expects per-camera animals counted, camera-days, and detection distances."))
-    tips <- c(tips, paste0(model, " doubles iterations, burn-in, and thinning automatically when Rhat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable)."))
+    tips <- c(tips, paste0(model, " doubles iterations, burn-in, and thinning automatically when R-hat is too high, and doubles D_max when the posterior for density presses against it, so longer runs can be expected when either check fails. To cap run time, lower 'Maximum adaptive rounds' in Model settings (results from a run that stops at the limit may not be reliable)."))
   }
 
   paste(tips, collapse = "\n")
@@ -681,7 +689,7 @@ make_model_status_callback <- function(rv, model_label, notification_id) {
     message <- paste0(model_label, ": ")
     if (!is.null(M)) message <- paste0(message, "M=", M, ", ")
     if (!is.null(D_max)) message <- paste0(message, "D_max=", format_fixed(D_max, 1), " animals/km², ")
-    if (!is.null(buffer_m)) message <- paste0(message, "buffer=", round(buffer_m), "m, ")
+    if (!is.null(buffer_m)) message <- paste0(message, "buffer=", round(buffer_m), " m, ")
     message <- paste0(message, iter, " iterations, ", burnin, " burn-in")
     if (round > 1L && !is.null(prev_elapsed_min) && !is.null(prev_iter) && prev_iter > 0) {
       est_min <- prev_elapsed_min * (iter / prev_iter)
@@ -711,12 +719,14 @@ ppc_text <- function(fit) {
   if (!ppc$fail) {
     return(paste0(base, " (passes; values from ", ppc$lower, " to ", ppc$upper, " pass)."))
   }
+  # Camera-level noise adds variation between cameras, so suggest it only
+  # when the observed counts vary more than the model expects.
   paste0(
     base, ". FAILED (outside ", ppc$lower, " to ", ppc$upper, "): the observed counts vary ",
     if (ppc$p < ppc$lower) "more" else "less",
     " than the model expects, so its estimates and intervals may be unreliable.",
-    if (!isTRUE(fit$settings$camera_noise)) {
-      " Turning on camera-level noise (Model settings > Advanced > Priors: Camera-level noise) can often fix a failed check."
+    if (!isTRUE(fit$settings$camera_noise) && ppc$p < ppc$lower) {
+      " Turning on camera-level noise (Model settings > Advanced > Priors: Camera-level noise (all models)) can often fix a failed check."
     } else {
       ""
     }
@@ -899,7 +909,7 @@ format_model_debug <- function(state, fit = NULL) {
     }
     setting_lines <- c(setting_lines, paste0("- Camera-level noise: ", noise_label(fit$settings$camera_noise)))
     if (is.finite(fit$final_rhat_max)) {
-      setting_lines <- c(setting_lines, paste0("- Max Rhat: ", format_fixed(fit$final_rhat_max, result_digits)))
+      setting_lines <- c(setting_lines, paste0("- Max R-hat: ", format_fixed(fit$final_rhat_max, result_digits)))
     }
     lines <- c(lines, "", "Final round:", setting_lines)
     ppc_line <- ppc_text(fit)
@@ -916,11 +926,11 @@ format_model_debug <- function(state, fit = NULL) {
         paste0("round ", row$round),
         if (!is.null(row$M)) paste0("M=", row$M),
         if (!is.null(row$D_max)) paste0("D_max=", format_fixed(row$D_max, 1)),
-        if (!is.null(row$buffer_m)) paste0("buffer=", round(row$buffer_m), "m"),
+        if (!is.null(row$buffer_m)) paste0("buffer=", round(row$buffer_m), " m"),
         paste0("iter=", row$niter),
         paste0("thin=", row$thin),
         paste0("chains=", row$n_chains),
-        paste0("rhat=", format_fixed(row$rhat_max, result_digits)),
+        paste0("R-hat=", format_fixed(row$rhat_max, result_digits)),
         if (!is.null(row$D_too_small)) paste0("D_max_too_small=", row$D_too_small),
         if (!is.null(row$M_too_small)) paste0("M_too_small=", row$M_too_small),
         if (!is.null(row$buffer_too_small)) paste0("buffer_too_small=", row$buffer_too_small)
@@ -940,31 +950,56 @@ format_model_debug <- function(state, fit = NULL) {
   paste(lines, collapse = "\n")
 }
 
-# Results printout for a model fit to uploaded data (a model tab).
-print_uploaded_result <- function(model, fit, debug) {
+# Posterior summary table for a model fit to uploaded data: the parameters
+# the simulated-data tables show (see sim_truth_values()), without the true
+# values.
+uploaded_summary_table <- function(fit) {
+  params <- c(
+    "D_km2",
+    intersect(c("sigma", "lam_0", "v", "sd_eps"), colnames(fit$samples_all))
+  )
+  map(params, function(param) {
+    draws <- extract_param_draws(fit$samples_all, param)
+    q <- quantile(draws, c(0.025, 0.975), na.rm = TRUE)
+    tibble(
+      Parameter = param,
+      Mean = mean(draws, na.rm = TRUE),
+      Median = median(draws, na.rm = TRUE),
+      `Lower 2.5%` = q[[1]],
+      `Upper 97.5%` = q[[2]]
+    )
+  }) |>
+    bind_rows()
+}
+
+# Results for a model fit to uploaded data (a model tab): the species and
+# WAIC above the posterior summary table, or a note if the model hasn't been
+# run or its last run failed.
+uploaded_result_ui <- function(model, fit, debug) {
   if (!is.null(debug$raw_error)) {
-    cat(model, " (uploaded data): the last run failed.\n", sep = "")
-    cat("See 'Run status & troubleshooting' below for the raw error and guidance.\n")
-    return(invisible(NULL))
+    return(tags$p(
+      model, " (uploaded data): the last run failed. See ",
+      tags$strong("Run status & troubleshooting"),
+      " below for the raw error and guidance."
+    ))
   }
   if (is.null(fit)) {
-    cat(model, " (uploaded data): not run yet. Click 'Run ", model, " on uploaded data'.", sep = "")
-    return(invisible(NULL))
+    return(tags$p(
+      class = "small",
+      model, " (uploaded data): not run yet. Click ",
+      tags$strong(paste("Run", model, "on uploaded data"), .noWS = "after"),
+      "."
+    ))
   }
-  s <- summarize_method(fit)
-  out <- list(
-    dataset = "Uploaded data",
-    mean_density_animals_per_km2 = round(s$mean_km2, result_digits),
-    median_density_animals_per_km2 = round(s$median_km2, result_digits),
-    CI95_km2 = round(c(s$q2.5_km2, s$q97.5_km2), result_digits)
+  tagList(
+    tags$p(
+      tags$strong("Species:"), fit$species,
+      if (is.finite(fit$waic)) {
+        tagList(" · ", tags$strong("WAIC:"), format_fixed(fit$waic, result_digits))
+      }
+    ),
+    results_datatable(uploaded_summary_table(fit), fit)
   )
-  if (is.finite(s$waic)) out$WAIC <- round(s$waic, result_digits)
-  ppc <- ppc_summary(fit, ppc_pass_range)
-  if (!is.null(ppc)) {
-    out$bayesian_p_value <- round(ppc$p, result_digits)
-    out$posterior_predictive_check <- if (ppc$fail) "FAILED (see run status below)" else "passed"
-  }
-  out
 }
 
 # -------------------------------------------------------------------
@@ -1037,10 +1072,11 @@ sim_truth_values <- function(st, model) {
   )
 }
 
-# Display version of a summarize_vs_truth() table: parameter symbols with
-# units instead of internal names, and Yes/No for coverage. The internal
-# names are still used to look up the posterior draws.
-pshared_truth_datatable <- function(tbl, fit) {
+# Results table for a model fit, from summarize_vs_truth() (simulated data)
+# or uploaded_summary_table() (uploaded data): parameter symbols with units
+# instead of internal names, Yes/No for coverage (simulated data only), and
+# the posterior predictive check under the table.
+results_datatable <- function(tbl, fit) {
   param_labels <- c(
     D_km2 = "D (animals/km²)",
     sigma = "σ (km)",
@@ -1051,8 +1087,7 @@ pshared_truth_datatable <- function(tbl, fit) {
   tbl <- tbl |>
     mutate(
       Parameter = coalesce(unname(param_labels[Parameter]), Parameter),
-      Covered = if_else(Covered, "Yes", "No"),
-      across(where(is.numeric), function(x) round(x, result_digits))
+      across(any_of("Covered"), \(x) if_else(x, "Yes", "No"))
     )
   # Posterior predictive check under the table (red when it fails).
   ppc <- ppc_summary(fit, ppc_pass_range)
@@ -1072,7 +1107,8 @@ pshared_truth_datatable <- function(tbl, fit) {
     options = list(dom = "t", paging = FALSE),
     rownames = FALSE,
     escape = FALSE
-  )
+  ) |>
+    format_result_columns(tbl)
 }
 
 # Warning for a USCR fit on simulated data whose state space reaches past
@@ -1389,7 +1425,7 @@ ui <- page_fillable(
           tags$div(
             class = "about-card",
 
-            tags$h3("Step 1: Upload your data"),
+            tags$h3("Step 1: Add your data"),
             tags$p(
               "The main analysis workflow uses uploaded data. The app fits ",
               tags$strong("Unmarked Spatial Capture-Recapture (USCR)", .noWS = "after"),
@@ -1423,16 +1459,32 @@ ui <- page_fillable(
             ),
             tags$ul(
               tags$li("Check required columns and data types."),
-              tags$li("Optionally trim each camera deployment to meet study design criteria.")
+              tags$li("Optionally trim each camera's analysis window to a set number of days (off by default).")
             ),
 
-            tags$h3("Step 2: Adjust settings (optional)"),
+            tags$h3("Step 2: Review the data summary"),
             tags$p(
-              "The default settings work well for many studies. To change them, open the ",
+              "The ",
+              tags$strong("Data summary"),
+              " tab summarizes the uploaded data: camera-days and a map of the cameras, detections by species, and counts by site and by day for a selected species. Check it before fitting the models."
+            ),
+
+            tags$h3("Step 3: Choose the species and review the priors"),
+            tags$p(
+              "On the ",
               tags$strong("Model settings"),
-              " tab and choose ",
-              tags$strong("Advanced", .noWS = "after"),
-              ". There you can:"
+              " tab, choose the ",
+              tags$strong("species to analyze", .noWS = "after"),
+              ". Until you choose one, the app selects the first species in alphabetical order."
+            ),
+            tags$p(
+              "Model output is sensitive to the priors. The default priors are calibrated for white-tailed deer (",
+              tags$em("Odocoileus virginianus", .noWS = "outside"),
+              "), so you may need to change them for other species or study sites. To see and change the priors, choose ",
+              tags$strong("Advanced"),
+              " on the ",
+              tags$strong("Model settings"),
+              " tab. There you can:"
             ),
             tags$ul(
               tags$li("Give all three models an informative prior on density, as a 95% interval."),
@@ -1447,7 +1499,7 @@ ui <- page_fillable(
               " column of the deployment file."
             ),
 
-            tags$h3("Step 3: Run the models"),
+            tags$h3("Step 4: Run the models"),
             tags$p(
               "Fit each model from its own tab: ",
               tags$strong("USCR model", .noWS = "after"),
@@ -1460,7 +1512,11 @@ ui <- page_fillable(
             tags$ul(
               tags$li("Click the Run button. Results appear below it when the model finishes."),
               tags$li(
-                "Runs are adaptive: after each round, the app checks convergence and whether its settings are large enough, adjusts them, and reruns until every check passes or the adaptive-round limit is reached (6 rounds by default; change it in the ",
+                paste0(
+                  "Runs are adaptive: after each round, the app checks convergence and whether its settings are large enough, adjusts them, and reruns until every check passes or the adaptive-round limit is reached (",
+                  mcmc_defaults$max_adapt_rounds,
+                  " rounds by default; change it in the "
+                ),
                 tags$strong("Model settings"),
                 " tab)."
               ),
@@ -1482,7 +1538,7 @@ ui <- page_fillable(
               "."
             ),
 
-            tags$h3("Step 4: Compare results"),
+            tags$h3("Step 5: Compare results"),
             tags$p(
               "Use the ",
               tags$strong("Compare & combine"),
@@ -1494,7 +1550,7 @@ ui <- page_fillable(
               tags$li("Download posterior summaries with parameter names, means, medians, and 95% credible intervals.")
             ),
 
-            tags$h3("Step 5: Optional design tools"),
+            tags$h3("Step 6: Optional design tools"),
             tags$p(
               "The ",
               tags$strong("Simulate data"),
@@ -1556,7 +1612,7 @@ ui <- page_fillable(
                 ".",
                 tags$br(),
                 tags$strong("Events per unit time → density."),
-                " Encounter rates are converted to density using animal speed and the camera viewshed."
+                " Encounter rates are converted to density using the animals' movement rate and the camera viewshed."
               ),
               tags$span(
                 class = "ref",
@@ -1579,7 +1635,7 @@ ui <- page_fillable(
                 ".",
                 tags$br(),
                 tags$strong("Waiting time → density."),
-                " Shorter effective time between encounters implies higher density when speed and viewshed are held fixed."
+                " Shorter effective time between encounters implies higher density when movement rate and viewshed are held fixed."
               ),
               tags$span(
                 class = "ref",
@@ -1718,7 +1774,7 @@ ui <- page_fillable(
           "- **`Longitude`**: Camera longitude (decimal degrees, WGS84). The app corrects the sign to match the hemisphere selected in **Model settings** (under Camera geometry and coordinates).",
           "- `Camera Model`: Optional camera make and model, for recordkeeping (for example, `Browning Strike Force Pro`).",
           paste0("- `Camera Detection Angle`: Optional full detection angle in degrees for that camera (from ", camera_angle_min_deg, " to ", camera_angle_max_deg, "). If left blank or outside that range, the app uses the default angle from **Model settings**."),
-          "- `Camera Height`: Optional camera height (meters).",
+          "- `Camera Height`: Optional camera height, in any unit, for recordkeeping (the models don't use it).",
           "- `Camera Orientation`: Optional cardinal direction (`N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, or `NW`) or 0-359 degrees.",
           "- **`Camera Functioning`**: Camera status; `Yes/No`, `TRUE/FALSE`, `T/F`, and `1/0` values are accepted.",
           "- **`Camera Malfunction Date`**: Leave blank for cameras that did not malfunction (a date entered while Camera Functioning is `Yes` is ignored, with a warning). If the camera failed (stopped working, or was knocked out of position but kept taking pictures), set Camera Functioning to `No` and enter the **first date whose data should be discarded** (`MM/DD/YYYY`). The camera's analysis window ends at midnight at the start of this date, so images from this date onward are excluded.",
@@ -1745,7 +1801,8 @@ ui <- page_fillable(
         class = "data-details",
         tags$summary(tags$strong("Notes")),
         markdown(paste(
-          "- In the check logs, ❌ marks a problem that blocks the upload, ⚠️ marks a warning to review that doesn't block it, and ℹ️ marks a note about data the models will leave out.",
+          "- In the check logs, ❌ marks a problem that blocks the upload, ⚠️ marks a warning to review that doesn't block it, ℹ️ marks a note about data the models will leave out, 🛠 marks a value the app corrected (a Latitude or Longitude sign), and ✅ means the file passed with no issues.",
+          "- Row numbers in the check logs count data rows: the first row after the column names is row 1.",
           "- **The deployment upload is blocked** if any of the following is true. These fields set each camera's analysis window and location, which every model depends on.",
           "  - A required column is missing.",
           "  - A Site Name is duplicated, or a row has deployment data but no Site Name.",
@@ -1762,7 +1819,7 @@ ui <- page_fillable(
           "  - A row with a Species has a missing or non-numeric Sighting Count, or a missing Cluster ID.",
           "  - A row's Species and Sighting Count have different numbers of pipe-delimited values.",
           "- Other problems, such as a missing Camera Functioning value, a Camera Malfunction Date on a camera marked as functioning, or image dates outside a camera's deployment dates, are reported as warnings.",
-          "- Completely blank rows (for example, rows of commas at the end of a CSV file) are removed from either file, and the check log notes which rows.",
+          "- Completely blank rows (for example, rows of commas at the end of a CSV file) are removed from either file, and the check log notes which rows. Empty columns with no column name, which spreadsheets can leave at the right edge of a CSV file, are removed without a note.",
           "- **Analysis window:** each camera contributes the time from its Start Date and Start Time to its End Date and End Time (or to midnight at the start of its Camera Malfunction Date), shortened by the trim if it's on. A detection event counts only if its first image is inside the window; the images check log lists events left out this way (other than by the trim), since they can point to a wrong Start or End Time. Camera effort is the length of the window in days, minus the time spent within detection events (from first to last image of each event).",
           "- Uploading a new deployment file clears the images file; upload the images file again afterward.",
           "- Anything that changes the data the models are fit to (uploading a file, the hemisphere settings, the species to analyze, or the deployment trim) clears existing model results on uploaded data, so results from different data are never compared or combined. Changing priors or other model settings doesn't.",
@@ -1783,7 +1840,7 @@ ui <- page_fillable(
       checkboxInput(
         "apply_trim",
         "Trim each camera's analysis window to a set number of days (24-hour periods) from its start date and time.",
-        value = TRUE
+        value = FALSE
       ),
       conditionalPanel(
         "input.apply_trim",
@@ -1857,7 +1914,14 @@ ui <- page_fillable(
       h2("Detections by species"),
       tags$p(
         class = "small",
-        "Images is the number of rows for that species in the images file. Detection Events is the number of independent detections: one per Cluster ID at a camera, counted only if its first image is inside the camera's analysis window. Animals Counted adds up the animals in those detection events, taking each event's largest Sighting Count; this is the count the models use. For example, a burst of 5 photos showing 2 deer is 5 Images, 1 Detection Event, and 2 Animals Counted. Cameras with Events is the number of cameras with at least one Detection Event."
+        tags$strong("Images"),
+        " is the number of rows for that species in the images file. ",
+        tags$strong("Detection events"),
+        " is the number of independent detections: one per Cluster ID at a camera, counted only if its first image is inside the camera's analysis window. ",
+        tags$strong("Animals counted"),
+        " adds up the animals in those detection events, taking each event's largest Sighting Count; this is the count the models use. For example, a burst of 5 photos showing 2 deer is 5 images, 1 detection event, and 2 animals counted. ",
+        tags$strong("Cameras with events"),
+        " is the number of cameras with at least one detection event."
       ),
       DTOutput("image_summary_table"),
       plotOutput("species_bar_plot", height = "300px"),
@@ -1894,7 +1958,7 @@ ui <- page_fillable(
       markdown(paste(
         paste0("Default detection angle is ", default_theta_deg, "° (based on Browning-style camera specifications). This value is used for uploaded cameras that do not include a `Camera Detection Angle` value. The **Simulate data** tab has its own detection angle setting."),
         "",
-        "Longitude and Latitude sign are auto-corrected to match the selected hemispheres below during upload QC (for example, a positive Longitude gets flipped negative for Western sites, and a positive Latitude gets flipped negative for Southern sites).",
+        "Longitude and Latitude signs are corrected to match the hemispheres selected below when the deployment file is checked (for example, a positive Longitude is made negative for Western sites, and a positive Latitude is made negative for Southern sites).",
         sep = "\n"
       )),
       sliderInput(
@@ -1923,10 +1987,10 @@ ui <- page_fillable(
           " iterations, ", mcmc_defaults$burnin, " burn-in, and thin = ",
           mcmc_defaults$thin
         ),
-        paste0("- **Convergence criteria**: R̂ ≤ ", adapt_checks$rhat_max, " for all monitored parameters"),
+        paste0("- **Convergence criteria**: ", rhat_md, " ≤ ", adapt_checks$rhat_max, " for all monitored parameters"),
         paste0(
           "- **Maximum adaptive rounds**: ", mcmc_defaults$max_adapt_rounds,
-          " by default. Only the settings tied to a failed check change between rounds: iterations, burn-in, and thinning double if R̂ fails; D<sub>max</sub> (REM, TTE) or M (USCR) doubles if the posterior presses against it; and for USCR the state-space buffer grows if it is too small. If a model reaches this limit without passing every check, increase it below."
+          " by default. Only the settings tied to a failed check change between rounds: iterations, burn-in, and thinning double if ", rhat_md, " fails; D<sub>max</sub> (REM, TTE) or M (USCR) doubles if the posterior presses against it; and for USCR the state-space buffer grows if it is too small. If a model reaches this limit without passing every check, increase it below."
         ),
         sep = "\n"
       )),
@@ -1958,14 +2022,6 @@ ui <- page_fillable(
           tags$p(
             tags$strong("Using the app defaults."),
             " The models use the default priors described under Advanced, a uniform prior on density, and no camera-level noise."
-          ),
-          tags$ul(
-            tags$li(paste(mcmc_defaults$n_chains, "chains are used for all model runs.")),
-            tags$li(paste0(
-              "All models start from ", mcmc_defaults$iter, " iterations, ",
-              mcmc_defaults$burnin, " burn-in, and thin = ", mcmc_defaults$thin, "."
-            )),
-            tags$li("The app checks convergence internally and can rerun models when needed.")
           )
         )
       ),
@@ -1994,7 +2050,7 @@ ui <- page_fillable(
               paste0(
                 "- **USCR** puts it on abundance (N, the number of animals in the state space): N is uniform from 0 to M, and density is N divided by the state-space area. M starts at ",
                 mcmc_defaults$M_uscr,
-                " for uploaded data (for simulations, it is sized from the true density) and doubles if the posterior for N presses against it."
+                " and doubles if the posterior for N presses against it."
               ),
               "",
               "So the default priors are all flat, but they are not the same prior.",
@@ -2055,7 +2111,7 @@ ui <- page_fillable(
             class = "prior-details",
             tags$summary(tags$strong("Priors: REM & TTE")),
             markdown(paste0(
-              "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement speed (log scale, v in km/day). The current default corresponds to a daily movement rate of `",
+              "- **log(v)** ~ Normal(mean, SD): Informative prior on daily movement rate (log scale, v in km/day). The current default corresponds to a daily movement rate of `",
               format_fixed(default_v_km_day), " km/day` at the prior mean of log(v), with an approximate 95% interval of `",
               format_fixed(default_v_interval_km_day[1]), "` to `", format_fixed(default_v_interval_km_day[2]),
               " km/day` (Christensen et al. in prep)."
@@ -2180,7 +2236,7 @@ ui <- page_fillable(
               <li>\\(\\psi \\sim \\mathrm{Beta}(a, b)\\). The default \\(a = b = 1\\) (\\(\\psi \\sim \\mathrm{Uniform}(0, 1)\\)) gives a uniform prior on \\(N\\) from 0 to \\(M\\). An informative density prior (<strong>Model settings &gt; Advanced &gt; Priors: Density (all models)</strong>) chooses \\(a\\) and \\(b\\) so that density \\(N / \\mathrm{area}\\) has the requested 95% prior interval.</li>
               <li>\\(\\log \\sigma \\sim \\mathcal{N}(', advanced_prior_defaults$log_sigma_mean, ',\\,', advanced_prior_defaults$log_sigma_sd, ')\\), which corresponds to a 95% circular home-range size of about ', format(round(default_hr95_km2, 2)), ' km² at the prior mean of \\(\\log \\sigma\\) (Christensen et al. in prep).</li>
               <li>\\(\\log \\lambda_0 \\sim \\mathcal{N}(', advanced_prior_defaults$log_lam0_mean, ',\\,', advanced_prior_defaults$log_lam0_sd, ')\\), centered at \\(\\lambda_0 = ', format(signif(exp(advanced_prior_defaults$log_lam0_mean), 3)), '\\) expected count per camera-day when the activity center is at the camera.</li>
-              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
+              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise (all models)</strong> (off by default).</li>
               <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
             </ul>
           </div>
@@ -2194,7 +2250,7 @@ ui <- page_fillable(
         style = "margin-bottom: 10px;"
       ),
       br(),
-      verbatimTextOutput("uscr_nps_text"),
+      uiOutput("uscr_nps_result"),
       h4("Run status & troubleshooting"),
       verbatimTextOutput("uscr_nps_debug")
     ),
@@ -2203,7 +2259,7 @@ ui <- page_fillable(
       "REM model",
       HTML(paste0('
         <h2>Model 2 — REM (Random Encounter Model)</h2>
-        <p><strong>The gist:</strong> Converts <strong>how often animals pass a camera</strong> into density, correcting for <strong>movement speed</strong> and <strong>camera view geometry</strong>.</p>
+        <p><strong>The gist:</strong> Converts <strong>how often animals pass a camera</strong> into density, correcting for <strong>movement rate</strong> and <strong>camera view geometry</strong>.</p>
         <details>
           <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
           <div style="margin: 1rem 0; padding-left: 1rem;">
@@ -2231,7 +2287,7 @@ ui <- page_fillable(
               <li>\\(D_{\\max}\\), the upper limit on density. It starts at ', rem_tte_start_D_max, ' animals/km² (or twice the upper bound of an informative density prior). If the posterior for \\(D\\) presses against \\(D_{\\max}\\), the app doubles it and reruns the model.</li>
               <li>\\(p_D \\sim \\mathrm{Beta}(a, b)\\). The default \\(a = b = 1\\) (\\(p_D \\sim \\mathrm{Uniform}(0, 1)\\)) gives a uniform prior on \\(D\\) from 0 to \\(D_{\\max}\\). An informative density prior (<strong>Model settings &gt; Advanced &gt; Priors: Density (all models)</strong>) chooses \\(a\\) and \\(b\\) so that \\(D\\) has the requested 95% prior interval.</li>
               <li>\\(\\log v \\sim \\mathcal{N}(', advanced_prior_defaults$log_v_mean, ',\\,', advanced_prior_defaults$log_v_sd, ')\\), which corresponds to a daily movement rate of about ', format_fixed(default_v_km_day), ' km/day at the prior mean of \\(\\log v\\) (Christensen et al. in prep).</li>
-              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
+              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise (all models)</strong> (off by default).</li>
               <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
             </ul>
           </div>
@@ -2245,7 +2301,7 @@ ui <- page_fillable(
         style = "margin-bottom: 10px;"
       ),
       br(),
-      verbatimTextOutput("rem_nps_text"),
+      uiOutput("rem_nps_result"),
       h4("Run status & troubleshooting"),
       verbatimTextOutput("rem_nps_debug")
     ),
@@ -2255,7 +2311,7 @@ ui <- page_fillable(
       "TTE model",
       HTML(paste0('
         <h2>Model 3 — TTE (Time-to-Event)</h2>
-        <p><strong>The gist:</strong> Converts <strong>how many animals each camera counts</strong> into density, using <strong>movement speed</strong> to measure camera time in <strong>viewshed-crossing time units</strong> and correcting for <strong>viewshed area</strong>. Shorter waits between detections imply higher density.</p>
+        <p><strong>The gist:</strong> Converts <strong>how many animals each camera counts</strong> into density, using <strong>movement rate</strong> to measure camera time in <strong>viewshed-crossing time units</strong> and correcting for <strong>viewshed area</strong>. Shorter waits between detections imply higher density.</p>
         <details>
           <summary style="cursor: pointer; font-weight: 600; margin: 1rem 0; padding: 0.5rem; background: #f0f4e8; border-left: 3px solid #609048; border-radius: 6px;"><strong>Under the hood (equations)</strong></summary>
           <div style="margin: 1rem 0; padding-left: 1rem;">
@@ -2276,7 +2332,7 @@ ui <- page_fillable(
               <li>\\(v\\) — daily movement rate (km/day).</li>
               <li>\\(r_j\\) — effective detection radius (km) for camera \\(j\\): its Detection Distance.</li>
               <li>\\(\\theta_{\\mathrm{deg},j}\\) — full detection angle (degrees) for camera \\(j\\): its Camera Detection Angle, or the default detection angle in Model settings if that value is missing or outside the accepted range (from ', camera_angle_min_deg, ' to ', camera_angle_max_deg, ' degrees).</li>
-              <li>\\(U_j\\) — number of time units per camera-day at camera \\(j\\), where a time unit is the time an animal moving at speed \\(v\\) takes to cross the camera\'s viewshed (average path length \\(f(\\theta_{\\mathrm{deg},j})\\,r_j\\)).</li>
+              <li>\\(U_j\\) — number of time units per camera-day at camera \\(j\\), where a time unit is the time an animal with movement rate \\(v\\) takes to cross the camera\'s viewshed (average path length \\(f(\\theta_{\\mathrm{deg},j})\\,r_j\\)).</li>
               <li>\\(A_j\\) — viewshed area (km²) for camera \\(j\\).</li>
               <li>\\(D_{\\max}\\) — upper limit of the prior distribution for density \\(D\\).</li>
               <li>\\(p_D\\) — density as a proportion of \\(D_{\\max}\\). Its prior sets the prior on density.</li>
@@ -2288,7 +2344,7 @@ ui <- page_fillable(
               <li>\\(D_{\\max}\\), the upper limit on density. It starts at ', rem_tte_start_D_max, ' animals/km² (or twice the upper bound of an informative density prior). If the posterior for \\(D\\) presses against \\(D_{\\max}\\), the app doubles it and reruns the model.</li>
               <li>\\(p_D \\sim \\mathrm{Beta}(a, b)\\). The default \\(a = b = 1\\) (\\(p_D \\sim \\mathrm{Uniform}(0, 1)\\)) gives a uniform prior on \\(D\\) from 0 to \\(D_{\\max}\\). An informative density prior (<strong>Model settings &gt; Advanced &gt; Priors: Density (all models)</strong>) chooses \\(a\\) and \\(b\\) so that \\(D\\) has the requested 95% prior interval.</li>
               <li>\\(\\log v \\sim \\mathcal{N}(', advanced_prior_defaults$log_v_mean, ',\\,', advanced_prior_defaults$log_v_sd, ')\\), which corresponds to a daily movement rate of about ', format_fixed(default_v_km_day), ' km/day at the prior mean of \\(\\log v\\) (Christensen et al. in prep).</li>
-              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong> (off by default).</li>
+              <li>\\(\\sigma_\\epsilon \\sim \\mathrm{Gamma}(', advanced_prior_defaults$sd_eps_shape, ',\\,', advanced_prior_defaults$sd_eps_rate, ')\\), giving the camera-level random-effect standard deviation a prior mean of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate, 3)), ' and variance of ', format(signif(advanced_prior_defaults$sd_eps_shape / advanced_prior_defaults$sd_eps_rate^2, 3)), '. The random effect \\(\\epsilon_j\\) is included only when camera-level noise is turned on in <strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise (all models)</strong> (off by default).</li>
               <li><strong>Note:</strong> these defaults are not well calibrated for species other than white-tailed deer (<em>Odocoileus virginianus</em>), and model output is sensitive to choice of prior distribution.</li>
             </ul>
           </div>
@@ -2302,7 +2358,7 @@ ui <- page_fillable(
         style = "margin-bottom: 10px;"
       ),
       br(),
-      verbatimTextOutput("tte_nps_text"),
+      uiOutput("tte_nps_result"),
       h4("Run status & troubleshooting"),
       verbatimTextOutput("tte_nps_debug")
     ),
@@ -2340,7 +2396,7 @@ ui <- page_fillable(
       numericInput(
         "combo_density_threshold",
         "Density threshold (animals/km²)",
-        value = 8,
+        value = default_density_threshold,
         min = 0,
         step = 1
       ),
@@ -2376,7 +2432,7 @@ ui <- page_fillable(
               <li><strong>USCR:</strong> activity centers are placed uniformly at random within the simulation region (the union of circles, with radius equal to the simulation buffer, around each camera), and their number is Poisson, with mean equal to the true density times the region\'s area. Each camera\'s count is Poisson, with a mean that depends on how far each activity center is from the camera, on \\(\\sigma\\), and on \\(\\lambda_0\\). The fit uses its own state space, set by the state-space buffer in <strong>Model settings</strong>, as for uploaded data, and activity centers outside it still add to the counts, as in a field study.</li>
               <li><strong>REM and TTE:</strong> each camera\'s count is Poisson, with the mean the model expects from the true density, daily movement rate, detection radius, and detection angle.</li>
             </ul>
-            <p>All three datasets use the same camera grid, survey length, and true density. When camera-level noise is on (<strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise</strong>), each camera\'s mean is also multiplied by \\(\\exp(\\epsilon_j)\\), with \\(\\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)\\), so the counts are Poisson-lognormal. Here \\(\\mathcal{N}(m, s)\\) is a normal distribution with mean \\(m\\) and standard deviation \\(s\\).</p>
+            <p>All three datasets use the same camera grid, survey length, and true density. When camera-level noise is on (<strong>Model settings &gt; Advanced &gt; Priors: Camera-level noise (all models)</strong>), each camera\'s mean is also multiplied by \\(\\exp(\\epsilon_j)\\), with \\(\\epsilon_j \\sim \\mathcal{N}(0, \\sigma_\\epsilon)\\), so the counts are Poisson-lognormal. Here \\(\\mathcal{N}(m, s)\\) is a normal distribution with mean \\(m\\) and standard deviation \\(s\\).</p>
             <h3>Notes</h3>
             <ul>
               <li>Each dataset is simulated from the same model that is fit to it, so results show how well a design can do when the model\'s assumptions hold.</li>
@@ -2429,7 +2485,7 @@ ui <- page_fillable(
               class = "small",
               style = "color: var(--muted);",
               "Camera-level noise is off, so simulated counts are Poisson. Turn it on in ",
-              tags$strong("Model settings > Advanced > Priors: Camera-level noise"),
+              tags$strong("Model settings > Advanced > Priors: Camera-level noise (all models)"),
               " to simulate and fit Poisson-lognormal counts."
             )
           )
@@ -2516,7 +2572,7 @@ ui <- page_fillable(
         tags$p(
           tags$strong(HTML("Camera-level noise SD (σ<sub>ε</sub>)")),
           " is the standard deviation of camera-to-camera variation in counts (on the log scale) that is not explained by survey length, density, movement, or camera geometry. It is used only when camera-level noise is turned on in ",
-          tags$strong("Model settings > Advanced > Priors: Camera-level noise", .noWS = "after"),
+          tags$strong("Model settings > Advanced > Priors: Camera-level noise (all models)", .noWS = "after"),
           "; then it is applied when simulating data for all three models, and all three models estimate ",
           HTML("σ<sub>ε</sub>"),
           " when fit."
@@ -2795,7 +2851,7 @@ server <- function(input, output, session) {
         style = "margin: 0;",
         tags$strong(paste0("Current simulated data: camera-level noise ", if (sim_noise) "on" else "off", ". ")),
         "All three fits below use this setting. To change it, change the camera-level noise setting in ",
-        tags$strong("Model settings > Advanced > Priors: Camera-level noise"),
+        tags$strong("Model settings > Advanced > Priors: Camera-level noise (all models)"),
         " and click ",
         tags$strong("Simulate data"),
         " again."
@@ -2843,12 +2899,12 @@ server <- function(input, output, session) {
       labs(
         x = "m", y = "m",
         title = sprintf(
-          "%d cameras, %d m spacing (true density: %.1f animals/km\u00b2)",
+          "%d cameras, %d m spacing (true density: %.1f animals/km²)",
           nrow(sim$out), round(s$settings$spacing_m), s$settings$D_true
         ),
         subtitle = paste0(
           sprintf(
-            "%d simulated activity centers within the %d m simulation buffer (dashed outline, %.2f km\u00b2)",
+            "%d simulated activity centers within the %d m simulation buffer (dashed outline, %.2f km²)",
             sim$N, round(s$settings$buffer_m), sim$area_km2
           ),
           if (!is.null(fit_outline)) {
@@ -2955,7 +3011,7 @@ server <- function(input, output, session) {
       # DT widget has no height and overlaps the heading below it.
       req(fit)
       tbl <- summarize_vs_truth(fit, sim_truth_values(pshared_sim()$settings, model))
-      pshared_truth_datatable(tbl, fit)
+      results_datatable(tbl, fit)
     })
   }
   output$pshared_uscr_table <- render_truth_table("USCR", pshared_uscr_fit)
@@ -3088,7 +3144,11 @@ server <- function(input, output, session) {
   observeEvent(input$deployment_csv, {
     req(input$deployment_csv)
     imported <- run_qc_step(
-      read_csv(input$deployment_csv$datapath, show_col_types = FALSE) |>
+      read_csv(
+        input$deployment_csv$datapath,
+        show_col_types = FALSE,
+        name_repair = "unique_quiet"
+      ) |>
         clean_deployment_import()
     )
     deployment_raw(imported$value)
@@ -3122,6 +3182,7 @@ server <- function(input, output, session) {
       read_csv(
         input$images_csv$datapath,
         show_col_types = FALSE,
+        name_repair = "unique_quiet",
         col_types = cols(
           `Sighting Count` = col_character(),
           Species = col_character()
@@ -3183,7 +3244,7 @@ server <- function(input, output, session) {
       "Camera malfunction" = win$malfunction & !win$trimmed,
       "Trimmed" = win$trimmed
     )
-    notes <- apply(flags, 1, function(f) paste(colnames(flags)[f], collapse = "; "))
+    notes <- apply(flags, 1, \(f) paste(colnames(flags)[f], collapse = "; "))
     tbl <- data.frame(
       `Site Name` = win$`Site Name`,
       `Window start` = format(win$window_start, "%m/%d/%Y %H:%M"),
@@ -3294,9 +3355,9 @@ server <- function(input, output, session) {
     summary_df <- deploy_summary() |>
       mutate(across(c(mean_days, total_camera_days), \(x) round(x, 1))) |>
       rename(
-        `Number of Cameras` = n_cameras,
-        `Mean Days per Camera` = mean_days,
-        `Total Camera-Days` = total_camera_days
+        `Number of cameras` = n_cameras,
+        `Mean days per camera` = mean_days,
+        `Total camera-days` = total_camera_days
       )
     datatable(
       summary_df,
@@ -3328,9 +3389,9 @@ server <- function(input, output, session) {
     summary_df <- image_summary() |>
       rename(
         Images = n_images,
-        `Detection Events` = n_events,
-        `Animals Counted` = animals,
-        `Cameras with Events` = cameras
+        `Detection events` = n_events,
+        `Animals counted` = animals,
+        `Cameras with events` = cameras
       )
     datatable(
       summary_df,
@@ -3357,8 +3418,8 @@ server <- function(input, output, session) {
       select(`Site Name`, n_images, n_events, animals) |>
       rename(
         Images = n_images,
-        `Detection Events` = n_events,
-        `Animals Counted` = animals
+        `Detection events` = n_events,
+        `Animals counted` = animals
       )
     datatable(
       species_df,
@@ -3437,7 +3498,7 @@ server <- function(input, output, session) {
   output$species_count_summary <- renderTable({
     d <- nps_model_inputs()
     tibble(
-      category = c("Animals Counted", "Total Camera-Days"),
+      category = c("Animals counted", "Total camera-days"),
       result = c(
         as.character(sum(d$camera_counts)),
         format_fixed(sum(d$camera_days), 1)
@@ -3639,7 +3700,7 @@ server <- function(input, output, session) {
   # preview uses the cameras in the uploaded data if available, otherwise
   # those in the current simulation.
   uscr_prior_preview_basis <- reactive({
-    d <- tryCatch(nps_model_inputs(), error = function(e) NULL)
+    d <- tryCatch(nps_model_inputs(), error = \(e) NULL)
     if (!is.null(d) && nrow(d$out) >= 2) {
       return(list(label = "your uploaded data", out = d$out))
     }
@@ -3662,7 +3723,7 @@ server <- function(input, output, session) {
 
     beta <- tryCatch(
       design_beta_density_prior(spec$lo, spec$hi, encounter_start_D_max(spec)),
-      error = function(e) e
+      error = \(e) e
     )
     if (inherits(beta, "error")) {
       return(list(message = conditionMessage(beta)))
@@ -3682,7 +3743,7 @@ server <- function(input, output, session) {
     }
     area <- uscr_state_space_and_area(basis$out, buffer_m = buffer_m)$area_km2
     M <- uscr_start_M(basis$out, buffer_m, spec)
-    uscr <- tryCatch(design_uscr_density_prior(spec$lo, spec$hi, area, M), error = function(e) e)
+    uscr <- tryCatch(design_uscr_density_prior(spec$lo, spec$hi, area, M), error = \(e) e)
     if (inherits(uscr, "error")) {
       out$uscr_message <- conditionMessage(uscr)
     } else {
@@ -3707,7 +3768,7 @@ server <- function(input, output, session) {
         tags$strong(label),
         paste0(
           "95% interval ", fmt(d$achieved[["lo"]]), " to ", fmt(d$achieved[["hi"]]),
-          " animals/km\u00b2, mean ", fmt(d$achieved[["mean"]]),
+          " animals/km², mean ", fmt(d$achieved[["mean"]]),
           ", median ", fmt(d$achieved[["median"]]), "."
         ),
         note
@@ -3729,7 +3790,7 @@ server <- function(input, output, session) {
         "REM & TTE: ", pv$beta,
         tagList(
           "(Starting D", tags$sub("max", .noWS = c("before", "after")),
-          " = ", fmt(pv$beta$D_max), " animals/km\u00b2.)"
+          " = ", fmt(pv$beta$D_max), " animals/km².)"
         )
       ),
       off_target_note("REM & TTE", pv$beta, ""),
@@ -3737,7 +3798,7 @@ server <- function(input, output, session) {
         prior_line(
           "USCR: ", pv[["uscr"]],
           paste0("(Based on ", pv$basis$label, ": state space ", fmt(pv[["uscr"]]$area_km2),
-                 " km\u00b2, starting M = ", pv[["uscr"]]$M, ".)")
+                 " km², starting M = ", pv[["uscr"]]$M, ".)")
         )
       } else {
         tags$p(class = "small", style = "color: var(--muted);", tags$strong("USCR: "), pv[["uscr_message"]])
@@ -3783,13 +3844,13 @@ server <- function(input, output, session) {
 
     spec <- density_prior_spec()
     if (!isTRUE(spec$uniform)) {
-      diffs <- c(diffs, paste0("Density prior: 95% interval ", fmt(spec$lo), "\u2013", fmt(spec$hi), " animals/km\u00b2"))
+      diffs <- c(diffs, paste0("Density prior: 95% interval ", fmt(spec$lo), "–", fmt(spec$hi), " animals/km²"))
     }
 
     noise_on <- if (shared) isTRUE(pshared_sim()$settings$camera_noise) else app_camera_noise()
     if (noise_on) {
       diffs <- c(diffs, paste0(
-        "Camera-level noise: on, \u03c3<sub>\u03b5</sub> ~ Gamma(", fmt(prior_input("sd_eps_shape")), ", ",
+        "Camera-level noise: on, σ<sub>ε</sub> ~ Gamma(", fmt(prior_input("sd_eps_shape")), ", ",
         fmt(prior_input("sd_eps_rate")), ")", if (shared) " (from the simulated data)" else ""
       ))
     }
@@ -3840,8 +3901,8 @@ server <- function(input, output, session) {
       }
     }
     if (identical(model, "USCR")) {
-      add_mean("log_sigma_mean", "log(\u03c3)", st$sigma_km, paste0("\u03c3 = ", fmt(st$sigma_km), " km"))
-      add_mean("log_lam0_mean", "log(\u03bb\u2080)", st$lambda0, paste0("\u03bb\u2080 = ", fmt(st$lambda0)))
+      add_mean("log_sigma_mean", "log(σ)", st$sigma_km, paste0("σ = ", fmt(st$sigma_km), " km"))
+      add_mean("log_lam0_mean", "log(λ₀)", st$lambda0, paste0("λ₀ = ", fmt(st$lambda0)))
     } else {
       add_mean("log_v_mean", "log(v)", st$v, paste0("v = ", fmt(st$v), " km/day"))
     }
@@ -3859,7 +3920,7 @@ server <- function(input, output, session) {
       # HTML() so the <sub> in sigma_epsilon renders; the lists hold only app
       # text and numbers.
       note_list <- function(items) {
-        tags$ul(style = "margin: 0.2rem 0 0 0;", lapply(items, function(d) tags$li(HTML(d))))
+        tags$ul(style = "margin: 0.2rem 0 0 0;", lapply(items, \(d) tags$li(HTML(d))))
       }
       tags$div(
         class = "small",
@@ -3867,7 +3928,7 @@ server <- function(input, output, session) {
         if (!length(diffs)) {
           tags$div(tags$strong("Run with all default settings."))
         } else {
-          tags$div(tags$strong("The following differ from default:"), note_list(diffs))
+          tags$div(tags$strong("The following differ from the defaults:"), note_list(diffs))
         },
         if (length(mean_diffs)) {
           tags$div(
@@ -3954,6 +4015,7 @@ server <- function(input, output, session) {
   run_on_uploaded <- function(model) {
     d <- nps_run_inputs(model)
     if (is.null(d)) return()
+    species <- input$species_to_analyze
     camera_noise <- app_camera_noise()
 
     if (identical(model, "USCR")) {
@@ -3968,13 +4030,21 @@ server <- function(input, output, session) {
       fit_model <- encounter_fitter(model, d, theta_deg, camera_noise, compute_WAIC = TRUE)
     }
 
+    # Record the species with the fit, for the results printout and the
+    # Compare & combine tab.
+    fit_species <- function(status_callback) {
+      fit <- fit_model(status_callback)
+      fit$species <- species
+      fit
+    }
+
     run_model(
       model = model,
       data_label = "uploaded data",
       fit_rv = list(USCR = uscr_nps_fit, REM = rem_nps_fit, TTE = tte_nps_fit)[[model]],
       debug_rv = list(USCR = uscr_nps_debug, REM = rem_nps_debug, TTE = tte_nps_debug)[[model]],
-      context = context,
-      fit_model = fit_model
+      context = c(paste("Species:", species), context),
+      fit_model = fit_species
     )
   }
 
@@ -3982,16 +4052,16 @@ server <- function(input, output, session) {
   observeEvent(input$run_rem_nps, run_on_uploaded("REM"))
   observeEvent(input$run_tte_nps, run_on_uploaded("TTE"))
 
-  output$uscr_nps_text <- renderPrint({
-    print_uploaded_result("USCR", uscr_nps_fit(), uscr_nps_debug())
+  output$uscr_nps_result <- renderUI({
+    uploaded_result_ui("USCR", uscr_nps_fit(), uscr_nps_debug())
   })
 
-  output$rem_nps_text <- renderPrint({
-    print_uploaded_result("REM", rem_nps_fit(), rem_nps_debug())
+  output$rem_nps_result <- renderUI({
+    uploaded_result_ui("REM", rem_nps_fit(), rem_nps_debug())
   })
 
-  output$tte_nps_text <- renderPrint({
-    print_uploaded_result("TTE", tte_nps_fit(), tte_nps_debug())
+  output$tte_nps_result <- renderUI({
+    uploaded_result_ui("TTE", tte_nps_fit(), tte_nps_debug())
   })
 
   output$uscr_nps_debug <- renderText({
@@ -4023,7 +4093,7 @@ server <- function(input, output, session) {
     if (!is.null(combo_data)) {
       build_combo_interval_plot(
         combo_data,
-        title_text = "Uploaded data: density estimates"
+        title_text = paste0(combo_data$species, " (uploaded data): density estimates")
       )
     }
   })
@@ -4033,7 +4103,7 @@ server <- function(input, output, session) {
     if (!is.null(combo_data)) {
       build_combo_density_overlay_plot(
         combo_data,
-        title_text = "Uploaded data: posterior distributions of density"
+        title_text = paste0(combo_data$species, " (uploaded data): posterior distributions of density")
       )
     }
   })
@@ -4053,12 +4123,12 @@ server <- function(input, output, session) {
       combo_data,
       density_threshold = input$combo_density_threshold,
       ppc_pass_range = ppc_pass_range
-    ) |>
-      mutate(across(where(is.numeric), function(x) round(x, result_digits)))
+    )
     # Bayesian p-values of models that failed their posterior predictive check
     # in bold red, set by the hidden failed_check column.
     datatable(
       df,
+      caption = paste("Species:", combo_data$species),
       options = list(
         paging = FALSE,
         ordering = FALSE,
@@ -4071,6 +4141,7 @@ server <- function(input, output, session) {
       ),
       rownames = FALSE
     ) |>
+      format_result_columns(df) |>
       formatStyle(
         "Bayesian p-value",
         valueColumns = "failed_check",
@@ -4121,7 +4192,7 @@ server <- function(input, output, session) {
       combo_data <- nps_combo_data()
       req(combo_data)
       imap(combo_data$fits, function(fit, model) {
-        mutate(posterior_summary_df(fit), model = model, .before = 1)
+        mutate(posterior_summary_df(fit), species = fit$species, model = model, .before = 1)
       }) |>
         bind_rows() |>
         write_csv(file)

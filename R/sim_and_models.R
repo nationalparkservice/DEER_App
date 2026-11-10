@@ -1,6 +1,6 @@
-## R/sim_and_models.R
-## Simulation helpers, model inputs for uploaded data, and the USCR, REM,
-## and TTE models, with adaptive reruns.
+# R/sim_and_models.R
+# Simulation helpers, model inputs for uploaded data, and the USCR, REM,
+# and TTE models, with adaptive reruns.
 
 # -------------------------------------------------------------------
 # 1. Simulation helpers (Simulate data tab)
@@ -246,9 +246,9 @@ normalize_nimble_output <- function(x) {
 # Runs the chains in parallel worker processes (one per chain, up to the
 # number of cores minus one). If the number of cores can't be determined, or
 # there's only one, the chains run one after another in a single worker.
-# make_inits(constants), if given, returns each
-# chain's initial values (USCR uses it to start activity centers near
-# cameras); otherwise nimble chooses initial values itself.
+# make_inits(constants), if given, returns each chain's initial values (USCR
+# uses it to start activity centers near cameras); otherwise nimble chooses
+# initial values itself.
 run_nimble_chains <- function(code,
                               constants,
                               data,
@@ -312,7 +312,7 @@ run_nimble_chains <- function(code,
 
 # Fits REM or TTE (model code and constants from run_REM() or run_TTE()), then
 # reruns it while any check fails, up to max_adapt_rounds rounds: iterations,
-# burn-in, and thinning double if the largest Rhat is above
+# burn-in, and thinning double if the largest R-hat is above
 # adapt_checks$rhat_max, and D_max doubles if the posterior probability that
 # D exceeds adapt_checks$limit_fraction of D_max is above
 # adapt_checks$limit_prob.
@@ -413,7 +413,7 @@ run_encounter_rate_model <- function(method,
     # Stop here (before doubling) so the reported settings match the last fit.
     if (round_i >= max_adapt_rounds) {
       hit_max_adapt_rounds <- TRUE
-      unmet_checks <- c(if (!converged) "Rhat", if (D_too_small) "D_max")
+      unmet_checks <- c(if (!converged) "R-hat", if (D_too_small) "D_max")
       warning(
         method,
         " stopped after max_adapt_rounds = ",
@@ -761,12 +761,10 @@ uscr_state_space_and_area <- function(out, buffer_m) {
 # adaptive rounds, run_USCR() re-solves the prior every round so the prior on
 # density stays the same.
 #
-# Adapted from dbbinom(), bb_summary() and design_psi_prior() in the
-# Poisson_Lognormal_USCR_Simulation project, with these changes: the target is
-# the 95% interval only (the original pinned the mean and matched the interval
-# approximately); quantiles are interpolated between integer N values, so the
-# search is smooth (exact integer quantiles are piecewise constant); and misses
-# are measured as fractions of the interval's width.
+# The solver targets the 95% interval only. Quantiles of N are interpolated
+# between integer values, so the search is smooth (exact integer quantiles are
+# piecewise constant), and misses are measured as fractions of the interval's
+# width.
 
 # A solved informative prior (USCR or REM/TTE) is flagged as off target when
 # either bound of its 95% interval misses the requested bound by more than
@@ -841,8 +839,8 @@ design_uscr_density_prior <- function(D_lo, D_hi, area_km2, M) {
       sprintf(
         paste0(
           "The density prior's upper bound (%.3g animals/km² over a %.2f km² ",
-          "state space, about %.0f animals) needs M above %d. Increase M or ",
-          "lower the upper bound."
+          "state space, about %.0f animals) must be below M (%d). Lower the ",
+          "upper bound."
         ),
         D_hi, area_km2, N_hi, M
       ),
@@ -967,12 +965,12 @@ design_beta_density_prior <- function(D_lo, D_hi, D_max) {
 
   p_start <- min(max(((D_lo + D_hi) / 2) / D_max, 1e-6), 1 - 1e-6)
   k_start <- exp(optimize(
-    function(lk) miss_fn(q_of(p_start, exp(lk))),
+    \(lk) miss_fn(q_of(p_start, exp(lk))),
     interval = log(c(0.01, 1e6))
   )$minimum)
   opt <- optim(
     c(qlogis(p_start), log(k_start)),
-    function(par) miss_fn(q_of(plogis(par[1]), exp(par[2]))),
+    \(par) miss_fn(q_of(plogis(par[1]), exp(par[2]))),
     method = "Nelder-Mead",
     control = list(maxit = 2000, reltol = 1e-12)
   )
@@ -1084,9 +1082,10 @@ plot_density_priors <- function(beta_design, uscr_design = NULL) {
 # USCR model code builder
 # -------------------------------------------------------------------
 
-# USCR requires at least 2 cameras: sigma (the spatial decay of detection
-# with distance) is estimated from spatial contrast in detections across
-# cameras at different locations, so a single camera can't identify it.
+# All three models need at least 2 cameras (the app checks this before a
+# run). For USCR, sigma (the spatial decay of detection with distance) is
+# estimated from spatial contrast in detections across cameras at different
+# locations, so a single camera can't identify it.
 build_uscr_code <- function() {
   nimbleCode({
     log_sigma ~ dnorm(log_sigma_mean, sd = log_sigma_sd)
@@ -1203,7 +1202,7 @@ safe_rhat_max <- function(samples_list) {
 
   diag <- tryCatch(
     MCMCvis::MCMCsummary(samples_list),
-    error = function(e) NULL
+    error = \(e) NULL
   )
 
   if (is.null(diag) || !"Rhat" %in% names(diag)) {
@@ -1302,7 +1301,7 @@ summarize_vs_truth <- function(fit, truth) {
 # Main USCR wrapper
 # -------------------------------------------------------------------
 # Fits USCR, then reruns it while any check fails, up to max_adapt_rounds
-# rounds: iterations, burn-in, and thinning double if the largest Rhat is
+# rounds: iterations, burn-in, and thinning double if the largest R-hat is
 # above adapt_checks$rhat_max; M doubles if the posterior probability that N
 # exceeds adapt_checks$limit_fraction of M is above adapt_checks$limit_prob;
 # and the state-space buffer grows if it is too small for the largest
@@ -1461,7 +1460,7 @@ run_USCR <- function(out,
     if (round_i >= max_adapt_rounds) {
       hit_max_adapt_rounds <- TRUE
       unmet_checks <- c(
-        if (!converged) "Rhat",
+        if (!converged) "R-hat",
         if (M_too_small) "M",
         if (buffer_too_small) "state-space buffer"
       )
